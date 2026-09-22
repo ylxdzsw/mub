@@ -34,7 +34,7 @@ Mu keeps its usual configuration, instructions, skills, traps, compaction, and
 session journals. If the directory has no Mu project scope, `mub` calls `mu init`.
 No Mu configuration or instructions are otherwise rewritten.
 
-Press **`M`** in the TUI to choose a model and reasoning effort for the PM, workers,
+Enter **`/models`** in the TUI prompt to choose a model and reasoning effort for the PM, workers,
 or both. The picker lists your configured models via `mu status --include-models`
 without making model requests. Selections persist in `.mub` and apply to the next
 invocation, including continuations; running processes are not interrupted.
@@ -54,36 +54,66 @@ Each task gets at most eight worker invocations before asking for another grant;
 
 ## The TUI
 
+The main screen keeps the task list above the PM conversation and prompt. The
+list grows with the number of tasks, up to half the available space, then scrolls;
+the conversation fills the rest. Nothing is selected initially. Selecting a task
+opens its live output in a right column; clearing the selection collapses it and
+gives the PM the full width again. The right column starts wider than the left and
+can be resized with `F5` / `F6` (subject to minimum column widths).
+
+Just start typing: ordinary letters are never board shortcuts while the PM prompt has focus.
+Tell the PM what to build, discuss a design, or answer a question (mention `T1`,
+`T2`, etc. when referring to a task). The last line shows the available keys.
+
 | Key | Action |
 | --- | --- |
-| `n` | New task dialog; optional title and multiline request |
-| `m` | Project discussion, decisions, and latest PM execution |
-| `M` | Choose PM/worker models and reasoning effort |
-| `↑` / `↓`, `j` / `k` | Select a task |
-| `Space` | Reply to the selected task; compose in the PM view |
-| `Enter` | Task brief, discussion, and execution tabs |
-| `1` / `2` / `3`, `Tab` | Switch detail tabs |
-| `[` / `]` | Previous/next worker run in Execution |
-| `PgUp` / `PgDn`, `Home` / `End` | Scroll details |
-| `p` | Pause/unpause worker dispatch (the PM can still answer) |
-| `r` | Ask a fresh PM to reconsider; clear a PM error |
-| `+` / `-` | Raise/lower task priority |
-| `s` | Interrupt the selected worker |
-| `x` | Cancel the selected task |
-| `R` | Explicitly resume a stopped/failed task or grant more turns |
-| `a` | Review confirmation for a trapped-command retry |
-| `b` | Accept the current checkout as a safe baseline |
-| `q`, `Ctrl-C` | Quit dialog: keep running, finish current task, or stop now |
+| Type, then `Enter` | Send a message to the PM |
+| `Ctrl-J` | Insert a newline; `Ctrl-S` also submits |
+| `←` / `→`, `Home` / `End`, Backspace / Delete | Edit the prompt; `Ctrl-U` clears it |
+| `↑` / `↓` | Select a task and show its right pane without leaving the prompt |
+| `Tab`, or `Enter` with an empty prompt | Focus task output (select the first task if needed); `Tab` switches back to the PM |
+| `Esc` | Clear the task selection and collapse the right pane |
+| `F5` / `F6` | Shrink / widen the right pane |
+| `F2` | PM conversation, decisions, and execution history |
+| `/help`, then `Enter` | List slash commands; choose one to insert it in the prompt |
+| `Ctrl-C` | Quit immediately when idle; otherwise confirm stop-and-quit once |
+| `Ctrl-D` on an empty PM prompt | Quit with the same confirmation behavior as `Ctrl-C` |
 
-Editors use **Ctrl-S to submit**, Enter for a newline, Tab to switch fields, and
-Esc to cancel. Dialogs do not stop process supervision. Live Mu output is captured
-in Execution; opening a task does not start an extra editing process.
+Manage tasks by talking to the PM, for example:
 
-Requests appear in **Inbox** immediately. The PM can clarify, queue, add
-prerequisites, split work, or update an existing task. Higher priority runs first,
-then task ID. Dependencies require successful completion, not cancellation.
-Questions appear in **Needs you**. Replies are delivered at a subsequent Mu turn,
-not injected into a running tool call.
+- “Prioritize the login fix before the dashboard work.”
+- “Pause the queue after the current worker finishes.”
+- “Stop T2 for now.”
+- “Yes, go ahead with the retry you described.”
+
+The PM interprets intent, arranges the queue, and handles worker recovery. You do
+not need numeric priorities, approval commands, or special approval phrases.
+Dependencies still run before their dependents, and reordering never takes the
+checkout away from its current worker. The task list reflects the PM's order
+with prerequisites placed first.
+
+Only local UI commands remain: `/help`, `/models`, and `/quit`. Prefix a message
+with `//` to send a literal leading `/` instead of invoking a local command.
+
+Task output opens at the latest run and follows new output automatically, like a
+read-only terminal pane. Mu uses **concise output** for normal turns and retries.
+With task output focused, `↑` / `↓` and `PgUp` / `PgDn` scroll; `Home` goes to the beginning, including the
+task brief and discussion; `End` resumes following. `[` / `]` select previous or
+next runs. `Tab` returns to the PM prompt while keeping the task visible; `Esc`
+clears the selection and closes the pane. Both preserve your unfinished prompt.
+Finished tasks stay in the list and open the same saved output after a restart.
+
+This is a live view of durable output, not a tmux attachment or an interactive
+shell. Opening it neither launches another Mu process nor forwards keystrokes to
+the worker. Output is loaded incrementally, including older scrollback rather
+than just a truncated log tail. Dialogs continue process supervision.
+
+Messages are saved immediately. The PM can turn explicit requests into tasks,
+clarify, add prerequisites, split work, or update existing tasks. Dependencies
+require successful completion, not cancellation. A task is **blocked** only when
+it needs a user decision or permission; answer the PM in ordinary language.
+Replies reach a subsequent Mu turn, not a running tool call. The CLI's `mub add` still creates an inbox task
+immediately when you want explicit submission instead of conversation.
 
 Project discussion is not automatically permission to implement. The PM records
 agreed decisions and queues explicit requests. A worker's successful exit goes
@@ -100,21 +130,22 @@ state and the PM can submit plans, but interactive controls require user input.
 mub add 'Add session expiration' --title 'Session expiration'
 printf '%s\n' 'Use a fixed lifetime of seven days.' | mub reply T1
 mub discuss 'What is blocking the release?'
-mub priority T1 10
-mub pause
-mub unpause
-mub replan
+mub discuss 'Prioritize T1 once its prerequisites are finished.'
+mub discuss 'Pause worker dispatch.'
+mub discuss 'Resume the queue.'
 mub show T1
 mub status
 mub logs RUN_ID
-mub stop T1
-mub resume T1
+mub discuss 'Stop T1 for now.'
+mub reply T1 'Continue with the approach you described.'
 mub quit --finish
 ```
 
 `status`, `show`, and `logs` also work while the owner is closed. JSON status is
 an inspection interface; do not edit the snapshot while a board is running.
-New work requires an open board, not an implicit background daemon.
+New work requires an open board, not an implicit background daemon. Low-level
+CLI controls remain available for emergency recovery and automation; normal task
+management uses `discuss` and `reply`.
 
 For automation, the same owner can run without curses:
 
@@ -131,33 +162,50 @@ task status rather than treating owner exit as proof that every task succeeded.
 
 * There is no automatic stash, reset, branch switch, commit, push, or merge.
   Workers follow your project's Git conventions and task instructions.
-* At startup, existing Git changes stop worker dispatch until you inspect and
-  accept them with `b` or `mub accept-baseline --yes`.
+* At startup, existing Git changes stop worker dispatch. Ask the PM to inspect
+  them; it can accept the baseline when your message authorizes that decision.
+  The PM cannot release a running worker's checkout.
 * A worker owns the checkout across review, clarification, and repair turns.
-  Marking its task done means the PM has accepted its changes as the next task's
-  baseline; that does not require a commit. Failed/cancelled work is not silently
-  passed to another task. You can explicitly release ownership after inspecting
-  the checkout with `b`.
-* Mu exit code 3 is a command-approval gate, not an automatic retry. Inspect the
-  exact trapped command in Execution first. `a`, or `mub approve T1 --yes`, runs
-  **one `mu retry --trap off` invocation**: this allows all Bash calls in that
-  invocation, not just the displayed command. The following normal turn returns
-  to your configured trap policy. Decline by cancelling the task.
-  A trapped PM pauses triage too: inspect `m` → `3`, then press `a` there (or
-  `mub approve-pm --yes`). The approved retry keeps the original plan's revision
-  checks; all subsequent PM invocations are fresh again.
+  Marking its reviewed task done accepts its changes as the next task's baseline;
+  that does not require a commit. Failed/cancelled work is not silently passed to
+  another task. Ask the PM to inspect abandoned changes before releasing ownership.
+* A worker's Mu exit code 3 returns the trapped command to **PM review**. The PM
+  inspects it and can authorize routine work already within your request. If the
+  action genuinely needs your decision, the PM marks the task **blocked**, explains
+  the action and scope, and waits for your natural-language answer. Refusals,
+  changed scope, and unrelated replies are not approval.
+* An approved worker retry is **one `mu retry --trap off` invocation**: all Bash
+  traps are disabled for that invocation, not just the displayed command. The PM
+  must consider that broader scope, not merely the isolated command. Later normal
+  turns return to configured traps. The recovery reason and any authorizing user
+  message are saved with the run. A new relevant message invalidates an approved
+  retry that has not started yet, so the PM must assess it again.
+* A blocked task cannot resume just because a worker claims permission. The PM
+  must cite a subsequent user message and explain its decision. The engine checks
+  the message's source and freshness; the PM interprets its meaning. A changed
+  blocking question requires a new answer. Interrupted/user-stopped work and
+  extra turn-budget grants likewise require user input.
 * Interrupted Mu sessions use `mu retry`; clean sessions use a new prompt in the
-  same session. The PM cannot approve commands or clear a recovery gate.
-* Closing the TUI stops its supervision. Finish-and-exit continues only the
-  current task (including review/repair), stopping if it needs your intervention.
-  Stop-now interrupts owned processes and preserves all records. For persistent
-  remote use, run the TUI in a persistent terminal.
+  same session. A retry completes the interrupted turn before new instructions
+  can be delivered: a changed brief is not permission to execute an old trapped
+  command. Routine retries do not reset the worker-turn budget.
+* The PM cannot grant itself a trap override. If the PM traps or fails, inspect
+  **F2 PM** and send a message to start a fresh PM turn under configured traps.
+  It can choose another allowed approach instead of repeating the blocked action.
+* Closing the TUI stops its supervision. Quitting is immediate when no agent is
+  running and no task is awaiting review; queued tasks remain saved for next time.
+  Otherwise a single confirmation interrupts owned processes and preserves all
+  records and checkout changes. The CLI's `mub quit --finish` still finishes only
+  the current task (including review/repair), stopping if it needs intervention.
+  For persistent remote use, run the TUI in a persistent terminal.
 * Reopening checks unfinished runs against process identities and Mu's session
   locks. If an old worker or its process-session descendants remain alive, `mub`
   refuses to start a replacement. Inspect and stop those processes first.
 
-The PM is a **trusted planning agent**, not an OS sandbox. Its prompt delegates
-edits to workers, but unrestricted Bash can bypass that convention. Likewise,
+The PM is a **trusted planning and worker-approval agent**, not an OS sandbox.
+It judges authorization from conversation; the board does not hard-code approval
+phrases or independently infer their meaning. Its prompt delegates edits to
+workers, but unrestricted Bash can bypass that convention. Likewise,
 ordinary `mu`, an editor, or an unrelated process can edit the checkout outside
 the queue. Do not run another implementation agent in the same checkout.
 
@@ -187,8 +235,9 @@ launched. Mu transcripts remain in Mu's own store and can be opened with
 PMs receive a bounded recent discussion plus current tasks and decisions. They
 can inspect a task's full history with `mub show`. A PM stages a structured plan
 using `mub plan` on stdin; the owner checks it and applies it only after a clean
-PM exit. Task revisions reject plans made stale by user input or worker results.
-Dependency validation rejects cycles. Inbox events arriving during a PM turn
+PM exit. Task revisions and user-message watermarks reject plans made stale by
+new input or worker results. PM order is persisted and dependency validation
+rejects cycles; dispatch always requires successful prerequisites. Inbox events arriving during a PM turn
 remain pending for the next fresh PM. No agent recursively owns another Mu
 process: the TUI launches both PM and workers as siblings.
 

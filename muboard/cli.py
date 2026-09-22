@@ -9,7 +9,7 @@ import sys
 import time
 
 from .ipc import ControlServer, call
-from .state import read_state
+from .state import read_state, ordered_tasks
 
 
 def text_arg(value):
@@ -89,6 +89,7 @@ def main():
             return
         if command in ("status", "show", "logs"):
             state = read_state(root)
+            state["tasks"] = ordered_tasks(state["tasks"])
             if command == "status":
                 try:
                     result = call(root, dict(op="status"))

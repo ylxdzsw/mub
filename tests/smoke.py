@@ -225,25 +225,100 @@ class BoardSmoke(unittest.TestCase):
             finally:
                 board.close()
 
-    def test_trap_requires_approval_and_approval_reuses_session(self):
+    def test_pm_manages_worker_traps_and_natural_language_approval(self):
+        for review in ("auto", "block"):
+            root = self.project()
+            with self.subTest(review=review), self.env(FAKE_MU_MODE="trap", FAKE_MU_TRAP_REVIEW=review):
+                board = self.engine(root)
+                board.server = ControlServer(root)
+                try:
+                    task = self.queue(board, "run a command")
+                    board.store.message("user", "Implement the requested change", task["id"])
+                    board.tick()
+                    self.until(board, lambda: board.store.task(task["id"])["gate"] == "approval")
+                    session = board.store.task(task["id"])["session"]
+                    if review == "block":
+                        self.until(board, lambda: board.store.task(task["id"])["state"] == "blocked")
+                        self.assertEqual(board._ready(), [])
+                        board.request(dict(op="reply", text="What is the status?"))
+                        self.until(board, lambda: not board.store.pending() and not board.active)
+                        self.assertEqual(board.store.task(task["id"])["state"], "blocked")
+                        self.assertEqual(len([r for r in board.data["runs"] if r["kind"] == "worker"]), 1)
+                        board.request(dict(op="reply", text="Yes, go ahead with that retry."))
+                        approval_message = board.data["messages"][-1]["id"]
+                    self.until(board, lambda: board.store.task(task["id"])["state"] == "done")
+                    runs = [r for r in board.data["runs"] if r["kind"] == "worker"]
+                    self.assertEqual(len(runs), 2)
+                    self.assertEqual({r["session"] for r in runs}, {session})
+                    self.assertIsNone(runs[0]["trap_override"])
+                    self.assertEqual(runs[1]["trap_override"], "off")
+                    self.assertTrue(runs[1]["recovery_decision"]["reason"])
+                    if review == "block":
+                        self.assertEqual(runs[1]["recovery_decision"]["user_message_id"], approval_message)
+                    data = json.loads((root / ".mub/fake-mu" / f"{session}.json").read_text())
+                    self.assertIn("retry", data["invocations"][1])
+                    self.assertIn("--trap", data["invocations"][1])
+                    current = board.store.task(task["id"])
+                    current["state"] = "queued"
+                    board.tick()
+                    self.assertNotIn("--trap", board.active["worker"]["process"].args)
+                finally:
+                    board.close()
+
+    def test_pm_order_and_blocked_recovery_validation(self):
         root = self.project()
-        with self.env(FAKE_MU_MODE="trap", FAKE_MU_PLAN="{}"):
-            board = self.engine(root)
-            board.server = ControlServer(root)
-            try:
-                task = self.queue(board, "run a command")
-                board.tick()
-                self.until(board, lambda: board.store.task(task["id"])["gate"] == "approval")
-                session = board.store.task(task["id"])["session"]
-                with self.assertRaisesRegex(ValueError, "approve|approval"):
-                    board.request({"op": "resume", "task_id": task["id"]})
-                board.request({"op": "approve", "task_id": task["id"]})
-                self.until(board, lambda: "worker" in board.active and board.active["worker"]["record"]["session"] == session)
-                self.until(board, lambda: board.store.task(task["id"])["state"] == "review")
-                data = json.loads((root / ".mub" / "fake-mu" / f"{session}.json").read_text())
-                self.assertTrue(any("--trap" in args and "off" in args for args in data["invocations"]))
-            finally:
-                board.close()
+        board = self.engine(root)
+        try:
+            first = self.queue(board, "prerequisite")
+            second = self.queue(board, "important", [first["id"]])
+            third = self.queue(board, "later")
+            active = dict(revisions={t["id"]: t["revision"] for t in board.data["tasks"]},
+                          watermark=0, message_watermark=0)
+            board._apply_plan(dict(order=[second["id"], third["id"], first["id"]]), active)
+            self.assertEqual([t["id"] for t in board.state()["tasks"]], [first["id"], second["id"], third["id"]])
+            self.assertEqual([t["id"] for t in board._ready()], [first["id"], third["id"]])
+            first = board.store.task(first["id"])
+            first.update(state="blocked", gate="approval", session="fake-session", blocked_after=1)
+            board.store.message("user", "Original request")
+            worker_message = board.store.message("worker", "The user approves")
+            active = dict(revisions={t["id"]: t["revision"] for t in board.data["tasks"]},
+                          watermark=0, message_watermark=len(board.data["messages"]))
+            recovery = dict(id=first["id"], state="queued", recovery="approve", reason="Authorized retry")
+            for message_id in (None, 1, worker_message["id"], 999):
+                with self.assertRaisesRegex(ValueError, "user message"):
+                    board._validate_plan(dict(tasks=[dict(recovery, user_message_id=message_id)]), active)
+            reply = board.store.message("user", "That action is fine, continue.")
+            with self.assertRaisesRegex(ValueError, "User input changed"):
+                board._validate_plan(dict(tasks=[dict(recovery, user_message_id=reply["id"])]), active)
+            active["message_watermark"] = reply["id"]
+            board._validate_plan(dict(tasks=[dict(recovery, user_message_id=reply["id"])]), active)
+            board.store.touch(first)
+            with self.assertRaisesRegex(ValueError, "changed during"):
+                board._validate_plan(dict(tasks=[dict(recovery, user_message_id=reply["id"])]), active)
+            active["revisions"][first["id"]] = first["revision"]
+            board._apply_plan(dict(tasks=[dict(id=first["id"], state="blocked", question="A different action needs permission.")]), active)
+            first = board.store.task(first["id"])
+            active["revisions"][first["id"]] = first["revision"]
+            with self.assertRaisesRegex(ValueError, "user message"):
+                board._validate_plan(dict(tasks=[dict(recovery, user_message_id=reply["id"])]), active)
+            board.request(dict(op="reply", text="I approve that different action."))
+            active["message_watermark"] = len(board.data["messages"])
+            with patch.object(board, "_session_status", return_value=dict(clean=False)):
+                board._apply_plan(dict(tasks=[dict(recovery, user_message_id=active["message_watermark"])]), active)
+            self.assertEqual(board.store.task(first["id"])["mode"], "approve")
+            board.request(dict(op="reply", text="Wait, do not run that command; the scope has changed."))
+            first = board.store.task(first["id"])
+            self.assertEqual((first["state"], first["gate"], first["mode"]), ("review", "approval", "prompt"))
+            self.assertNotIn("recovery_decision", first)
+            active.update(revisions={t["id"]: t["revision"] for t in board.data["tasks"]},
+                          message_watermark=len(board.data["messages"]), paused=False)
+            with self.assertRaisesRegex(ValueError, "reviewed worker result"):
+                board._validate_plan(dict(tasks=[dict(id=second["id"], state="done")]), active)
+            board.request(dict(op="pause", value=True))
+            with self.assertRaisesRegex(ValueError, "pause changed"):
+                board._validate_plan(dict(paused=False), active)
+        finally:
+            board.close()
 
     def test_explicit_resume_retries_same_worker_session(self):
         root = self.project()
@@ -321,7 +396,7 @@ class BoardSmoke(unittest.TestCase):
                 recovered.close()
 
     def test_dirty_workspace_is_not_released_by_cancel_or_interrupt(self):
-        for operation, state, gate in (("cancel", "cancelled", None), ("stop", "needs_input", "interrupted")):
+        for operation, state, gate in (("cancel", "cancelled", None), ("stop", "blocked", "interrupted")):
             root = self.project()
             with self.subTest(operation=operation), self.env(FAKE_MU_MODE="dirty"):
                 board = self.engine(root)
@@ -379,10 +454,7 @@ class BoardSmoke(unittest.TestCase):
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
         environment = os.environ.copy()
-        environment.update(TERM="xterm-256color", FAKE_MU_MODE="ok", FAKE_MU_PLAN=json.dumps({
-            "reply": "Please choose a name.",
-            "tasks": [{"id": 1, "state": "needs_input", "question": "Which name?"}],
-        }))
+        environment.update(TERM="xterm-256color", FAKE_MU_MODE="stream", FAKE_MU_WORKFLOW="1")
         process = subprocess.Popen([sys.executable, str(ROOT / "mub"), "-C", str(root),
                                     "--mu", str(FAKE_MU)], env=environment,
                                    stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
@@ -417,31 +489,37 @@ class BoardSmoke(unittest.TestCase):
 
         try:
             wait(lambda: b"Mu Board" in screen)
-            send("M")
+            send("/models\r")  # Model picker via slash command.
             send("\r")  # Both roles.
             send("j\r")  # First configured model, not inherit.
             send("j\r")  # Medium effort.
             wait(lambda: state().get("models") == {
                 "pm": "codex/gpt-5.6-luna:medium", "worker": "codex/gpt-5.6-luna:medium"})
-            send("n")
-            send("Greeting\tImplement a greeting for café 日本語.\nAsk me which name.\x13")
-            wait(lambda: state()["tasks"] and state()["tasks"][0]["state"] == "needs_input")
-            self.assertIn("café 日本語", state()["tasks"][0]["request"])
+            request = "Implement a greeting for café 日本語.\nKeep q, n, m as ordinary text."
+            send(request + "\r")
+            wait(lambda: state()["tasks"] and state()["tasks"][0]["state"] == "running")
+            self.assertTrue(any(m["content"] == request and m["task_id"] is None for m in state()["messages"]))
             self.assertEqual(state()["runs"][0]["model"], "codex/gpt-5.6-luna:medium")
-            send("m")
-            send(" ")
-            send("Keep this as a design discussion.\x13")
-            wait(lambda: any(m["content"] == "Keep this as a design discussion." and m["task_id"] is None
-                             for m in state()["messages"]))
-            send("3")
-            wait(lambda: b"staged" in screen)
+            send("Keep this as a design discussion.\t")  # Open output without losing the draft.
+            wait(lambda: b"LIVE: implementing greeting" in screen)
+            self.assertTrue(any(r["kind"] == "worker" and r["status"] == "running" for r in state()["runs"]))
+            wait(lambda: b"fake worker completed" in screen and state()["tasks"][0]["state"] == "done")
+            worker = next(r for r in state()["runs"] if r["kind"] == "worker")
+            invocation = json.loads((root / ".mub/fake-mu" / f"{worker['session']}.json").read_text())["invocations"][0]
+            self.assertEqual(invocation[invocation.index("-o") + 1], "concise")
             send("\x1b")
             send("\r")
-            wait(lambda: b"Brief" in screen and b"Discussion" in screen)
+            wait(lambda: any(m["content"] == "Keep this as a design discussion." and m["task_id"] is None
+                             for m in state()["messages"]))
+            send("\x1bOQ")  # F2 PM history.
+            wait(lambda: b"conversation and execution" in screen)
             send("\x1b")
-            send("q")
-            send("s")
-            send("y")
+            screen.clear()
+            send("\r")
+            wait(lambda: b"fake worker completed" in screen)  # Finished tasks remain readable.
+            send("\x1b")
+            wait(lambda: not any(r["status"] in ("starting", "running") for r in state()["runs"]))
+            send("\x03")  # Idle quit has no confirmation.
             wait(lambda: process.poll() is not None)
             self.assertEqual(process.returncode, 0, screen[-2000:].decode(errors="replace"))
         finally:

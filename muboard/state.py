@@ -27,6 +27,24 @@ def fresh_state():
                 paused=False, hold=None, workspace_block=None, error=None)
 
 
+def ordered_tasks(tasks):
+    """PM preference order, with every prerequisite ahead of its dependents."""
+    by_id = {task["id"]: task for task in tasks}
+    ordered, seen = [], set()
+
+    def visit(task):
+        if task["id"] in seen:
+            return
+        seen.add(task["id"])
+        for dependency in task["depends_on"]:
+            visit(by_id[dependency])
+        ordered.append(task)
+
+    for task in sorted(tasks, key=lambda task: (-task["priority"], task["id"])):
+        visit(task)
+    return ordered
+
+
 class Store:
     def __init__(self, root):
         self.root = Path(root)

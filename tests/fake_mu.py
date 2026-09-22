@@ -50,6 +50,7 @@ def finish(path, data, code, text, clean=None):
     if clean is not None:
         data["clean"] = clean
     write_session(path, data)
+    print(text, flush=True)
     return code
 
 
@@ -82,6 +83,34 @@ def run_mu(arguments):
             if os.environ.get("FAKE_MU_PM_TRAP") and "retry" not in arguments:
                 return finish(path, data, 3, "Execution: trapped PM command", False)
             plan = json.loads(os.environ.get("FAKE_MU_PLAN", "{}"))
+            if os.environ.get("FAKE_MU_TRAP_REVIEW"):
+                state = socket_request({"op": "status"})["result"]
+                plan = {"tasks": []}
+                for task in state["tasks"]:
+                    if task["gate"] == "approval":
+                        replies = [m for m in state["messages"] if m["role"] == "user"
+                                   and m["id"] > task.get("blocked_after", 0)
+                                   and m["task_id"] in (None, task["id"])]
+                        if task["state"] == "blocked":
+                            if replies and replies[-1]["content"] == "Yes, go ahead with that retry.":
+                                plan["tasks"].append(dict(id=task["id"], state="queued", recovery="approve",
+                                                          reason="The user approved the explained retry scope.",
+                                                          user_message_id=replies[-1]["id"]))
+                        elif os.environ["FAKE_MU_TRAP_REVIEW"] == "auto":
+                            plan["tasks"].append(dict(id=task["id"], state="queued", recovery="approve",
+                                                      reason="Inspected the command; routine work within the user's request."))
+                        else:
+                            question = "This retry disables all Bash traps for one invocation. May I continue?"
+                            plan["tasks"].append(dict(id=task["id"], state="blocked", question=question))
+                            plan["reply"] = question
+                    elif task["state"] == "review":
+                        plan["tasks"].append(dict(id=task["id"], state="done", result="Verified worker output"))
+            if os.environ.get("FAKE_MU_WORKFLOW"):
+                tasks = socket_request({"op": "status"})["result"]["tasks"]
+                plan = {"reply": "I'll arrange that work.", "tasks": [
+                    {"id": task["id"], "state": "done", "result": "Greeting complete"}
+                    for task in tasks if task["state"] == "review"
+                ] if tasks else [{"id": "greeting", "title": "Greeting", "brief": "Implement a greeting", "state": "queued"}]}
             response = socket_request({
                 "op": "plan",
                 "token": os.environ["MUB_PM_TOKEN"],
@@ -98,6 +127,13 @@ def run_mu(arguments):
             return finish(path, data, 3, "Execution: trapped command", False)
         if mode == "retry" and "retry" not in arguments:
             return finish(path, data, 1, "fake worker failed before resume", False)
+        if mode == "stream":
+            print("LIVE: implementing greeting", flush=True)
+            for index in range(20):
+                if stopped:
+                    return finish(path, data, 130, "fake worker interrupted", False)
+                time.sleep(0.1)
+                print(f"LIVE: check {index + 1}", flush=True)
         if mode in ("dirty", "long"):
             if mode == "dirty":
                 (ROOT / "dirty-worker.txt").write_text("provisional worker change\n")
