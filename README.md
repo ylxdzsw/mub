@@ -164,7 +164,9 @@ task status rather than treating owner exit as proof that every task succeeded.
   Workers follow your project's Git conventions and task instructions.
 * At startup, existing Git changes stop worker dispatch. Ask the PM to inspect
   them; it can accept the baseline when your message authorizes that decision.
-  The PM cannot release a running worker's checkout.
+  A baseline is the accepted starting state for subsequent tasks, not a Git
+  commit or snapshot. Reopening rechecks Git and clears stale checkout warnings
+  when the checkout is clean. The PM cannot release a running worker's checkout.
 * A worker owns the checkout across review, clarification, and repair turns.
   Marking its reviewed task done accepts its changes as the next task's baseline;
   that does not require a commit. Failed/cancelled work is not silently passed to

@@ -98,8 +98,12 @@ class Engine:
             for task in self.data["tasks"]:
                 if task["state"] in ("needs_input", "blocked", "cancelled"):
                     task.setdefault("blocked_after", len(self.data["messages"]))
-            dirty = self.workspace()
-            if dirty and self.data["hold"] is None:
+            self.data["workspace_block"] = None
+            if self.data["hold"] is not None:
+                task = self.store.task(self.data["hold"])
+                if task["state"] == "cancelled":
+                    self._release_cancelled(task)
+            elif self.workspace():
                 self.data["workspace_block"] = "Checkout has existing changes. Ask the PM to inspect them before accepting a baseline."
             if paused:
                 self.data["paused"] = True
@@ -359,6 +363,7 @@ class Engine:
                 self.data["workspace_block"] = f"Cancelled T{task['id']} left changes. Ask the PM to inspect them before accepting a baseline."
             else:
                 self.data["hold"] = None
+                self.data["workspace_block"] = None
 
     def _spawn(self, kind, prompt, task=None, recovery=None):
         session = recovery["session"] if recovery else (task["session"] if task else None)
