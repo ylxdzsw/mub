@@ -83,6 +83,10 @@ def run_mu(arguments):
             if os.environ.get("FAKE_MU_PM_TRAP") and "retry" not in arguments:
                 return finish(path, data, 3, "Execution: trapped PM command", False)
             plan = json.loads(os.environ.get("FAKE_MU_PLAN", "{}"))
+            if os.environ.get("FAKE_MU_LOOP"):
+                tasks = socket_request({"op": "status"})["result"]["tasks"]
+                plan = {"tasks": [dict(id=t["id"], state="done") for t in tasks if t["state"] == "review"]
+                        + [dict(id="next", title="More work", brief="Repeat work", state="queued")]}
             if os.environ.get("FAKE_MU_TRAP_REVIEW"):
                 state = socket_request({"op": "status"})["result"]
                 plan = {"tasks": []}
@@ -125,7 +129,7 @@ def run_mu(arguments):
 
         if mode == "trap" and "retry" not in arguments:
             return finish(path, data, 3, "Execution: trapped command", False)
-        if mode == "retry" and "retry" not in arguments:
+        if mode == "fail" or (mode == "retry" and "retry" not in arguments):
             return finish(path, data, 1, "fake worker failed before resume", False)
         if mode == "stream":
             print("LIVE: implementing greeting", flush=True)

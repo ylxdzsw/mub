@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -31,8 +32,13 @@ def run_options(parser, *, suppressed=False):
     parser.add_argument("--pm-model", default=defaults, help="Override the PM model for this launch")
     parser.add_argument("--worker-model", default=defaults, help="Override the worker model for this launch")
     parser.add_argument("--max-turns", type=int, default=argparse.SUPPRESS if suppressed else 8)
-    parser.add_argument("--timeout", type=float, default=argparse.SUPPRESS if suppressed else 1800,
-                        help="Seconds per Mu invocation (default 1800)")
+    parser.add_argument("--max-runs", type=int, default=defaults,
+                        help="PM + worker invocations per explicit replan grant (saved; initially 32)")
+    parser.add_argument("--idle-timeout", "--timeout", dest="timeout", type=float,
+                        default=argparse.SUPPRESS if suppressed else 3600,
+                        help="Seconds without observed Mu activity (default 3600 / 1h; PM and worker)")
+    parser.add_argument("--max-runtime", type=float, default=argparse.SUPPRESS if suppressed else 86400,
+                        help="Absolute seconds per Mu invocation, even with activity (default 86400 / 24h)")
     for flag, help_text in [("paused", "Start with worker dispatch paused"),
                             ("headless", "Run the same owner without curses"),
                             ("until-idle", "Exit the headless owner when no work is actionable")]:
@@ -64,8 +70,9 @@ def parser():
         command.add_argument("task_id", type=task_id)
         if name == "approve":
             command.add_argument("--yes", action="store_true", help="Allow one Mu retry with ALL Bash traps off")
-    for name in ("pause", "unpause", "replan"):
+    for name in ("pause", "unpause"):
         sub.add_parser(name)
+    sub.add_parser("replan", help="Grant a fresh board invocation budget and reconsider pending work")
     pm_approval = sub.add_parser("approve-pm", help="Allow one trapped PM turn to retry with all Bash traps off")
     pm_approval.add_argument("--yes", action="store_true")
     priority = sub.add_parser("priority")
@@ -147,8 +154,9 @@ def run(root, args):
         raise ValueError("The TUI needs a terminal; use --headless for scripting")
     if args.until_idle and not args.headless:
         raise ValueError("--until-idle requires --headless")
-    if args.max_turns < 1 or args.timeout <= 0:
-        raise ValueError("Turn limit and timeout must be positive")
+    if (args.max_turns < 1 or (args.max_runs is not None and args.max_runs < 1)
+            or any(not math.isfinite(value) or value <= 0 for value in (args.timeout, args.max_runtime))):
+        raise ValueError("Run limits and timeouts must be finite and positive")
     mu = shutil.which(args.mu)
     if not mu:
         raise ValueError(f"Mu executable not found: {args.mu}")
@@ -162,7 +170,7 @@ def run(root, args):
     from .engine import Engine
     engine = Engine(root, mu=mu, pm_model=args.pm_model or args.model,
                     worker_model=args.worker_model or args.model, max_turns=args.max_turns,
-                    timeout=args.timeout, paused=args.paused)
+                    max_runs=args.max_runs, timeout=args.timeout, max_runtime=args.max_runtime, paused=args.paused)
     previous = {}
     try:
         engine.server = ControlServer(root)
@@ -182,7 +190,7 @@ def run(root, args):
                 summary = dict(tasks=[dict(id=t["id"], title=t["title"], state=t["state"], question=t["question"]) for t in state["tasks"]],
                                pm=state["pm"]["id"] if state["pm"] else None,
                                worker=state["worker"]["id"] if state["worker"] else None,
-                               error=state["error"], paused=state["paused"])
+                               error=state["error"], paused=state["paused"], guardrails=state["guardrails"])
                 if summary != last:
                     print(json.dumps(summary, ensure_ascii=False), flush=True)
                     last = summary

@@ -19,6 +19,7 @@ FAKE_MU = ROOT / "tests" / "fake_mu.py"
 sys.path.insert(0, str(ROOT))
 
 from muboard.engine import Engine
+from muboard.cli import parser
 from muboard.ipc import ControlServer
 from muboard.state import Store
 
@@ -26,6 +27,7 @@ from muboard.state import Store
 class BoardSmoke(unittest.TestCase):
     def setUp(self):
         self.projects = []
+        self.enterContext(patch("muboard.engine.RETRY_DELAY", 0.1))
         FAKE_MU.chmod(0o755)
 
     def tearDown(self):
@@ -61,6 +63,212 @@ class BoardSmoke(unittest.TestCase):
                 return
             time.sleep(0.01)
         self.fail("timed out waiting for board state")
+
+    def test_watchdog_allows_long_active_runs_but_bounds_idle_and_total_time(self):
+        board = Engine(self.project(), mu=str(FAKE_MU), timeout=1800, max_runtime=86400)
+        active = dict(record={}, started=0, last_activity=0, activity_checked=0, activity="initial")
+        try:
+            with patch.object(board, "_stop") as stop, patch.object(board, "_activity") as activity:
+                activity.return_value = "initial"
+                with patch("muboard.engine.time.monotonic", return_value=600):
+                    board._watchdog(active)
+                stop.assert_not_called()  # No special five-minute PM cap.
+                for clock in range(1200, 7201, 1200):
+                    activity.return_value = clock
+                    with patch("muboard.engine.time.monotonic", return_value=clock):
+                        board._watchdog(active)
+                stop.assert_not_called()  # Two hours with regular activity.
+                with patch("muboard.engine.time.monotonic", return_value=9000):
+                    board._watchdog(active)
+                stop.assert_called_once_with(active, "interrupted")
+                self.assertEqual(active["record"]["timeout_kind"], "idle")
+                stop.reset_mock()
+                activity.return_value = "still producing output"
+                with patch("muboard.engine.time.monotonic", return_value=86400):
+                    board._watchdog(active)
+                stop.assert_called_once_with(active, "interrupted")
+                self.assertEqual(active["record"]["timeout_kind"], "runtime")
+        finally:
+            board.close()
+
+    def test_idle_timeout_cli_defaults_and_alias(self):
+        defaults = parser().parse_args([])
+        self.assertEqual((defaults.timeout, defaults.max_runtime), (3600, 86400))
+        old_flag = parser().parse_args(["--timeout", "5400", "run", "--max-runtime", "172800"])
+        self.assertEqual((old_flag.timeout, old_flag.max_runtime), (5400, 172800))
+        new_flag = parser().parse_args(["run", "--idle-timeout", "7200"])
+        self.assertEqual((new_flag.timeout, new_flag.max_runtime), (7200, 86400))
+        for values in (dict(timeout=float("nan")), dict(max_runtime=float("inf")), dict(max_runtime=0)):
+            with self.assertRaisesRegex(ValueError, "finite and positive"):
+                Engine(self.project(), **values)
+
+    def test_watchdog_observes_logs_journal_and_quiet_process_io(self):
+        root = self.project()
+        board = self.engine(root)
+        try:
+            log = board.store.directory / "runs" / "activity.log"
+            log.write_text("")
+            active = dict(record=dict(log_path=str(log), session="activity"))
+            with patch("muboard.engine.owned_members", return_value=[]):
+                initial = board._activity(active)
+                log.write_text("new tool output\n")
+                output = board._activity(active)
+                self.assertNotEqual(initial, output)
+                journal = root / ".mu" / "sessions" / "activity.jsonl"
+                journal.parent.mkdir(parents=True)
+                journal.write_text('{"activity":true}\n')
+                hidden = board._activity(active)
+                self.assertNotEqual(output, hidden)
+                (root / "unrelated.txt").write_text("another process is not Mu activity")
+                self.assertEqual(hidden, board._activity(active))
+            with patch("muboard.engine.owned_members", return_value=[(os.getpid(), "test")]):
+                before = board._activity(active)[1][os.getpid(), "test"]
+                log.read_bytes()
+                after = board._activity(active)[1][os.getpid(), "test"]
+                self.assertGreater(after[1], before[1])  # rchar: even unrendered reads count.
+                self.assertGreaterEqual(after[0], before[0])  # CPU ticks, not elapsed process age.
+        finally:
+            board.close()
+
+    def test_board_budget_bounds_new_task_loop_and_survives_reopen(self):
+        root = self.project()
+        with self.env(FAKE_MU_LOOP="1"):
+            board = self.engine(root, max_runs=4)
+            board.server = ControlServer(root)
+            try:
+                board.request(dict(op="reply", text="Start work"))
+                self.until(board, lambda: board.idle())
+                self.assertEqual(len(board.data["runs"]), 4)
+                self.assertIn("budget exhausted", board.data["error"])
+                self.assertEqual(len(board.data["tasks"]), 2)
+                board.request(dict(op="reply", text="What happened?"))
+                board.tick()
+                self.assertFalse(board.active)
+                self.assertEqual(board.data["guardrails"]["runs"], 4)
+            finally:
+                board.close()
+            board = self.engine(root)
+            try:
+                self.assertEqual(board.max_runs, 4)
+                board.tick()
+                self.assertTrue(board.idle())
+                self.assertFalse(board.active)
+                board.request(dict(op="replan"))
+                self.assertEqual(board.data["guardrails"]["runs"], 0)
+                self.assertIsNone(board.data["error"])
+            finally:
+                board.close()
+
+    def test_failed_workers_stop_and_cooldown_survives_restart(self):
+        root = self.project()
+        with self.env(FAKE_MU_MODE="fail", FAKE_MU_PLAN="{}"), patch("muboard.engine.RETRY_DELAY", 30):
+            board = self.engine(root)
+            board.server = ControlServer(root)
+            try:
+                task_id = self.queue(board)["id"]
+                board.store.message("user", "Do the work", task_id)
+                board.tick()
+                self.until(board, lambda: board.store.task(task_id)["gate"] == "error")
+                self.until(board, lambda: not board.active and not board.store.pending())
+                task = board.store.task(task_id)
+                deadline = task["retry_after"]
+                decision = dict(id=task_id, state="queued", recovery="retry", reason="Retry once")
+                active = dict(revisions={task_id: task["revision"]}, watermark=0,
+                              message_watermark=len(board.data["messages"]))
+                board._apply_plan(dict(tasks=[decision]), active)
+                board.tick()
+                self.assertFalse(board.active)
+                self.assertFalse(board.idle())  # Cooldown is pending work, not completion.
+            finally:
+                board.close()
+            board = self.engine(root)
+            board.server = ControlServer(root)
+            try:
+                self.assertEqual(board.store.task(task_id)["retry_after"], deadline)
+                self.assertEqual(board.store.task(task_id)["failed_runs"], 1)
+                board.tick()
+                self.assertFalse(board.active)
+                with patch("muboard.engine.time.time", return_value=deadline + 1):
+                    self.until(board, lambda: board.store.task(task_id)["state"] == "blocked")
+                task = board.store.task(task_id)
+                self.assertEqual(task["failed_runs"], 2)
+                self.assertEqual(len([r for r in board.data["runs"] if r["kind"] == "worker"]), 2)
+                active.update(revisions={task_id: task["revision"]}, message_watermark=len(board.data["messages"]))
+                with self.assertRaisesRegex(ValueError, "user message"):
+                    board._validate_plan(dict(tasks=[decision]), active)
+                with self.assertRaisesRegex(ValueError, "user message"):
+                    board._validate_plan(dict(tasks=[dict(decision, user_message_id=1)]), active)
+            finally:
+                board.close()
+
+    def test_pm_failure_budget_and_cooldown_are_persistent(self):
+        root = self.project()
+        board = self.engine(root)
+        try:
+            with patch("muboard.engine.RETRY_DELAY", 30):
+                board._pm_error({}, "First failure")
+            deadline = board.data["guardrails"]["next_pm"]
+            board.tick()
+            self.assertFalse(board.active)
+        finally:
+            board.close()
+        board = self.engine(root)
+        try:
+            self.assertEqual(board.data["guardrails"]["pm_failures"], 1)
+            self.assertEqual(board.data["guardrails"]["next_pm"], deadline)
+            board._pm_error({}, "Second failure")
+            board.tick()
+            self.assertFalse(board.active)
+            self.assertTrue(board.idle())
+            self.assertIn("Automatic PM retries paused", board.data["error"])
+        finally:
+            board.close()
+
+    def test_plan_submission_loop_stops_pm(self):
+        board = self.engine(self.project())
+        active = dict(token="token", stop=None)
+        board.active["pm"] = active
+        try:
+            with patch.object(board, "_stop") as stop:
+                for _ in range(3):
+                    with self.assertRaisesRegex(ValueError, "Plan fields"):
+                        board.request(dict(op="plan", token="token", plan={"invalid": True}))
+                stop.assert_called_once_with(active, "interrupted")
+        finally:
+            board.active.clear()
+            board.close()
+
+    def test_turn_grants_cannot_reuse_user_evidence_or_inherit_traps_off(self):
+        board = self.engine(self.project())
+        try:
+            task = self.queue(board)
+            task.update(session="fake-session", turns=3, state="review")
+            message = board.store.message("user", "Another batch is fine")
+            decision = dict(id=task["id"], state="queued", recovery="retry", reason="User granted turns",
+                            user_message_id=message["id"])
+            active = dict(revisions={task["id"]: task["revision"]}, watermark=0,
+                          message_watermark=message["id"])
+            with patch.object(board, "_session_status", return_value=dict(clean=True)):
+                board._apply_plan(dict(tasks=[decision]), active)
+            task = board.store.task(task["id"])
+            self.assertEqual(task["turns"], 0)
+            task.update(turns=3, state="review")
+            active["revisions"][task["id"]] = task["revision"]
+            with self.assertRaisesRegex(ValueError, "user message"):
+                board._validate_plan(dict(tasks=[decision]), active)
+            task.update(turns=1, state="blocked", gate="interrupted")
+            board.data["runs"].append(dict(id="interrupted", kind="worker", session=task["session"],
+                                           status="interrupted", trap_override="off", clean=False))
+            with self.assertRaisesRegex(ValueError, "explicitly approve"):
+                board.request(dict(op="resume", task_id=task["id"]))
+            message = board.store.message("user", "Resume the approved turn")
+            active["message_watermark"] = message["id"]
+            decision["user_message_id"] = message["id"]
+            with self.assertRaisesRegex(ValueError, "approval gate"):
+                board._validate_plan(dict(tasks=[decision]), active)
+            board._validate_plan(dict(tasks=[dict(decision, recovery="approve")]), active)
+        finally:
+            board.close()
 
     def test_owner_lock_git_private_and_reopen(self):
         root = self.project()
@@ -439,7 +647,7 @@ class BoardSmoke(unittest.TestCase):
             added = subprocess.run([sys.executable, str(ROOT / "mub"), "-C", str(root), "add", "via control"],
                                    cwd=ROOT, env=environment, capture_output=True, text=True, check=True)
             self.assertIn('"task_id"', added.stdout)
-            stdout, stderr = process.communicate(timeout=8)
+            stdout, stderr = process.communicate(timeout=40)
             self.assertEqual(process.returncode, 0, stderr)
             state = json.loads(subprocess.run([sys.executable, str(ROOT / "mub"), "-C", str(root), "status"],
                                               cwd=ROOT, env=environment, capture_output=True, text=True, check=True).stdout)

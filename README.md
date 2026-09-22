@@ -49,8 +49,13 @@ mub --pm-model codex/gpt-5.6-luna:medium --worker-model codex/gpt-5.6-luna:high
 
 Use `--model` to set both. A provider-qualified model avoids provider fallback.
 Each task gets at most eight worker invocations before asking for another grant;
-`--max-turns` changes that limit. `--timeout` bounds each invocation in seconds
-(default 1800). Two unsuccessful PM plans pause automatic PM retries.
+`--max-turns` changes that limit. `--idle-timeout` (also spelled `--timeout`)
+bounds inactivity, not total invocation duration (default 3600 seconds for both
+PMs and workers). Active runs can continue up to `--max-runtime` (default 24 hours).
+The board also allows at most
+32 total PM/worker invocations per explicit grant (`--max-runs`). These counts
+and the selected `--max-runs` ceiling survive restarts.
+See [Loop and spending guardrails](#loop-and-spending-guardrails).
 
 ## The TUI
 
@@ -158,6 +163,73 @@ Headless output is newline-delimited JSON status. `--until-idle` stops for block
 work, approval, paused dispatch, or a PM error as well as an empty queue; inspect
 task status rather than treating owner exit as proof that every task succeeded.
 
+## Loop and spending guardrails
+
+These are scheduler checks, not just instructions to the PM:
+
+* **32 total invocations per grant**, across every PM and worker, including retries
+  and failed launch attempts. Successful plans, new task IDs, ordinary messages,
+  and reopening the board do not reset the count. This bounds clean-but-unproductive
+  review/requeue cycles and PMs repeatedly creating replacement tasks. Status JSON
+  and headless output expose the `guardrails` counters.
+* **Eight worker invocations per task grant.** More require fresh user evidence;
+  a message used for an earlier grant cannot be recycled for later batches.
+* **Two consecutive unsuccessful worker invocations** (errors, unclean exits, or
+  traps) block the task for fresh user input. A clean completion resets this streak,
+  but does not reset either invocation budget. Routine recovery cannot reset it.
+* **Two unsuccessful PM plans** pause automatic PM retries; the failure count
+  survives restarts. Each PM invocation accepts at most three plan submissions,
+  including corrections; repeated rejected submissions stop the PM.
+* **Retry cooldowns** start at 30 seconds after an unsuccessful invocation and
+  increase with the failure streak. Cooldowns survive restart and user replies.
+  The worker cooldown does not prevent the PM from reviewing the failure.
+* **Idle watchdog:** PMs and workers stop only after `--idle-timeout` seconds
+  without observed activity (default 3600 / 60 minutes). The old five-minute PM
+  deadline is gone; `--timeout` is now an alias for this inactivity limit.
+  Captured output, the local Mu session journal, and CPU/I/O counters or process
+  changes in the owned process session reset the idle clock. Quiet computations
+  and buffered tool output can therefore count as activity even when the pane
+  is silent. Board polling and unrelated checkout changes do not reset it.
+* **Long absolute fallback:** `--max-runtime` caps a single invocation at 86400
+  seconds (24 hours), even if it keeps producing activity. Activity is not proof
+  of useful progress: a noisy or CPU-spinning loop still needs a finite cap.
+  Both timeout types interrupt rather than automatically resume the agent, and
+  the run record identifies `timeout_kind` (`idle` or `runtime`) and `stop_detail`.
+  Owned processes receive SIGINT, then remaining process-session members receive
+  SIGKILL after five seconds.
+
+The timeout defaults were calibrated against a September 2026 sample of 300 Mu
+session histories across 11 local and archived projects (JSONL and legacy SQLite).
+Among 724 clean completed turns, median runtime was about 95 seconds, p95 about
+16 minutes, p99 about 32
+minutes, and the longest about 57 minutes. The longest within-turn durable-event
+gap was 20 minutes, including a long Bash command. A 60-minute idle allowance
+leaves three times that observed quiet interval; a 24-hour runtime cap leaves
+ample room beyond the observed complete runs. User think time, unfinished turns,
+and failure/interruption cases were excluded from the clean baseline. Journal
+gaps are only a conservative proxy for silence: token streaming and intermediate
+tool output can occur between durable events. This sample is not a guarantee
+about future workloads; raise either limit for known long, quiet work.
+
+When a limit fires, inspect `mub status`, `mub show T1`, and `mub logs RUN_ID` (or
+F2 in the TUI). Fix the cause before continuing. Answer a blocked task in natural
+language to authorize another attempt, or use the explicit recovery controls.
+After the **board-wide budget** is exhausted, run **`mub replan`** from your own
+terminal to grant another batch. This does not reset task limits or cooldowns;
+agents cannot invoke this user control. Do not automate repeated grants.
+
+For a smaller unattended allowance, for example:
+
+```sh
+mub run --max-runs 12 --max-turns 4 --idle-timeout 3600 --max-runtime 86400
+```
+
+An invocation is **not** one API request: Mu can make many model/tool calls and
+perform its own provider retries within it. The board does not meter tokens,
+enforce a dollar ceiling, or prove semantic progress. Use provider-side spending
+limits where available. These controls cannot guarantee that an account will
+never be rate-limited or flagged, and unrestricted agent Bash is not a sandbox.
+
 ## Checkout and approval safety
 
 * There is no automatic stash, reset, branch switch, commit, push, or merge.
@@ -182,6 +254,8 @@ task status rather than treating owner exit as proof that every task succeeded.
   turns return to configured traps. The recovery reason and any authorizing user
   message are saved with the run. A new relevant message invalidates an approved
   retry that has not started yet, so the PM must assess it again.
+  If a traps-off invocation ends uncleanly, another retry requires fresh user
+  authorization: Mu would otherwise inherit the interrupted turn's traps-off policy.
 * A blocked task cannot resume just because a worker claims permission. The PM
   must cite a subsequent user message and explain its decision. The engine checks
   the message's source and freshness; the PM interprets its meaning. A changed
