@@ -66,9 +66,21 @@ def read_state(root):
         return fresh_state()
     data = json.loads(path.read_text())
     if data.get("version") == 1:
-        return migrate(data)
+        data = migrate(data)
     if data.get("version") != 2:
         raise ValueError("Unsupported mub snapshot version")
+    # Older snapshots did not link prompt events to their conversation entries.
+    linked = {e["message_id"] for e in data["events"] if "message_id" in e}
+    for event in reversed(data["events"]):
+        if event["handled"] or "message_id" in event or event["kind"] not in ("message", "submitted"):
+            continue
+        message = next((m for m in reversed(data["messages"])
+                        if m["role"] == "user" and m["id"] not in linked
+                        and m["task_id"] == event["task_id"] and m["created"] <= event["created"]
+                        and (event["kind"] == "submitted" or m["content"] == event["text"])), None)
+        if message:
+            event["message_id"] = message["id"]
+            linked.add(message["id"])
     return data
 
 
@@ -158,15 +170,19 @@ class Store:
         self.data["messages"].append(row)
         return row
 
-    def event(self, kind, task_id=None, text=""):
+    def event(self, kind, task_id=None, text="", *, message_id=None):
         self.data["dispatch"] = None
         row = dict(id=len(self.data["events"]) + 1, kind=kind, task_id=task_id,
                    text=text, handled=False, created=now())
+        if message_id is not None:
+            row["message_id"] = message_id
         self.data["events"].append(row)
         return row
 
     def pending(self):
-        return [e for e in self.data["events"] if not e["handled"]]
+        return sorted((e for e in self.data["events"] if not e["handled"]),
+                      key=lambda e: (not (e["kind"].startswith("worker_") or
+                                          (e["kind"] == "interrupted" and e["task_id"] is not None)), e["id"]))
 
 
 def update_task(task, **values):

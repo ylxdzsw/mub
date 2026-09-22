@@ -31,7 +31,22 @@ handles persistence and recovery, and bounds retries. It does not judge semantic
 completion or understand task dependencies. PMs and workers are sibling Mu
 processes, not recursively owned agents.
 
-## Tasks and dispatch
+## Queues and dispatch
+
+The board has two separate queues:
+
+- **Task queue:** work arranged and managed by the PM. Its order determines
+  which task may be dispatched next.
+- **Event queue:** pending messages to the PM, including user prompts and worker
+  outcomes or other worker events. Worker events take priority over user prompts;
+  events at the same priority are delivered in arrival order, one per PM turn.
+
+You can submit a prompt while the PM or a worker is running. It is saved and
+acknowledged immediately, then waits in the event queue if the PM is busy. It
+does not interrupt or invalidate the current PM turn. A successful PM plan
+acknowledges only that turn's event; queued prompts remain pending. Failed turns
+preserve their event for recovery. Both queues survive restarts. No worker is
+dispatched while messages to the PM remain pending.
 
 A task has an ID, display title, lifecycle state, worker session reference, and a
 **free-form PM note**. The note preserves the request, relevant clarifications,
@@ -115,7 +130,8 @@ Type ordinary messages to the PM: “Build these two features,” “What is blo
 T2?”, “Prioritize T3,” or “Pause after this worker.” Mention task IDs when useful.
 Letters are not board shortcuts while the prompt has focus.
 
-The task list sits above the PM conversation. Selecting a task opens its output
+The task queue sits above the PM conversation, where prompts are marked queued
+or processing until handled. Selecting a task opens its output
 in a right pane; clearing the selection restores the full-width conversation.
 
 | Key | Action |

@@ -470,7 +470,7 @@ class BoardSmoke(unittest.TestCase):
             finally:
                 board.close()
 
-    def test_stale_pm_plan_is_rejected_after_user_reply(self):
+    def test_user_prompts_queue_without_invalidating_pm_and_worker_events_go_first(self):
         root = self.project()
         plan = {"tasks": [{"id": 1, "title": "PM rewrite", "state": "queued"}]}
         with self.env(FAKE_MU_MODE="ok", FAKE_MU_PLAN=json.dumps(plan), FAKE_MU_DELAY="0.08"):
@@ -480,10 +480,26 @@ class BoardSmoke(unittest.TestCase):
                 task_id = board.request({"op": "add", "text": "original"})["task_id"]
                 board.tick()
                 self.assertIn("pm", board.active)
-                board.request({"op": "reply", "task_id": task_id, "text": "new information"})
-                self.until(board, lambda: "pm" not in board.active)
-                self.assertEqual(board.store.task(task_id)["title"], "original")
-                self.assertTrue(any(e["kind"] == "plan_failed" for e in board.data["events"]))
+                first = board.active["pm"]["record"]
+                reply = board.request({"op": "reply", "task_id": task_id, "text": "new information"})
+                self.assertTrue(reply["queued"])
+                worker_event = board.store.event("worker_progress", task_id, "Progress to assess")
+                later = board.request({"op": "reply", "text": "another request"})
+                self.until(board, lambda: board.data["runs"][0]["status"] == "finished")
+                self.assertEqual(board.store.task(task_id)["title"], "PM rewrite")
+                self.assertEqual(board.active["pm"]["event_ids"], [worker_event["id"]])
+                self.assertNotIn("new information", board._pm_prompt([worker_event]))
+                self.assertNotIn("another request", board._pm_prompt([worker_event]))
+                with self.assertRaisesRegex(ValueError, "user message"):
+                    board._user_evidence(dict(user_message_id=board.data["messages"][-1]["id"],
+                                              reason="Not delivered yet"), board.active["pm"])
+                self.assertEqual([e["id"] for e in board.store.pending()],
+                                 [worker_event["id"], reply["event_id"], later["event_id"]])
+                self.until(board, lambda: not board.active and not board.store.pending())
+                self.assertEqual([r["event_ids"] for r in board.data["runs"]],
+                                 [first["event_ids"], [worker_event["id"]], [reply["event_id"]], [later["event_id"]]])
+                self.assertFalse(any(e["kind"] == "plan_failed" for e in board.data["events"]))
+                self.assertEqual(board.data["guardrails"]["pm_failures"], 0)
             finally:
                 board.close()
 
@@ -616,7 +632,7 @@ class BoardSmoke(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "user message"):
                     board._validate_plan(dict(tasks=[dict(recovery, user_message_id=message_id)]), active)
             reply = board.store.message("user", "That action is fine, continue.")
-            with self.assertRaisesRegex(ValueError, "User input changed"):
+            with self.assertRaisesRegex(ValueError, "user message"):
                 board._validate_plan(dict(tasks=[dict(recovery, user_message_id=reply["id"])]), active)
             active["message_watermark"] = reply["id"]
             board._validate_plan(dict(tasks=[dict(recovery, user_message_id=reply["id"])]), active)
@@ -636,6 +652,9 @@ class BoardSmoke(unittest.TestCase):
             self.assertEqual(board.store.task(first["id"])["execution"]["mode"], "approve")
             board.request(dict(op="reply", text="Wait, do not run that command; the scope has changed."))
             first = board.store.task(first["id"])
+            self.assertEqual(first["execution"]["mode"], "approve")
+            self.assertIsNone(board.data["dispatch"])
+            board._prepare_pm(board.store.pending())
             self.assertEqual((first["state"], first["execution"]["gate"], first["execution"]["mode"]), ("review", "approval", "prompt"))
             self.assertNotIn("recovery_decision", first["execution"])
             active.update(revisions={t["id"]: t["execution"]["revision"] for t in board.data["tasks"]},

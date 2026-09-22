@@ -158,8 +158,10 @@ class _UI:
 
     def _notice(self):
         task = self._task()
+        processing = (self.state["pm"] or {}).get("event_ids", [])
+        queued = sum(e["id"] not in processing for e in self.state["events"])
         return self.ui_error or self.state["error"] or (task["execution"]["question"] if task else "") or (
-            "PM is working…" if self.state["pm"] else "Worker dispatch paused" if self.state["paused"] else
+            f"PM is working… · {queued} events queued" if self.state["pm"] else "Worker dispatch paused" if self.state["paused"] else
             "Waiting for PM dispatch" if not self.state["worker"] and self.state["dispatch"] is None
             and any(t["state"] == "queued" for t in self.state["tasks"]) else ""
         )
@@ -190,7 +192,7 @@ class _UI:
         self.board_scroll = max(0, min(self.board_scroll, index))
         if index >= self.board_scroll + visible:
             self.board_scroll = index - visible + 1
-        add(1, 1, f"Tasks · {len(tasks)} · ↑↓ select", attr=curses.A_DIM)
+        add(1, 1, f"Task queue · {len(tasks)} · ↑↓ select", attr=curses.A_DIM)
         for row, task in enumerate(tasks[self.board_scroll:self.board_scroll + visible], 2):
             state = task["state"].replace("needs_input", "blocked")
             marker = "›" if task["id"] == self.selected else " "
@@ -201,9 +203,13 @@ class _UI:
         if chat_rows:
             add(chat_y - 1, 1, "─ PM conversation · F2 history " + "─" * left, attr=curses.A_DIM)
             messages = [m for m in self.state["messages"] if m["task_id"] is None]
+            pending = {e.get("message_id"): e["id"] for e in self.state["events"]}
+            processing = (self.state["pm"] or {}).get("event_ids", [])
             lines = []
             for message in reversed(messages):
-                lines[:0] = _lines(f"{message['role']}: {message['content']}", left - 4)
+                event_id = pending.get(message["id"])
+                status = " (processing)" if event_id in processing else " (queued)" if event_id else ""
+                lines[:0] = _lines(f"{message['role']}{status}: {message['content']}", left - 4)
                 if len(lines) >= chat_rows:
                     break
             for row, line in enumerate(lines[-chat_rows:], chat_y):

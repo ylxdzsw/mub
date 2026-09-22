@@ -192,6 +192,7 @@ def run(root, args):
                 summary = dict(tasks=[dict(id=t["id"], title=t["title"], state=t["state"], question=t["execution"]["question"]) for t in state["tasks"]],
                                pm=state["pm"]["id"] if state["pm"] else None,
                                worker=state["worker"]["id"] if state["worker"] else None,
+                               events=[e["id"] for e in state["events"]],
                                dispatch=state["dispatch"],
                                error=state["error"], paused=state["paused"], guardrails=state["guardrails"])
                 if summary != last:

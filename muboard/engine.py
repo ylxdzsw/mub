@@ -182,7 +182,7 @@ class Engine:
                     dispatch=self.data["dispatch"],
                     pm=self.active.get("pm", {}).get("record"),
                     worker=self.active.get("worker", {}).get("record"),
-                    tasks=self.data["tasks"], messages=self.data["messages"][-100:],
+                    tasks=self.data["tasks"], events=self.store.pending(), messages=self.data["messages"][-100:],
                     runs=self.data["runs"][-100:])
 
     def request(self, req):
@@ -263,8 +263,8 @@ class Engine:
             result = dict(models=self.state()["models"])
         elif op == "add":
             task = self.store.add_task(req["text"], req.get("title"))
-            self.store.message("user", req["text"], task["id"])
-            self.store.event("submitted", task["id"])
+            message = self.store.message("user", req["text"], task["id"])
+            self.store.event("submitted", task["id"], message_id=message["id"])
             result = dict(task_id=task["id"])
         elif op == "reply":
             text = req["text"].strip()
@@ -274,19 +274,11 @@ class Engine:
             if task_id is not None:
                 task = self.store.task(int(task_id))
                 task_id = task["id"]
-                self.store.touch(task)
-            for task in self.data["tasks"]:
-                if task["execution"]["mode"] == "approve" and task_id in (None, task["id"]):
-                    update_task(task, mode="prompt", gate="approval")
-                    if task["state"] == "queued":
-                        task["state"] = "review"
-                    task["execution"].pop("recovery_decision", None)
-                    self.store.touch(task)
-            self.store.message("user", text, task_id)
-            self.store.event("message", task_id, text)
+            message = self.store.message("user", text, task_id)
+            event = self.store.event("message", task_id, text, message_id=message["id"])
             self.data["error"] = None
             self.data["guardrails"]["pm_failures"] = 0
-            result = dict(received=True)
+            result = dict(received=True, queued=True, event_id=event["id"])
         elif op == "pause":
             self.data["paused"] = bool(req["value"])
             self.store.event("dispatch_pause", text="User paused workers" if self.data["paused"] else "User unpaused workers")
@@ -392,6 +384,10 @@ class Engine:
         guardrails = self.data["guardrails"]
         if guardrails["runs"] >= self.max_runs:
             raise RuntimeError(self._budget_error())
+        events = self.store.pending()[:1] if kind == "pm" else []
+        if kind == "pm" and not recovery:
+            self._prepare_pm(events)
+            prompt = self._pm_prompt(events)
         # Reserve before starting Mu, including session creation and failed launches.
         guardrails["runs"] += 1
         self.store.save()
@@ -416,12 +412,19 @@ class Engine:
         active = dict(record=record, started=time.monotonic(), stop=None, plan=None,
                       revisions={t["id"]: t["execution"]["revision"] for t in self.data["tasks"]},
                       message_watermark=len(self.data["messages"]),
+                      event_ids=[e["id"] for e in events],
+                      message_ids=[m["id"] for m in self._pm_messages(events)],
                       watermark=max((e["id"] for e in self.store.pending()), default=0))
         if recovery:
             active.update(revisions={int(k): v for k, v in recovery["revisions"].items()},
                           message_watermark=recovery.get("message_watermark", 0),
                           watermark=recovery["watermark"], plan=recovery.get("plan"))
+            active["event_ids"] = recovery.get("event_ids", [e["id"] for e in self.data["events"]
+                                                            if e["id"] <= recovery["watermark"]])
+            active["message_ids"] = recovery.get("message_ids", [m["id"] for m in self.data["messages"]
+                                                                if m["id"] <= active["message_watermark"]])
         record.update(revisions=active["revisions"], watermark=active["watermark"],
+                      event_ids=active["event_ids"], message_ids=active["message_ids"],
                       message_watermark=active["message_watermark"])
         env = os.environ.copy()
         env.update(NO_COLOR="1", MUB_PROJECT=str(self.root))
@@ -516,9 +519,31 @@ class Engine:
         active["record"].update(timeout_kind=kind, stop_detail=detail)
         self._stop(active, "interrupted")
 
-    def _pm_prompt(self):
+    def _prepare_pm(self, events):
+        for event in events:
+            if event["kind"] != "message":
+                continue
+            for task in self.data["tasks"]:
+                if task["execution"]["mode"] == "approve" and event["task_id"] in (None, task["id"]):
+                    update_task(task, mode="prompt", gate="approval")
+                    if task["state"] == "queued":
+                        task["state"] = "review"
+                    task["execution"].pop("recovery_decision", None)
+                    self.store.touch(task)
+
+    def _pm_messages(self, events):
+        selected = {e["id"] for e in events}
+        deferred = {e["message_id"] for e in self.store.pending()
+                    if e["id"] not in selected and "message_id" in e}
+        messages = [m for m in self.data["messages"] if m["id"] not in deferred]
+        visible = {m["id"] for m in messages[-60:]} | {e.get("message_id") for e in events}
+        return [m for m in messages if m["id"] in visible]
+
+    def _pm_prompt(self, events=None):
+        if events is None:
+            events = self.store.pending()[:1]
         state = dict(tasks=self.data["tasks"],
-                     messages=self.data["messages"][-60:], events=self.store.pending(),
+                     messages=self._pm_messages(events), events=events,
                      paused=self.data["paused"], workspace_owner=self.data["hold"],
                      workspace_block=self.data["workspace_block"], workspace_status=self.workspace(),
                      recent_runs=[{k: r.get(k) for k in ("id", "kind", "task_id", "status", "result")}
@@ -532,6 +557,8 @@ Plan shape (fields optional except task id):
 New tasks use string aliases with title and note; order and dispatch may refer to those aliases. Multiple tasks per message are fine when requested. Preserve the user's goal and relevant clarifications in each note. Notes replace the previous text in full; they have no required schema. There is no separate project decisions store. Leave unchanged tasks out.
 
 The task list IS the queue order; order moves listed tasks to the front, preserving the others' relative order. Preserve submission order unless prerequisites or user priorities justify changing it. Dependencies are YOUR judgment, expressed in notes and ordering, not engine-enforced pointers. Do not run a dependent just because its prerequisite failed or was cancelled. Ordinary implementation steps can remain inside one worker task.
+
+The event queue is separate from the task queue. Handle the event supplied below in this turn; worker events take priority over queued user prompts. New prompts wait for a later turn without interrupting you. Conversation is context, not additional pending requests. Do not act on undelivered messages you may see through live status or history. Pending events prevent worker dispatch until they have been considered.
 
 Dispatch is an explicit, single-use authorization for the FIRST unfinished task. Omitted/null dispatch means wait; it never drains the queue automatically or skips a blocked task. Reassess after every worker outcome and relevant user input. Move independent work ahead if needed. Never preempt a running worker merely to reorder. A worker retains checkout ownership across review and follow-up; do not dispatch another task before resolving handoff. While a worker is running, omit dispatch and reconsider when it exits.
 
@@ -573,6 +600,7 @@ Do not loop on failing commands or unchanged results. After two unsuccessful att
         message = next((m for m in self.data["messages"] if m["id"] == message_id), None)
         if (type(message_id) is not int or not message or message["role"] != "user"
                 or not after < message_id <= active["message_watermark"]
+                or ("message_ids" in active and message_id not in active["message_ids"])
                 or message["task_id"] not in (None, task["id"] if task else None)):
             raise ValueError("Recovery requires a subsequent user message from this PM's context")
         if not isinstance(decision.get("reason"), str) or not decision["reason"].strip():
@@ -589,9 +617,6 @@ Do not loop on failing commands or unchanged results. After two unsuccessful att
     def _validate_plan(self, plan, active):
         if not isinstance(plan, dict) or set(plan) - {"reply", "tasks", "order", "dispatch", "paused", "baseline"}:
             raise ValueError("Plan fields: reply, tasks, order, dispatch, paused, baseline")
-        if any(m["role"] == "user" and m["id"] > active.get("message_watermark", len(self.data["messages"]))
-               for m in self.data["messages"]):
-            raise ValueError("User input changed during this PM turn; refresh required")
         if not isinstance(plan.get("reply", ""), str):
             raise ValueError("reply must be text")
         if "paused" in plan and type(plan["paused"]) is not bool:
@@ -793,8 +818,11 @@ Do not loop on failing commands or unchanged results. After two unsuccessful att
             self.store.message("pm", f"Checkout baseline accepted: {json.dumps(plan['baseline'], ensure_ascii=False)}")
         if plan.get("reply"):
             self.store.message("pm", plan["reply"])
+        event_ids = active.get("event_ids")
+        if event_ids is None:
+            event_ids = range(1, active["watermark"] + 1)
         for event in self.data["events"]:
-            if event["id"] <= active["watermark"]:
+            if event["id"] in event_ids:
                 event["handled"] = True
         dispatch = plan.get("dispatch")
         self.data["dispatch"] = aliases.get(dispatch, dispatch) if not self.store.pending() else None
@@ -968,7 +996,7 @@ Do not loop on failing commands or unchanged results. After two unsuccessful att
         if ("pm" not in self.active and self.store.pending() and not self.data["error"]
                 and time.time() >= self.data["guardrails"]["next_pm"]):
             try:
-                self._spawn("pm", self._pm_prompt())
+                self._spawn("pm", "")
             except Exception as error:
                 self.data["error"] = f"Cannot start PM: {error}"
                 self.store.save()
