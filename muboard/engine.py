@@ -126,7 +126,9 @@ class Engine:
     def workspace(self):
         result = subprocess.run(["git", "status", "--porcelain", "--untracked-files=normal"],
                                 cwd=self.root, capture_output=True, text=True, timeout=10)
-        return result.stdout.strip() if result.returncode == 0 else ""
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or "Cannot inspect the Git checkout")
+        return result.stdout.strip()
 
     def _mu(self, args, timeout=20):
         return subprocess.run([self.mu, *args], cwd=self.root, capture_output=True,
@@ -215,11 +217,11 @@ class Engine:
                 source = "invocation output"
             else:
                 if run["id"] not in self.replays:
-                    self.replays[run["id"]] = replay(self.root, run, self.mu).encode()
-                raw = self.replays[run["id"]]
+                    text, source = replay(self.root, run, self.mu)
+                    self.replays[run["id"]] = text.encode(), source
+                raw, source = self.replays[run["id"]]
                 size = len(raw)
                 chunk = raw[offset:offset + 65536] if "offset" in req else raw
-                source = "archived invocation" if run.get("log_path") else "Mu session replay (all turns)"
             end = offset + len(chunk)
             decoder = codecs.getincrementaldecoder("utf-8")("replace")
             text = decoder.decode(chunk, final=run["status"] not in ("starting", "running") and end == size)
@@ -276,8 +278,6 @@ class Engine:
                 task_id = task["id"]
             message = self.store.message("user", text, task_id)
             event = self.store.event("message", task_id, text, message_id=message["id"])
-            self.data["error"] = None
-            self.data["guardrails"]["pm_failures"] = 0
             result = dict(received=True, queued=True, event_id=event["id"])
         elif op == "pause":
             self.data["paused"] = bool(req["value"])
@@ -296,7 +296,8 @@ class Engine:
             if not runs or runs[-1]["status"] != "approval":
                 raise ValueError("The latest PM run is not waiting for command approval")
             self.pm_recovery = copy.deepcopy(runs[-1])
-            self.data["error"] = None
+            self.data["error"] = ("PM retry approved, awaiting launch. If the owner restarts before launch, "
+                                  "use mub approve-pm --yes again, or send a message for a fresh PM turn.")
             self.store.message("system", "User approved one PM Mu retry with traps off through the recovery control.")
             result = dict(queued=True)
         elif op in ("resume", "approve"):
@@ -322,6 +323,8 @@ class Engine:
             result = dict(queued=True)
         elif op in ("cancel", "stop"):
             task = self.store.task(int(req["task_id"]))
+            if op == "cancel" and task["state"] == "done":
+                raise ValueError("Completed tasks cannot be cancelled")
             worker = self.active.get("worker")
             if worker and worker["record"]["task_id"] == task["id"]:
                 self._stop(worker, "cancelled" if op == "cancel" else "interrupted")
@@ -355,6 +358,10 @@ class Engine:
             result = dict(stopping=mode)
         else:
             raise ValueError(f"Unknown operation: {op}")
+        if op in ("add", "reply"):
+            self.pm_recovery = None
+            self.data["error"] = None
+            self.data["guardrails"]["pm_failures"] = 0
         self.store.save()
         return result
 
@@ -661,6 +668,8 @@ Do not loop on failing commands or unchanged results. After two unsuccessful att
                 if active["revisions"].get(key) != task["execution"]["revision"]:
                     raise ValueError(f"T{key} changed during this PM turn; refresh required")
                 state = patch.get("state", task["state"])
+                if task["state"] == "done" and state == "cancelled":
+                    raise ValueError("Completed tasks cannot be cancelled")
                 if state == "done" and task["state"] not in ("review", "done"):
                     raise ValueError("Only a reviewed worker result can be marked done")
                 if state == "done" and task["state"] != "done":
@@ -713,17 +722,24 @@ Do not loop on failing commands or unchanged results. After two unsuccessful att
         order = [aliases.get(key, key) for key in order]
         if len(set(order)) != len(order) or any(key not in current for key in order):
             raise ValueError("order must name distinct existing tasks or new labels")
-        order += [key for key in current if key not in order]
+        if any(key not in active["revisions"] and key not in aliases.values() for key in order):
+            raise ValueError("Cannot reorder tasks added after this PM turn started")
+        # Tasks created for this turn precede submissions that arrived while it ran.
+        deferred = [t["id"] for t in self.data["tasks"] if t["id"] not in active["revisions"]]
+        order += [key for key in current if key not in order and key not in deferred]
+        order += deferred
         current = {key: current[key] for key in order}
         if "order" in plan or plan.get("dispatch") is not None:
             for task in self.data["tasks"]:
-                if active["revisions"].get(task["id"]) != task["execution"]["revision"]:
+                if task["id"] in active["revisions"] and active["revisions"][task["id"]] != task["execution"]["revision"]:
                     raise ValueError("Task order changed during this PM turn; refresh required")
         dispatch = plan.get("dispatch")
         if dispatch is not None:
             if type(dispatch) not in (int, str):
                 raise ValueError("dispatch must be a task id or null")
             dispatch = aliases.get(dispatch, dispatch)
+            if dispatch not in active["revisions"] and dispatch not in aliases.values():
+                raise ValueError("Cannot dispatch tasks added after this PM turn started")
             head = next((t for t in current.values() if t["state"] not in ("done", "cancelled")), None)
             if not head or head["id"] != dispatch or head["state"] != "queued" or head["execution"]["gate"]:
                 raise ValueError("Only the first unfinished, queued task can be dispatched; reorder or resolve blockers first")
@@ -926,7 +942,7 @@ Do not loop on failing commands or unchanged results. After two unsuccessful att
 
     def _budget_error(self):
         return (f"Board invocation budget exhausted ({self.data['guardrails']['runs']}/{self.max_runs}). "
-                "Inspect runs and blockers, then use mub replan to explicitly grant another batch. "
+                "Inspect runs and blockers, then use mub replan (or /replan in the TUI) to explicitly grant another batch. "
                 "Messages and restarts do not renew this budget.")
 
     def _ready(self):
@@ -975,7 +991,7 @@ Do not loop on failing commands or unchanged results. After two unsuccessful att
                 return
             if (self.data["error"] or self.data["workspace_block"]
                     or self.data["guardrails"]["runs"] >= self.max_runs
-                    or (task["state"] == "queued" and not self._ready())):
+                    or (not self.store.pending() and (self.data["paused"] or not self._ready()))):
                 self.done = True
                 return
         if not self.active and self.data["guardrails"]["runs"] >= self.max_runs:
@@ -989,6 +1005,8 @@ Do not loop on failing commands or unchanged results. After two unsuccessful att
             self.pm_recovery = None
             try:
                 self._spawn("pm", "", recovery=recovery)
+                self.data["error"] = None
+                self.store.save()
             except Exception as error:
                 self.data["error"] = f"Cannot retry PM: {error}"
                 self.store.save()
@@ -1007,7 +1025,7 @@ Do not loop on failing commands or unchanged results. After two unsuccessful att
             self.server.drain(self.request)
             if self.store.pending() or self.stopping == "stop":
                 return
-        if self.data["paused"] and not self.stopping:
+        if self.data["paused"]:
             return
         ready = self._ready()
         if ready:

@@ -95,7 +95,7 @@ fields. Plans apply only after a clean PM exit; stale plans are rejected.
 ## Run
 
 Requires **Linux 5.3+ (pidfds), Python 3.12+, Git, and configured `mu` on PATH**.
-There are no Python runtime dependencies.
+Run inside a Git working tree. There are no Python runtime dependencies.
 
 ```sh
 ./mub -C /path/to/project
@@ -112,6 +112,9 @@ Without `-C`, the current working directory is the board's project; the board
 does not search parent directories. Mu retains its configuration, instructions,
 skills, traps, compaction, and journals. If Mu reports no project scope, the CLI
 calls `mu init`.
+Use the same project directory for the owner and every control command. Do not
+open separate boards in different subdirectories of the same checkout: owner
+locks are per board directory, not per Git working tree.
 
 Use **`/models`** in the TUI to select a PM model, worker model, or both. Choices
 persist and apply on the next invocation, including continuations. Selecting
@@ -129,6 +132,8 @@ Use `--model` to set both. Provider-qualified names avoid provider fallback.
 Type ordinary messages to the PM: “Build these two features,” “What is blocking
 T2?”, “Prioritize T3,” or “Pause after this worker.” Mention task IDs when useful.
 Letters are not board shortcuts while the prompt has focus.
+Selecting a task only changes the output pane; it does not retarget the prompt.
+Mention its task ID in your message, or use `mub reply T1 ...` for a task-scoped reply.
 
 The task queue sits above the PM conversation, where prompts are marked queued
 or processing until handled. Selecting a task opens its output
@@ -144,12 +149,13 @@ in a right pane; clearing the selection restores the full-width conversation.
 | `Esc` | Clear selection and collapse the task pane |
 | `F5` / `F6` | Shrink / widen the right pane |
 | `F2` | PM conversation and execution history |
-| `/help`, `/models`, `/quit` | Local UI commands |
+| `/help`, `/models`, `/replan`, `/quit` | Local UI commands; `/replan` confirms a new invocation budget |
 | `Ctrl-C`, or `Ctrl-D` on an empty prompt | Quit; confirm once if work or review is active |
 
 With output focused, arrows and `PgUp` / `PgDn` scroll, `Home` shows the beginning,
 `End` follows new output, and `[` / `]` select previous/next runs. Your prompt
 draft is preserved. Prefix a message with `//` to send a literal leading `/`.
+Task-scoped replies show the same queued/processing markers in the task pane.
 
 Output is read-only: opening it neither launches another agent nor forwards
 keystrokes to a worker. While the owner is open, invocation output is captured
@@ -161,7 +167,9 @@ use their archived logs. Dialogs continue process supervision.
 ## CLI and headless use
 
 Mutations go to the running owner over a private Unix socket. Only one owner may
-run per project. Status, task history, and Mu transcript replay also work offline.
+run per project. Status, task history, and Mu transcript replay also work with
+the owner closed. Session replay still requires Mu (use `--mu` for a custom
+executable); available archived invocation logs do not. No model request is made.
 
 ```sh
 mub add 'Add session expiration' --title 'Session expiration'
@@ -197,7 +205,8 @@ owned-agent callers based on socket peer process identity.
   with a replacement worker. Interrupted work requires user input to resume.
 - Existing checkout changes without an owner stop dispatch. The PM may accept
   them only with user authorization after inspection. Failed/cancelled work is
-  not silently passed to another task. There is no automatic stash, reset,
+  not silently passed to another task. Failed Git inspections are errors, never
+  evidence of a clean checkout. There is no automatic stash, reset,
   branch switch, push, or merge.
 - Worker exit code 3 goes to PM review. The PM inspects the complete trapped
   command and stdin, then decides whether it is routine work already authorized
@@ -216,9 +225,14 @@ owned-agent callers based on socket peer process identity.
 - The PM cannot approve its own trap override. A failed/trapped PM normally
   restarts in a fresh session after user input. The explicit user-only
   `approve-pm --yes` escape hatch permits one traps-off retry.
+  If the owner stops before that retry launches, explicit approval is required
+  again; it never silently substitutes a fresh turn. New user messages invalidate
+  an unlaunched PM approval and request normal PM reassessment instead.
 - Quitting stops supervision and interrupts owned processes after confirmation.
   `quit --finish` finishes only the current task, including review/follow-up,
-  stopping if intervention is needed. For remote use, keep the TUI in a
+  stopping if intervention is needed, dispatch is paused, or review produces no
+  actionable follow-up. Pending PM events are assessed before a follow-up starts.
+  For remote use, keep the TUI in a
   persistent terminal.
 
 The PM is trusted, not sandboxed. Its prompt delegates edits to workers, but
@@ -231,7 +245,8 @@ These are engine checks, not just PM instructions:
 
 - **32 PM/worker invocations per grant** (`--max-runs`), including failed launches.
   Counts survive restart and ordinary messages. Only user `mub replan` grants a
-  new board batch; it does not reset task limits or cooldowns.
+  new board batch (or confirmed `/replan` in the TUI); it does not reset task
+  limits or cooldowns. The local TUI command works even when the PM cannot run.
 - **Eight worker invocations per task grant** (`--max-turns`). More require fresh
   user evidence, which cannot be reused for later grants.
 - Two consecutive unsuccessful worker invocations block for user input. Two
@@ -286,12 +301,22 @@ PM dispatch authorization rather than replaying a saved launch decision.
 
 ## Checks
 
+The implementation has no framework layer: `cli.py` and `ui.py` submit the same
+requests to `engine.py`; `ipc.py` serializes remote requests onto that owner's
+thread; `state.py` owns snapshots and migration; `output.py` handles history
+replay. Lifecycle and authorization rules belong in the engine, not UI handlers.
+
 ```sh
 python -m compileall -q muboard
 python tests/smoke.py
 ```
 
 Smoke checks use temporary Git projects and a fake Mu executable, with no model
-requests. For real-model checks, use an isolated temporary `MU_CONFIG_DIR` with
+requests. They cover queue ordering, staged-plan isolation, checkout ownership,
+recovery/budget bounds, graceful shutdown, persistence/migration, output provenance,
+and a real PTY-driven TUI workflow. Run `tests/smoke.py` explicitly; the filename is
+not included in default `unittest discover` patterns.
+
+For real-model checks, use an isolated temporary `MU_CONFIG_DIR` with
 only the intended provider/model; Mu deep-merges provider configuration. Keep
 credential copies private and remove them afterward.

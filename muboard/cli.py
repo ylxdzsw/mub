@@ -113,8 +113,7 @@ def main():
                     response = call(root, dict(op="log", run_id=args.run_id))
                     result, source = response["text"], response["source"]
                 except RuntimeError:
-                    result = replay(root, record, args.mu)
-                    source = "archived invocation" if record.get("log_path") else "Mu session replay (all turns)"
+                    result, source = replay(root, record, args.mu)
                 print(f"[{source} · session {record['session']}]", file=sys.stderr)
                 print(result, end="")
                 return
@@ -146,7 +145,7 @@ def main():
                 req.update(plan=json.loads(text_arg(None)), token=os.environ.get("MUB_PM_TOKEN"))
             result = call(root, req)
         print(json.dumps(result, ensure_ascii=False, indent=2))
-    except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as error:
+    except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as error:
         print(f"mub: {error}", file=sys.stderr)
         raise SystemExit(1) from None
 

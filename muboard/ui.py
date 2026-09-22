@@ -12,6 +12,7 @@ from types import SimpleNamespace
 COMMANDS = {
     "/help": "Help and local commands",
     "/models": "Choose PM/worker models and reasoning effort",
+    "/replan": "Confirm a fresh board invocation budget and reassess work",
     "/quit": "Quit; confirm first if work is active",
 }
 
@@ -166,6 +167,12 @@ class _UI:
             and any(t["state"] == "queued" for t in self.state["tasks"]) else ""
         )
 
+    def _message_text(self, message):
+        event = next((e for e in self.state["events"] if e.get("message_id") == message["id"]), None)
+        processing = (self.state["pm"] or {}).get("event_ids", [])
+        status = " (processing)" if event and event["id"] in processing else " (queued)" if event else ""
+        return f"{message['role']}{status}: {message['content']}"
+
     def _draw_main(self):
         self.window.erase()
         height, width = self.window.getmaxyx()
@@ -203,13 +210,9 @@ class _UI:
         if chat_rows:
             add(chat_y - 1, 1, "─ PM conversation · F2 history " + "─" * left, attr=curses.A_DIM)
             messages = [m for m in self.state["messages"] if m["task_id"] is None]
-            pending = {e.get("message_id"): e["id"] for e in self.state["events"]}
-            processing = (self.state["pm"] or {}).get("event_ids", [])
             lines = []
             for message in reversed(messages):
-                event_id = pending.get(message["id"])
-                status = " (processing)" if event_id in processing else " (queued)" if event_id else ""
-                lines[:0] = _lines(f"{message['role']}{status}: {message['content']}", left - 4)
+                lines[:0] = _lines(self._message_text(message), left - 4)
                 if len(lines) >= chat_rows:
                     break
             for row, line in enumerate(lines[-chat_rows:], chat_y):
@@ -253,7 +256,7 @@ class _UI:
     def _command(self, text):
         command, *args = text.split()
         if command not in COMMANDS:
-            self.ui_error = "Ask the PM in plain language to manage tasks. Local commands: /help, /models, /quit."
+            self.ui_error = "Ask the PM in plain language to manage tasks. Local commands: " + ", ".join(COMMANDS) + "."
             return
         if args:
             self.ui_error = f"Usage: {command}"
@@ -262,6 +265,9 @@ class _UI:
         self.draft, self.cursor = "", 0
         if command == "/models":
             self._models()
+        elif command == "/replan":
+            if self._confirm("Grant more work?", "Grant a fresh board invocation budget and ask the PM to reassess? Task limits and retry cooldowns still apply."):
+                self._request(dict(op="replan"))
         elif command == "/quit":
             self._quit()
         else:
@@ -362,7 +368,7 @@ class _UI:
         else:
             heading, context, notice = "PM · conversation and execution", "", self.state["error"]
             messages = detail["messages"]
-        context += "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+        context += "\n".join(self._message_text(m) for m in messages)
         if run:
             context += f"\n\n── Mu output · run {view.run_index + 1}/{len(runs)} · {run['id']} ──\n"
             text = context + (text or "Waiting for Mu output…")
