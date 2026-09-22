@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT))
 from muboard.engine import Engine
 from muboard.cli import parser
 from muboard.ipc import ControlServer
-from muboard.state import Store
+from muboard.state import Store, read_state, update_task
 
 
 class BoardSmoke(unittest.TestCase):
@@ -47,11 +47,11 @@ class BoardSmoke(unittest.TestCase):
     def engine(self, root, **values):
         return Engine(root, mu=str(FAKE_MU), max_turns=3, timeout=3, **values)
 
-    def queue(self, engine, text="work", depends_on=None):
+    def queue(self, engine, text="work"):
         task = engine.store.add_task(text)
         task["state"] = "queued"
-        if depends_on is not None:
-            task["depends_on"] = list(depends_on)
+        if engine.data["dispatch"] is None:
+            engine.data["dispatch"] = task["id"]
         engine.store.save()
         return task
 
@@ -106,12 +106,12 @@ class BoardSmoke(unittest.TestCase):
         root = self.project()
         board = self.engine(root)
         try:
-            log = board.store.directory / "runs" / "activity.log"
-            log.write_text("")
-            active = dict(record=dict(log_path=str(log), session="activity"))
+            log = board.outputs["activity"] = tempfile.TemporaryFile()
+            active = dict(record=dict(id="activity", session="activity"))
             with patch("muboard.engine.owned_members", return_value=[]):
                 initial = board._activity(active)
-                log.write_text("new tool output\n")
+                log.write(b"new tool output\n")
+                log.flush()
                 output = board._activity(active)
                 self.assertNotEqual(initial, output)
                 journal = root / ".mu" / "sessions" / "activity.jsonl"
@@ -123,7 +123,7 @@ class BoardSmoke(unittest.TestCase):
                 self.assertEqual(hidden, board._activity(active))
             with patch("muboard.engine.owned_members", return_value=[(os.getpid(), "test")]):
                 before = board._activity(active)[1][os.getpid(), "test"]
-                log.read_bytes()
+                os.pread(log.fileno(), 100, 0)
                 after = board._activity(active)[1][os.getpid(), "test"]
                 self.assertGreater(after[1], before[1])  # rchar: even unrendered reads count.
                 self.assertGreaterEqual(after[0], before[0])  # CPU ticks, not elapsed process age.
@@ -168,14 +168,14 @@ class BoardSmoke(unittest.TestCase):
                 task_id = self.queue(board)["id"]
                 board.store.message("user", "Do the work", task_id)
                 board.tick()
-                self.until(board, lambda: board.store.task(task_id)["gate"] == "error")
+                self.until(board, lambda: board.store.task(task_id)["execution"]["gate"] == "error")
                 self.until(board, lambda: not board.active and not board.store.pending())
                 task = board.store.task(task_id)
-                deadline = task["retry_after"]
+                deadline = task["execution"]["retry_after"]
                 decision = dict(id=task_id, state="queued", recovery="retry", reason="Retry once")
-                active = dict(revisions={task_id: task["revision"]}, watermark=0,
+                active = dict(revisions={task_id: task["execution"]["revision"]}, watermark=0,
                               message_watermark=len(board.data["messages"]))
-                board._apply_plan(dict(tasks=[decision]), active)
+                board._apply_plan(dict(tasks=[decision], dispatch=task_id), active)
                 board.tick()
                 self.assertFalse(board.active)
                 self.assertFalse(board.idle())  # Cooldown is pending work, not completion.
@@ -184,16 +184,20 @@ class BoardSmoke(unittest.TestCase):
             board = self.engine(root)
             board.server = ControlServer(root)
             try:
-                self.assertEqual(board.store.task(task_id)["retry_after"], deadline)
-                self.assertEqual(board.store.task(task_id)["failed_runs"], 1)
+                self.assertEqual(board.store.task(task_id)["execution"]["retry_after"], deadline)
+                self.assertEqual(board.store.task(task_id)["execution"]["failed_runs"], 1)
+                self.until(board, lambda: not board.active and not board.store.pending())
+                task = board.store.task(task_id)
+                active.update(revisions={task_id: task["execution"]["revision"]}, message_watermark=len(board.data["messages"]))
+                board._apply_plan(dict(dispatch=task_id), active)
                 board.tick()
                 self.assertFalse(board.active)
                 with patch("muboard.engine.time.time", return_value=deadline + 1):
                     self.until(board, lambda: board.store.task(task_id)["state"] == "blocked")
                 task = board.store.task(task_id)
-                self.assertEqual(task["failed_runs"], 2)
+                self.assertEqual(task["execution"]["failed_runs"], 2)
                 self.assertEqual(len([r for r in board.data["runs"] if r["kind"] == "worker"]), 2)
-                active.update(revisions={task_id: task["revision"]}, message_watermark=len(board.data["messages"]))
+                active.update(revisions={task_id: task["execution"]["revision"]}, message_watermark=len(board.data["messages"]))
                 with self.assertRaisesRegex(ValueError, "user message"):
                     board._validate_plan(dict(tasks=[decision]), active)
                 with self.assertRaisesRegex(ValueError, "user message"):
@@ -242,21 +246,21 @@ class BoardSmoke(unittest.TestCase):
         board = self.engine(self.project())
         try:
             task = self.queue(board)
-            task.update(session="fake-session", turns=3, state="review")
+            update_task(task, session="fake-session", turns=3, state="review")
             message = board.store.message("user", "Another batch is fine")
             decision = dict(id=task["id"], state="queued", recovery="retry", reason="User granted turns",
                             user_message_id=message["id"])
-            active = dict(revisions={task["id"]: task["revision"]}, watermark=0,
+            active = dict(revisions={task["id"]: task["execution"]["revision"]}, watermark=0,
                           message_watermark=message["id"])
             with patch.object(board, "_session_status", return_value=dict(clean=True)):
                 board._apply_plan(dict(tasks=[decision]), active)
             task = board.store.task(task["id"])
-            self.assertEqual(task["turns"], 0)
-            task.update(turns=3, state="review")
-            active["revisions"][task["id"]] = task["revision"]
+            self.assertEqual(task["execution"]["turns"], 0)
+            update_task(task, turns=3, state="review")
+            active["revisions"][task["id"]] = task["execution"]["revision"]
             with self.assertRaisesRegex(ValueError, "user message"):
                 board._validate_plan(dict(tasks=[decision]), active)
-            task.update(turns=1, state="blocked", gate="interrupted")
+            update_task(task, turns=1, state="blocked", gate="interrupted")
             board.data["runs"].append(dict(id="interrupted", kind="worker", session=task["session"],
                                            status="interrupted", trap_override="off", clean=False))
             with self.assertRaisesRegex(ValueError, "explicitly approve"):
@@ -274,9 +278,9 @@ class BoardSmoke(unittest.TestCase):
         root = self.project()
         first = self.engine(root)
         try:
-            self.assertEqual((root / ".mub" / ".gitignore").read_text(), "*\n")
-            self.assertTrue((root / ".mub" / "state.json").exists())
-            self.assertTrue((root / ".mub" / "owner.lock").exists())
+            self.assertIn("/mub.json\n", (root / ".mu" / ".gitignore").read_text())
+            self.assertTrue((root / ".mu" / "mub.json").exists())
+            self.assertTrue((root / ".mu" / "mub.lock").exists())
             with self.assertRaisesRegex(RuntimeError, "already has a running mub"):
                 self.engine(root)
             task = first.store.add_task("durable request")
@@ -287,16 +291,100 @@ class BoardSmoke(unittest.TestCase):
                 cwd=root, text=True, capture_output=True, check=True,
             )
             self.assertEqual(status.stdout, "")
-            self.assertEqual(subprocess.run(["git", "check-ignore", "-q", ".mub/.gitignore"], cwd=root).returncode, 0)
-            self.assertEqual(subprocess.run(["git", "check-ignore", "-q", ".mub/state.json"], cwd=root).returncode, 0)
+            self.assertEqual(subprocess.run(["git", "check-ignore", "-q", ".mu/mub.lock"], cwd=root).returncode, 0)
+            self.assertEqual(subprocess.run(["git", "check-ignore", "-q", ".mu/mub.json"], cwd=root).returncode, 0)
         finally:
             first.close()
         reopened = self.engine(root)
         try:
-            self.assertEqual(reopened.store.task(task["id"])["request"], "durable request")
+            self.assertEqual(reopened.store.task(task["id"])["note"], "durable request")
             self.assertEqual(len(reopened.data["messages"]), 1)
         finally:
             reopened.close()
+
+    def test_legacy_snapshot_migrates_without_losing_history_or_editing_archive(self):
+        root = self.project()
+        legacy = root / ".mub"
+        legacy.mkdir()
+        (root / ".mu").mkdir()
+        ignore = root / ".mu" / ".gitignore"
+        ignore.write_text("# Existing Mu rules\nsessions/\n")
+        log = legacy / "archived.log"
+        log.write_text("archived worker output\n")
+        def task(key, priority, dependencies):
+            return dict(id=key, title=f"Task {key}", request=f"Original {key}", brief=f"Latest {key}",
+                        state="queued", priority=priority, depends_on=dependencies, question="", result="Last result",
+                        session=f"session-{key}", gate=None, turns=2, revision=4, mode="prompt", created="then", updated="then")
+        old = dict(version=1, tasks=[task(1, 0, []), task(2, 10, [1]), task(3, 5, [])],
+                   messages=[dict(id=1, role="user", content="Keep this conversation", task_id=None, created="then")],
+                   decisions=[dict(id=1, content="Keep this agreed decision", created="then")], events=[],
+                   runs=[dict(id="old", kind="worker", task_id=1, session="session-1", status="finished", log_path=str(log))],
+                   models=dict(pm=None, worker=None), paused=True, hold=1, workspace_block=None, error=None,
+                   guardrails=dict(runs=7, pm_failures=1, next_pm=100, max_runs=12))
+        original = json.dumps(old)
+        (legacy / "state.json").write_text(original)
+        with (legacy / "owner.lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(RuntimeError, "already has a running mub"):
+                Store(root)
+            self.assertFalse((root / ".mu" / "mub.json").exists())
+        store = Store(root)
+        try:
+            data = store.data
+            self.assertEqual(data["version"], 2)
+            self.assertEqual([t["id"] for t in data["tasks"]], [1, 2, 3])
+            self.assertEqual(data["hold"], 1)
+            self.assertEqual(data["guardrails"], old["guardrails"])
+            self.assertEqual(data["messages"][0], old["messages"][0])
+            self.assertIn("Keep this agreed decision", data["messages"][-1]["content"])
+            self.assertNotIn("decisions", data)
+            second = store.task(2)
+            self.assertEqual(set(second), {"id", "title", "state", "session", "note", "execution"})
+            self.assertIn("Original 2", second["note"])
+            self.assertIn("Latest 2", second["note"])
+            self.assertIn("Last result", second["note"])
+            self.assertIn("T1", second["note"])
+            self.assertEqual(second["execution"]["turns"], 2)
+            self.assertEqual(data["runs"], old["runs"])
+            self.assertEqual((legacy / "state.json").read_text(), original)
+            self.assertEqual(log.read_text(), "archived worker output\n")
+            self.assertTrue(ignore.read_text().startswith("# Existing Mu rules\nsessions/\n"))
+            self.assertEqual((root / ".mu" / "mub.json").stat().st_mode & 0o777, 0o600)
+            self.assertIsNone(data["dispatch"])
+        finally:
+            store.close()
+        self.assertEqual(read_state(root), data)
+
+    def test_live_output_is_temporary_and_history_replays_mu_after_reopen(self):
+        root = self.project()
+        with self.env(FAKE_MU_PLAN="{}"):
+            board = self.engine(root)
+            board.server = ControlServer(root)
+            try:
+                self.queue(board)
+                self.until(board, lambda: board.idle())
+                run = next(r for r in board.data["runs"] if r["kind"] == "worker")
+                chunk = board.request(dict(op="log", run_id=run["id"], offset=0))
+                self.assertIn("fake worker completed", chunk["text"])
+                self.assertEqual(chunk["source"], "invocation output")
+                self.assertNotIn("log_path", run)
+                self.assertNotIn("prompt_path", run)
+                self.assertFalse((root / ".mu" / "runs").exists())
+                self.assertFalse((root / ".mub").exists())
+            finally:
+                board.close()
+            reopened = self.engine(root)
+            try:
+                self.assertIsNone(reopened.data["dispatch"])
+                self.assertTrue(reopened.store.pending())
+                chunk = reopened.request(dict(op="log", run_id=run["id"], offset=0))
+                self.assertIn("fake worker completed", chunk["text"])
+                self.assertEqual(chunk["source"], "Mu session replay (all turns)")
+            finally:
+                reopened.close()
+            output = subprocess.run([sys.executable, str(ROOT / "mub"), "-C", str(root), "--mu", str(FAKE_MU),
+                                     "logs", run["id"]], capture_output=True, text=True, check=True)
+            self.assertIn("fake worker completed", output.stdout)
 
     def test_project_is_pwd_not_an_ancestor(self):
         parent = self.project()
@@ -314,8 +402,8 @@ class BoardSmoke(unittest.TestCase):
         subprocess.run([sys.executable, str(ROOT / "mub"), "--mu", str(FAKE_MU),
                         "--headless", "--until-idle"], cwd=child, env=environment,
                        capture_output=True, text=True, check=True, timeout=10)
-        self.assertTrue((child / ".mub/state.json").exists())
-        self.assertEqual(len(json.loads((parent / ".mub/state.json").read_text())["tasks"]), 1)
+        self.assertTrue((child / ".mu/mub.json").exists())
+        self.assertEqual(len(json.loads((parent / ".mu/mub.json").read_text())["tasks"]), 1)
 
     def test_model_choices_persist_and_do_not_change_running_work(self):
         root = self.project()
@@ -350,8 +438,7 @@ class BoardSmoke(unittest.TestCase):
     def test_pm_plan_is_staged_then_applied_atomically(self):
         root = self.project()
         with self.env(FAKE_MU_MODE="ok", FAKE_MU_PLAN=json.dumps({
-            "tasks": [{"id": "clarify", "title": "Clarify", "brief": "answer a question",
-                       "state": "needs_input", "question": "Which answer?"}],
+            "tasks": [{"id": "clarify", "title": "Clarify", "note": "Which answer?", "state": "blocked"}],
         })):
             board = self.engine(root)
             board.server = ControlServer(root)
@@ -362,15 +449,14 @@ class BoardSmoke(unittest.TestCase):
                 self.assertFalse(any(t["title"] == "Clarify" for t in board.data["tasks"]))
                 self.until(board, lambda: "pm" not in board.active)
                 task = next(t for t in board.data["tasks"] if t["title"] == "Clarify")
-                self.assertEqual(task["state"], "needs_input")
-                self.assertEqual(task["question"], "Which answer?")
+                self.assertEqual(task["state"], "blocked")
+                self.assertEqual(task["execution"]["question"], "Which answer?")
             finally:
                 board.close()
 
     def test_staged_pm_plan_is_discarded_on_unclean_exit(self):
         root = self.project()
-        plan = {"tasks": [{"id": "discard", "title": "Discard", "brief": "must not apply",
-                            "state": "needs_input", "question": "No apply"}]}
+        plan = {"tasks": [{"id": "discard", "title": "Discard", "note": "No apply", "state": "blocked"}]}
         with self.env(FAKE_MU_MODE="ok", FAKE_MU_PM_FAIL="1", FAKE_MU_PLAN=json.dumps(plan)):
             board = self.engine(root)
             board.server = ControlServer(root)
@@ -401,21 +487,54 @@ class BoardSmoke(unittest.TestCase):
             finally:
                 board.close()
 
-    def test_dependencies_block_and_cycles_are_rejected(self):
-        root = self.project()
-        board = self.engine(root)
+    def test_queue_requires_pm_dispatch_and_never_skips_a_blocked_head(self):
+        board = self.engine(self.project())
         try:
-            first = self.queue(board, "first")
-            second = self.queue(board, "second", [first["id"]])
-            self.assertEqual([t["id"] for t in board._ready()], [first["id"]])
-            first["state"] = "done"
+            first = self.queue(board, "prerequisite")
+            second = self.queue(board, "dependent; wait for prerequisite")
+            third = self.queue(board, "independent")
+            first["state"] = "blocked"
+            self.assertEqual(board._ready(), [])
+            active = dict(revisions={t["id"]: t["execution"]["revision"] for t in board.data["tasks"]},
+                          watermark=0, message_watermark=0)
+            with self.assertRaisesRegex(ValueError, "first unfinished"):
+                board._validate_plan(dict(dispatch=second["id"]), active)
+            with self.assertRaisesRegex(ValueError, "Unsupported task field"):
+                board._validate_plan(dict(tasks=[dict(id=second["id"], depends_on=[first["id"]])]), active)
+            board._apply_plan(dict(order=[third["id"]]), active)
+            self.assertEqual(board._ready(), [])
+            active["revisions"] = {t["id"]: t["execution"]["revision"] for t in board.data["tasks"]}
+            board._apply_plan(dict(dispatch=third["id"]), active)
+            self.assertEqual([t["id"] for t in board._ready()], [third["id"]])
+            board.store.event("changed")
+            self.assertEqual(board._ready(), [])
+        finally:
+            board.close()
+
+    def test_completion_requires_explicit_handoff_and_preserves_ownership(self):
+        board = self.engine(self.project())
+        try:
+            first = self.queue(board)
+            second = self.queue(board, "next")
+            first["state"] = "review"
+            board.data["hold"] = first["id"]
+            active = dict(revisions={t["id"]: t["execution"]["revision"] for t in board.data["tasks"]},
+                          watermark=0, message_watermark=0, workspace_status=board.workspace())
+            with self.assertRaisesRegex(ValueError, "handoff explanation"):
+                board._apply_plan(dict(tasks=[dict(id=first["id"], state="done")]), active)
+            self.assertEqual(board.data["hold"], first["id"])
+            board._apply_plan(dict(tasks=[dict(id=first["id"], state="queued", note="Finish the requested work and commit it.")],
+                                   dispatch=first["id"]), active)
+            self.assertEqual(board.data["hold"], first["id"])
+            first = board.store.task(first["id"])
+            first["state"] = "review"
+            active["revisions"][first["id"]] = first["execution"]["revision"]
+            board._apply_plan(dict(tasks=[dict(id=first["id"], state="done", handoff="Read-only task; nothing to commit")],
+                                   dispatch=second["id"]), active)
+            self.assertIsNone(board.data["hold"])
             self.assertEqual([t["id"] for t in board._ready()], [second["id"]])
-            active = {"revisions": {t["id"]: t["revision"] for t in board.data["tasks"]}}
-            with self.assertRaisesRegex(ValueError, "Dependency cycle"):
-                board._validate_plan({"tasks": [
-                    {"id": first["id"], "depends_on": [second["id"]]},
-                    {"id": second["id"], "depends_on": [first["id"]]},
-                ]}, active)
+            self.assertNotIn("handoff", board.store.task(first["id"]))
+            self.assertIn("nothing to commit", board.data["messages"][-1]["content"])
         finally:
             board.close()
 
@@ -443,7 +562,7 @@ class BoardSmoke(unittest.TestCase):
                     task = self.queue(board, "run a command")
                     board.store.message("user", "Implement the requested change", task["id"])
                     board.tick()
-                    self.until(board, lambda: board.store.task(task["id"])["gate"] == "approval")
+                    self.until(board, lambda: board.store.task(task["id"])["execution"]["gate"] == "approval")
                     session = board.store.task(task["id"])["session"]
                     if review == "block":
                         self.until(board, lambda: board.store.task(task["id"])["state"] == "blocked")
@@ -463,11 +582,12 @@ class BoardSmoke(unittest.TestCase):
                     self.assertTrue(runs[1]["recovery_decision"]["reason"])
                     if review == "block":
                         self.assertEqual(runs[1]["recovery_decision"]["user_message_id"], approval_message)
-                    data = json.loads((root / ".mub/fake-mu" / f"{session}.json").read_text())
+                    data = json.loads((root / ".mu/fake-mu" / f"{session}.json").read_text())
                     self.assertIn("retry", data["invocations"][1])
                     self.assertIn("--trap", data["invocations"][1])
                     current = board.store.task(task["id"])
                     current["state"] = "queued"
+                    board.data["dispatch"] = current["id"]
                     board.tick()
                     self.assertNotIn("--trap", board.active["worker"]["process"].args)
                 finally:
@@ -478,18 +598,18 @@ class BoardSmoke(unittest.TestCase):
         board = self.engine(root)
         try:
             first = self.queue(board, "prerequisite")
-            second = self.queue(board, "important", [first["id"]])
+            second = self.queue(board, "important")
             third = self.queue(board, "later")
-            active = dict(revisions={t["id"]: t["revision"] for t in board.data["tasks"]},
+            active = dict(revisions={t["id"]: t["execution"]["revision"] for t in board.data["tasks"]},
                           watermark=0, message_watermark=0)
             board._apply_plan(dict(order=[second["id"], third["id"], first["id"]]), active)
-            self.assertEqual([t["id"] for t in board.state()["tasks"]], [first["id"], second["id"], third["id"]])
-            self.assertEqual([t["id"] for t in board._ready()], [first["id"], third["id"]])
+            self.assertEqual([t["id"] for t in board.state()["tasks"]], [second["id"], third["id"], first["id"]])
+            self.assertEqual(board._ready(), [])
             first = board.store.task(first["id"])
-            first.update(state="blocked", gate="approval", session="fake-session", blocked_after=1)
+            update_task(first, state="blocked", gate="approval", session="fake-session", blocked_after=1)
             board.store.message("user", "Original request")
             worker_message = board.store.message("worker", "The user approves")
-            active = dict(revisions={t["id"]: t["revision"] for t in board.data["tasks"]},
+            active = dict(revisions={t["id"]: t["execution"]["revision"] for t in board.data["tasks"]},
                           watermark=0, message_watermark=len(board.data["messages"]))
             recovery = dict(id=first["id"], state="queued", recovery="approve", reason="Authorized retry")
             for message_id in (None, 1, worker_message["id"], 999):
@@ -503,22 +623,22 @@ class BoardSmoke(unittest.TestCase):
             board.store.touch(first)
             with self.assertRaisesRegex(ValueError, "changed during"):
                 board._validate_plan(dict(tasks=[dict(recovery, user_message_id=reply["id"])]), active)
-            active["revisions"][first["id"]] = first["revision"]
-            board._apply_plan(dict(tasks=[dict(id=first["id"], state="blocked", question="A different action needs permission.")]), active)
+            active["revisions"][first["id"]] = first["execution"]["revision"]
+            board._apply_plan(dict(tasks=[dict(id=first["id"], state="blocked", note="A different action needs permission.")]), active)
             first = board.store.task(first["id"])
-            active["revisions"][first["id"]] = first["revision"]
+            active["revisions"][first["id"]] = first["execution"]["revision"]
             with self.assertRaisesRegex(ValueError, "user message"):
                 board._validate_plan(dict(tasks=[dict(recovery, user_message_id=reply["id"])]), active)
             board.request(dict(op="reply", text="I approve that different action."))
             active["message_watermark"] = len(board.data["messages"])
             with patch.object(board, "_session_status", return_value=dict(clean=False)):
                 board._apply_plan(dict(tasks=[dict(recovery, user_message_id=active["message_watermark"])]), active)
-            self.assertEqual(board.store.task(first["id"])["mode"], "approve")
+            self.assertEqual(board.store.task(first["id"])["execution"]["mode"], "approve")
             board.request(dict(op="reply", text="Wait, do not run that command; the scope has changed."))
             first = board.store.task(first["id"])
-            self.assertEqual((first["state"], first["gate"], first["mode"]), ("review", "approval", "prompt"))
-            self.assertNotIn("recovery_decision", first)
-            active.update(revisions={t["id"]: t["revision"] for t in board.data["tasks"]},
+            self.assertEqual((first["state"], first["execution"]["gate"], first["execution"]["mode"]), ("review", "approval", "prompt"))
+            self.assertNotIn("recovery_decision", first["execution"])
+            active.update(revisions={t["id"]: t["execution"]["revision"] for t in board.data["tasks"]},
                           message_watermark=len(board.data["messages"]), paused=False)
             with self.assertRaisesRegex(ValueError, "reviewed worker result"):
                 board._validate_plan(dict(tasks=[dict(id=second["id"], state="done")]), active)
@@ -536,8 +656,10 @@ class BoardSmoke(unittest.TestCase):
             try:
                 task = self.queue(board, "retry me")
                 board.tick()
-                self.until(board, lambda: board.store.task(task["id"])["gate"] == "error")
+                self.until(board, lambda: board.store.task(task["id"])["execution"]["gate"] == "error")
                 session = board.store.task(task["id"])["session"]
+                self.until(board, lambda: not board.active and not board.store.pending())
+                os.environ["FAKE_MU_PLAN"] = json.dumps(dict(dispatch=task["id"]))
                 board.request({"op": "resume", "task_id": task["id"]})
                 self.until(board, lambda: "worker" in board.active and board.active["worker"]["record"]["session"] == session)
                 self.until(board, lambda: board.store.task(task["id"])["state"] == "review")
@@ -549,7 +671,7 @@ class BoardSmoke(unittest.TestCase):
     def test_pm_approval_requires_explicit_retry(self):
         root = self.project()
         with self.env(FAKE_MU_PM_TRAP="1", FAKE_MU_PLAN=json.dumps({
-            "tasks": [{"id": 1, "state": "needs_input", "question": "Which format?"}],
+            "tasks": [{"id": 1, "state": "blocked", "note": "Which format?"}],
         })):
             board = self.engine(root)
             board.server = ControlServer(root)
@@ -560,7 +682,7 @@ class BoardSmoke(unittest.TestCase):
                 self.assertEqual(original["status"], "approval")
                 self.assertEqual(board.store.task(1)["state"], "inbox")
                 board.request({"op": "approve_pm"})
-                self.until(board, lambda: board.store.task(1)["state"] == "needs_input")
+                self.until(board, lambda: board.store.task(1)["state"] == "blocked")
                 self.assertEqual(board.data["runs"][-1]["session"], original["session"])
                 self.assertIsNone(board.data["error"])
             finally:
@@ -573,8 +695,8 @@ class BoardSmoke(unittest.TestCase):
             board.server = ControlServer(root)
             try:
                 board.request({"op": "add", "text": "Inspect the project"})
-                self.until(board, lambda: (root / ".mub/fake-mu/peer-control.json").exists())
-                response = json.loads((root / ".mub/fake-mu/peer-control.json").read_text())
+                self.until(board, lambda: (root / ".mu/fake-mu/peer-control.json").exists())
+                response = json.loads((root / ".mu/fake-mu/peer-control.json").read_text())
                 self.assertFalse(response["ok"])
                 self.assertIn("requires user input", response["error"])
             finally:
@@ -589,11 +711,13 @@ class BoardSmoke(unittest.TestCase):
             self.until(board, lambda: (root / "dirty-worker.txt").exists())
             active = board.active["worker"]
             board.request({"op": "cancel", "task_id": task["id"]})
-            saved = json.loads((root / ".mub/state.json").read_text())
+            saved = json.loads((root / ".mu/mub.json").read_text())
             self.assertEqual(saved["runs"][-1]["stop_reason"], "cancelled")
             active["process"].wait(timeout=5)
             # Simulate the owner disappearing before it records the exit.
             board.active.clear()
+            for output in board.outputs.values():
+                output.close()
             board.store.close()
             recovered = self.engine(root)
             try:
@@ -617,7 +741,7 @@ class BoardSmoke(unittest.TestCase):
                     self.until(board, lambda: not board.active)
                     current = board.store.task(task["id"])
                     self.assertEqual(current["state"], state)
-                    self.assertEqual(current["gate"], gate)
+                    self.assertEqual(current["execution"]["gate"], gate)
                     self.assertEqual(board.data["hold"], task["id"])
                     self.assertTrue((root / "dirty-worker.txt").exists())
                 finally:
@@ -638,9 +762,9 @@ class BoardSmoke(unittest.TestCase):
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             deadline = time.monotonic() + 5
-            while not (root / ".mub" / "control.sock").exists() and time.monotonic() < deadline:
+            while not (root / ".mu" / "mub.sock").exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
-            self.assertTrue((root / ".mub" / "control.sock").exists())
+            self.assertTrue((root / ".mu" / "mub.sock").exists())
             status = subprocess.run([sys.executable, str(ROOT / "mub"), "-C", str(root), "status"],
                                     cwd=ROOT, env=environment, capture_output=True, text=True, check=True)
             self.assertTrue(json.loads(status.stdout)["root"].endswith(Path(root).name))
@@ -651,7 +775,7 @@ class BoardSmoke(unittest.TestCase):
             self.assertEqual(process.returncode, 0, stderr)
             state = json.loads(subprocess.run([sys.executable, str(ROOT / "mub"), "-C", str(root), "status"],
                                               cwd=ROOT, env=environment, capture_output=True, text=True, check=True).stdout)
-            self.assertTrue(any(task["request"] == "via control" for task in state["tasks"]))
+            self.assertTrue(any(task["note"] == "via control" for task in state["tasks"]))
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -683,7 +807,7 @@ class BoardSmoke(unittest.TestCase):
             pump()
 
         def state():
-            path = root / ".mub" / "state.json"
+            path = root / ".mu" / "mub.json"
             return json.loads(path.read_text()) if path.exists() else {"tasks": [], "messages": []}
 
         def wait(predicate):
@@ -713,7 +837,7 @@ class BoardSmoke(unittest.TestCase):
             self.assertTrue(any(r["kind"] == "worker" and r["status"] == "running" for r in state()["runs"]))
             wait(lambda: b"fake worker completed" in screen and state()["tasks"][0]["state"] == "done")
             worker = next(r for r in state()["runs"] if r["kind"] == "worker")
-            invocation = json.loads((root / ".mub/fake-mu" / f"{worker['session']}.json").read_text())["invocations"][0]
+            invocation = json.loads((root / ".mu/fake-mu" / f"{worker['session']}.json").read_text())["invocations"][0]
             self.assertEqual(invocation[invocation.index("-o") + 1], "concise")
             send("\x1b")
             send("\r")

@@ -10,7 +10,8 @@ import sys
 import time
 
 from .ipc import ControlServer, call
-from .state import read_state, ordered_tasks
+from .state import read_state
+from .output import replay
 
 
 def text_arg(value):
@@ -46,7 +47,7 @@ def run_options(parser, *, suppressed=False):
 
 
 def parser():
-    p = argparse.ArgumentParser(prog="mub", description="Mu Board — a project inbox, fresh PM turns, and one editing worker.")
+    p = argparse.ArgumentParser(prog="mub", description="Mu Board — worker supervision and an ordered task queue.")
     p.add_argument("-C", "--project", help="Project directory (default: current working directory)")
     run_options(p)
     sub = p.add_subparsers(dest="command")
@@ -61,9 +62,9 @@ def parser():
     reply.add_argument("task_id", type=task_id)
     reply.add_argument("text", nargs="?")
     sub.add_parser("status", help="Read board state as JSON, including when the TUI is closed")
-    show = sub.add_parser("show", help="Read a task's brief, discussion, and run history")
+    show = sub.add_parser("show", help="Read a task's note, discussion, and run history")
     show.add_argument("task_id", type=task_id)
-    logs = sub.add_parser("logs", help="Read captured Mu output")
+    logs = sub.add_parser("logs", help="Read live output or replay the Mu session")
     logs.add_argument("run_id")
     for name in ("cancel", "stop", "resume", "approve"):
         command = sub.add_parser(name)
@@ -75,9 +76,6 @@ def parser():
     sub.add_parser("replan", help="Grant a fresh board invocation budget and reconsider pending work")
     pm_approval = sub.add_parser("approve-pm", help="Allow one trapped PM turn to retry with all Bash traps off")
     pm_approval.add_argument("--yes", action="store_true")
-    priority = sub.add_parser("priority")
-    priority.add_argument("task_id", type=task_id)
-    priority.add_argument("priority", type=int)
     baseline = sub.add_parser("accept-baseline", help="Accept existing checkout changes and release workspace ownership")
     baseline.add_argument("--yes", action="store_true")
     shutdown = sub.add_parser("quit")
@@ -96,7 +94,6 @@ def main():
             return
         if command in ("status", "show", "logs"):
             state = read_state(root)
-            state["tasks"] = ordered_tasks(state["tasks"])
             if command == "status":
                 try:
                     result = call(root, dict(op="status"))
@@ -112,7 +109,14 @@ def main():
                 record = next((r for r in state["runs"] if r["id"] == args.run_id), None)
                 if not record:
                     raise ValueError("Unknown run")
-                print(Path(record["log_path"]).read_text(), end="")
+                try:
+                    response = call(root, dict(op="log", run_id=args.run_id))
+                    result, source = response["text"], response["source"]
+                except RuntimeError:
+                    result = replay(root, record, args.mu)
+                    source = "archived invocation" if record.get("log_path") else "Mu session replay (all turns)"
+                print(f"[{source} · session {record['session']}]", file=sys.stderr)
+                print(result, end="")
                 return
         else:
             req = dict(op=command)
@@ -124,8 +128,6 @@ def main():
                 req["title"] = args.title
             elif command == "discuss":
                 req.update(op="reply", task_id=None)
-            elif command == "priority":
-                req["priority"] = args.priority
             elif command in ("pause", "unpause"):
                 req.update(op="pause", value=command == "pause")
             elif command == "approve" and not args.yes:
@@ -187,9 +189,10 @@ def run(root, args):
             while not engine.done:
                 engine.tick()
                 state = engine.state()
-                summary = dict(tasks=[dict(id=t["id"], title=t["title"], state=t["state"], question=t["question"]) for t in state["tasks"]],
+                summary = dict(tasks=[dict(id=t["id"], title=t["title"], state=t["state"], question=t["execution"]["question"]) for t in state["tasks"]],
                                pm=state["pm"]["id"] if state["pm"] else None,
                                worker=state["worker"]["id"] if state["worker"] else None,
+                               dispatch=state["dispatch"],
                                error=state["error"], paused=state["paused"], guardrails=state["guardrails"])
                 if summary != last:
                     print(json.dumps(summary, ensure_ascii=False), flush=True)

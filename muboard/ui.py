@@ -158,8 +158,10 @@ class _UI:
 
     def _notice(self):
         task = self._task()
-        return self.ui_error or self.state["error"] or (task["question"] if task else "") or (
-            "PM is working…" if self.state["pm"] else "Worker dispatch paused" if self.state["paused"] else ""
+        return self.ui_error or self.state["error"] or (task["execution"]["question"] if task else "") or (
+            "PM is working…" if self.state["pm"] else "Worker dispatch paused" if self.state["paused"] else
+            "Waiting for PM dispatch" if not self.state["worker"] and self.state["dispatch"] is None
+            and any(t["state"] == "queued" for t in self.state["tasks"]) else ""
         )
 
     def _draw_main(self):
@@ -332,6 +334,7 @@ class _UI:
                     if chunk is not None:
                         buffer["text"] += chunk["text"]
                         buffer["offset"] = chunk["offset"]
+                        buffer["source"] = chunk["source"]
             view.next_fetch = time.monotonic() + 0.2
 
         def add(row, text, attr=0):
@@ -347,14 +350,12 @@ class _UI:
         text = view.buffers.get(run["id"], {}).get("text", "") if run else ""
         if task:
             heading = f"T{task['id']} · {task['title']} · {task['state']}"
-            context = f"Request\n{task['request']}\n\nBrief\n{task['brief'] or task['request']}\n"
+            context = f"Task note\n{task['note']}\n"
             messages = [m for m in detail["messages"] if m["role"] != "worker"]
-            notice = task["question"]
+            notice = task["execution"]["question"]
         else:
             heading, context, notice = "PM · conversation and execution", "", self.state["error"]
             messages = detail["messages"]
-            if detail["decisions"]:
-                context = "Decisions\n" + "\n".join(d["content"] for d in detail["decisions"]) + "\n\n"
         context += "\n".join(f"{m['role']}: {m['content']}" for m in messages)
         if run:
             context += f"\n\n── Mu output · run {view.run_index + 1}/{len(runs)} · {run['id']} ──\n"
@@ -364,7 +365,7 @@ class _UI:
         add(0, heading, self.colors.get("title", 0))
         status = f"{'following' if view.follow else 'scrollback'} · read-only"
         if run:
-            status += f" · {run['status']} · {run.get('model') or 'Mu/session default'}"
+            status += f" · {run['status']} · {view.buffers.get(run['id'], {}).get('source', 'Mu output')} · {run.get('model') or 'Mu/session default'}"
         add(1, status, curses.A_DIM)
         add(2, self.ui_error or notice, self.colors.get("warn", 0))
         key = (text, width)

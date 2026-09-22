@@ -9,7 +9,7 @@ import time
 
 
 ROOT = Path(os.environ.get("MUB_PROJECT", Path.cwd()))
-STORE = ROOT / ".mub" / "fake-mu"
+STORE = ROOT / ".mu" / "fake-mu"
 
 
 def read_session(session):
@@ -23,6 +23,7 @@ def write_session(path, data):
 
 def new_session():
     STORE.mkdir(parents=True, exist_ok=True)
+    (STORE / ".gitignore").write_text("*\n")
     counter = STORE / "counter"
     number = int(counter.read_text()) + 1 if counter.exists() else 1
     counter.write_text(str(number))
@@ -85,15 +86,15 @@ def run_mu(arguments):
             plan = json.loads(os.environ.get("FAKE_MU_PLAN", "{}"))
             if os.environ.get("FAKE_MU_LOOP"):
                 tasks = socket_request({"op": "status"})["result"]["tasks"]
-                plan = {"tasks": [dict(id=t["id"], state="done") for t in tasks if t["state"] == "review"]
-                        + [dict(id="next", title="More work", brief="Repeat work", state="queued")]}
+                plan = {"tasks": [dict(id=t["id"], state="done", handoff="No changes to commit") for t in tasks if t["state"] == "review"]
+                        + [dict(id="next", title="More work", note="Repeat work", state="queued")]}
             if os.environ.get("FAKE_MU_TRAP_REVIEW"):
                 state = socket_request({"op": "status"})["result"]
                 plan = {"tasks": []}
                 for task in state["tasks"]:
-                    if task["gate"] == "approval":
+                    if task["execution"]["gate"] == "approval":
                         replies = [m for m in state["messages"] if m["role"] == "user"
-                                   and m["id"] > task.get("blocked_after", 0)
+                                   and m["id"] > task["execution"].get("blocked_after", 0)
                                    and m["task_id"] in (None, task["id"])]
                         if task["state"] == "blocked":
                             if replies and replies[-1]["content"] == "Yes, go ahead with that retry.":
@@ -105,16 +106,24 @@ def run_mu(arguments):
                                                       reason="Inspected the command; routine work within the user's request."))
                         else:
                             question = "This retry disables all Bash traps for one invocation. May I continue?"
-                            plan["tasks"].append(dict(id=task["id"], state="blocked", question=question))
+                            plan["tasks"].append(dict(id=task["id"], state="blocked", note=question))
                             plan["reply"] = question
                     elif task["state"] == "review":
-                        plan["tasks"].append(dict(id=task["id"], state="done", result="Verified worker output"))
+                        plan["tasks"].append(dict(id=task["id"], state="done", handoff="Verified output; no checkout changes to commit"))
             if os.environ.get("FAKE_MU_WORKFLOW"):
                 tasks = socket_request({"op": "status"})["result"]["tasks"]
                 plan = {"reply": "I'll arrange that work.", "tasks": [
-                    {"id": task["id"], "state": "done", "result": "Greeting complete"}
+                    {"id": task["id"], "state": "done", "handoff": "Greeting verified; no changes to commit"}
                     for task in tasks if task["state"] == "review"
-                ] if tasks else [{"id": "greeting", "title": "Greeting", "brief": "Implement a greeting", "state": "queued"}]}
+                ] if tasks else [{"id": "greeting", "title": "Greeting", "note": "Implement a greeting", "state": "queued"}]}
+            if any(os.environ.get(k) for k in ("FAKE_MU_LOOP", "FAKE_MU_TRAP_REVIEW", "FAKE_MU_WORKFLOW")):
+                tasks = socket_request({"op": "status"})["result"]["tasks"]
+                projected = {t["id"]: dict(t) for t in tasks}
+                for change in plan.get("tasks", []):
+                    projected.setdefault(change["id"], {}).update(change)
+                head = next((t for t in projected.values() if t["state"] not in ("done", "cancelled")), None)
+                if head and head["state"] == "queued":
+                    plan["dispatch"] = head["id"]
             response = socket_request({
                 "op": "plan",
                 "token": os.environ["MUB_PM_TOKEN"],

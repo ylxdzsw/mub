@@ -12,7 +12,7 @@ import threading
 
 class ControlServer:
     def __init__(self, root):
-        self.path = Path(root) / ".mub" / "control.sock"
+        self.path = Path(root) / ".mu" / "mub.sock"
         if len(os.fsencode(self.path)) > 100:
             raise ValueError("Project path is too long for a Unix control socket")
         # The owner lock has already been acquired; any old socket is stale.
@@ -81,7 +81,7 @@ class ControlServer:
 
 
 def call(root, request):
-    path = Path(root) / ".mub" / "control.sock"
+    path = Path(root) / ".mu" / "mub.sock"
     with socket.socket(socket.AF_UNIX) as client:
         client.settimeout(35)
         try:
