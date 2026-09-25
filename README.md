@@ -44,7 +44,9 @@ pick a session or inspect the scheduler's decisions and output.
 | `PgUp` / `PgDn` | Scroll conversation |
 | `Home` / `End` in conversation | Beginning / follow output |
 | `Ctrl-P` | Session picker, including scheduler output |
-| `Ctrl-C` | Interrupt and hold the selected session |
+| `Ctrl-C` in composer | Clear the current input buffer |
+| `Ctrl-C` in sidebar/conversation | Interrupt and hold the selected session |
+| `Q` / `Esc` in dialogs | Close information screens or cancel a picker |
 | `Ctrl-Q` | Quit; confirm before stopping active agents |
 | `Ctrl-A/E`, `Ctrl-U/K`, `Ctrl-W` | Ordinary line/word editing |
 
@@ -52,12 +54,18 @@ Local commands:
 
 - `/new [name]`: create and select a session.
 - `/close`: detach an idle session; confirm discarding any queued messages.
-- `/models [scheduler|worker|both]`: select models and reasoning effort.
+- `/model`: show the currently selected scheduler and worker models.
+- `/model scheduler|worker|both`: select models and reasoning effort.
 - `/resume`: release a session hold and explicitly authorize continuation of its
   interrupted turn, if any.
 - `/schedule`: recheck the workspace and scheduling. After a scheduler error,
   explicitly start a fresh scheduler session instead of retrying its old turn.
 - `/help`, `/quit`.
+
+Typing `/` in the composer opens a bounded command list, filtered as you type.
+Use `↑` / `↓` to select, `Tab` to fill the command before adding arguments,
+`Enter` to run it, or `Esc` to hide the list. At most five commands are shown;
+the list scrolls with the selection.
 
 Use `//` to send a literal leading slash. Viewing output never sends keystrokes
 to a worker. Dialogs keep process supervision running.

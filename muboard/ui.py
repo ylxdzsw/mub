@@ -50,7 +50,7 @@ class _UI:
     COMMANDS = {
         "/new [name]": "Create and select a session",
         "/close": "Close the selected session",
-        "/models [scheduler|worker|both]": "Choose catalog models and effort; defaults to both",
+        "/model [scheduler|worker|both]": "Show selected models, or choose models and effort for a role",
         "/resume [selected]": "Resume the selected session",
         "/schedule": "Explicitly recheck or recover the scheduler",
         "/help": "Show commands and keyboard controls",
@@ -64,6 +64,9 @@ class _UI:
         self.selected = sessions[0]["id"] if sessions else None
         self.drafts = {}
         self.draft, self.cursor = "", 0
+        self.command_query = None
+        self.command_index = 0
+        self.command_dismissed = False
         self.focus = "sidebar" if sessions else "composer"
         self.outputs = {}
         self.scrolls = {}
@@ -381,6 +384,7 @@ class _UI:
         if label_y >= 0:
             self._add(label_y, 0, "─" * max(0, width - 1), attr=curses.A_DIM)
         cursor = self._draw_composer(label_y, composer_top, composer_rows, width)
+        self._draw_commands(label_y, width)
         notice = self.ui_error
         if not notice:
             if session:
@@ -390,10 +394,54 @@ class _UI:
                 scheduler = self.state["scheduler"]
                 notice = scheduler.get("error") or scheduler.get("reason") or ""
         self._add(notice_y, 1, notice, width - 2, self.colors.get("error" if self.ui_error else "warn", 0))
-        self._add(height - 1, 0, "Tab/Shift-Tab panes · Enter focus/queue · Ctrl-P sessions · Ctrl-C interrupt · Ctrl-Q quit · /help",
+        ctrl_c = "clear input" if self.focus == "composer" else "interrupt"
+        self._add(height - 1, 0, f"Tab/Shift-Tab panes · Enter focus/queue · Ctrl-P sessions · Ctrl-C {ctrl_c} · Ctrl-Q quit · /help",
                   attr=curses.A_DIM)
         self._cursor((composer_top + cursor[0], cursor[1]) if cursor else None)
         self.window.refresh()
+
+    def _command_matches(self):
+        if self.draft != self.command_query:
+            self.command_query = self.draft
+            self.command_index = 0
+            self.command_dismissed = False
+        if (self.focus != "composer" or self.command_dismissed or self.cursor != len(self.draft)
+                or not self.draft.startswith("/") or any(char.isspace() for char in self.draft)):
+            return []
+        return [(name, description) for name, description in self.COMMANDS.items()
+                if name.split()[0].startswith(self.draft)]
+
+    def _draw_commands(self, bottom, width):
+        matches = self._command_matches()
+        visible = min(5, len(matches), max(0, bottom - 3))
+        if not visible or width < 8:
+            return
+        box_width = min(88, width - 2)
+        top = bottom - visible - 2
+        start = max(0, min(self.command_index - visible + 1, len(matches) - visible))
+        header = f" Commands {self.command_index + 1}/{len(matches)} · ↑↓ select · Tab fill · Enter run · Esc hide "
+        self._add(top, 1, "┌" + _clip(header, box_width - 2).ljust(box_width - 2, "─") + "┐", box_width, curses.A_DIM)
+        for row, index in enumerate(range(start, start + visible), top + 1):
+            name, description = matches[index]
+            line = _clip(f" {name}  {description}", box_width - 2)
+            self._add(row, 1, "│" + line + " " * (box_width - 2 - _width(line)) + "│", box_width,
+                      curses.A_REVERSE if index == self.command_index else 0)
+        self._add(bottom - 1, 1, "└" + "─" * (box_width - 2) + "┘", box_width, curses.A_DIM)
+
+    def _command_key(self, key):
+        matches = self._command_matches()
+        if not matches:
+            return False
+        if key in (curses.KEY_UP, curses.KEY_DOWN):
+            self.command_index = max(0, min(len(matches) - 1, self.command_index + (-1 if key == curses.KEY_UP else 1)))
+        elif key in (9, 13, curses.KEY_ENTER):
+            name = matches[self.command_index][0].split()[0]
+            self._set_draft(name + (" " if key == 9 else ""))
+            if key != 9:
+                self._submit()
+        else:
+            return False
+        return True
 
     def _insert(self, text):
         self.draft = self.draft[:self.cursor] + text + self.draft[self.cursor:]
@@ -448,11 +496,11 @@ class _UI:
         if command not in {item.split()[0] for item in self.COMMANDS}:
             self.ui_error = "Unknown command. Use /help for local commands."
             return
-        if command not in ("/new", "/models", "/resume") and argument:
+        if command not in ("/new", "/model", "/resume") and argument:
             self.ui_error = f"Usage: {command}"
             return
-        if command == "/models" and argument not in ("", "scheduler", "worker", "both"):
-            self.ui_error = "Usage: /models [scheduler|worker|both]"
+        if command == "/model" and argument not in ("", "scheduler", "worker", "both"):
+            self.ui_error = "Usage: /model [scheduler|worker|both]"
             return
         if command == "/resume" and argument not in ("", "selected"):
             self.ui_error = "Usage: /resume [selected]"
@@ -468,8 +516,16 @@ class _UI:
                 self.focus = "composer"
         elif command == "/close":
             self._close()
-        elif command == "/models":
-            self._models(argument or "both")
+        elif command == "/model":
+            if argument:
+                self._models(argument)
+            else:
+                self._info("Selected models", [
+                    *(f"{role.title()}: {self.state['models'].get(role) or 'Mu/session default'}"
+                      for role in ("scheduler", "worker")), "",
+                    "Use /model scheduler, /model worker, or /model both to change models and effort.",
+                    "Changes apply to later invocations; active workers keep their current model.",
+                ])
         elif command == "/resume":
             self._resume()
         elif command == "/schedule":
@@ -577,9 +633,6 @@ class _UI:
             self._getch()
 
     def _dialog_global(self, key):
-        if key == 3:
-            self._interrupt()
-            return True
         if key == 17:
             self._quit()
             return True
@@ -601,13 +654,13 @@ class _UI:
                           curses.A_REVERSE if index == selected else 0)
             if height >= 2:
                 self._add(height - 2, 1, self.ui_error, width - 2, self.colors.get("error", 0))
-            self._add(height - 1, 0, "↑↓ select · Enter choose · Esc cancel", attr=curses.A_DIM)
+            self._add(height - 1, 0, "↑↓ select · Enter choose · Q/Esc cancel", attr=curses.A_DIM)
             self._cursor()
             self.window.refresh()
             key = self._getch()
             if self._dialog_global(key):
                 continue
-            if key == 27:
+            if key in (3, 27, "q", "Q"):
                 return None
             if key in (10, 13, curses.KEY_ENTER):
                 return selected
@@ -645,20 +698,17 @@ class _UI:
             lines = _lines(message, max(2, width - 4))
             for row, line in enumerate(lines[:max(0, height - 3)], 2):
                 self._add(row, 2, line, width - 4)
-            self._add(height - 1, 0, "y confirm · n/Esc/Enter cancel", attr=curses.A_DIM)
+            self._add(height - 1, 0, "y confirm · n/Q/Esc/Enter cancel", attr=curses.A_DIM)
             self._cursor()
             self.window.refresh()
             key = self._getch()
-            if key == 3:
-                self._interrupt()
-                continue
             if key == 17:
                 if quit_shortcut:
                     self._quit()
                 else:
                     return False
                 continue
-            if key in (27, 10, 13, curses.KEY_ENTER, "n", "N"):
+            if key in (3, 27, 10, 13, curses.KEY_ENTER, "n", "N", "q", "Q"):
                 return False
             if key in ("y", "Y"):
                 return True
@@ -669,33 +719,40 @@ class _UI:
                  "Keyboard:", "  Ctrl-P         Pick a session", "  Tab/Shift-Tab  Cycle sidebar, conversation, composer",
                  "  ↑/↓            Move in sidebar; scroll in conversation; edit in composer",
                  "  Enter          Focus composer, or queue its message", "  Alt-Enter      Insert a newline (Ctrl-J also inserts one)",
-                 "  PgUp/PgDn      Scroll conversation", "  Ctrl-C         Interrupt the selected session", "  Ctrl-Q         Quit; confirms before stopping active agents",
+                 "  PgUp/PgDn      Scroll conversation", "  Ctrl-C         Clear composer input; interrupt session in other panes", "  Ctrl-Q         Quit; confirms before stopping active agents",
+                 "  /              List commands; ↑/↓ select, Tab fill, Enter run, Esc hide",
+                 "  Q/Esc          Close information screens or cancel pickers",
                  "  Ctrl-A/E       Start/end of line", "  Ctrl-U/K       Delete to start/end of line", "  Ctrl-W         Delete previous word"]
+        self._info("Mu Board help", lines)
+
+    def _info(self, title, lines):
         offset = 0
         while not self.engine.done:
             self._tick()
             self.window.erase()
             height, width = self.window.getmaxyx()
-            self._add(0, 1, "Mu Board help", width - 2, self.colors.get("title", 0))
+            self._add(0, 1, title, width - 2, self.colors.get("title", 0))
             visible = max(0, height - 2)
-            for row, line in enumerate(lines[offset:offset + visible], 1):
+            wrapped = [line for text in lines for line in _lines(text, max(2, width - 2))]
+            offset = min(offset, max(0, len(wrapped) - visible))
+            for row, line in enumerate(wrapped[offset:offset + visible], 1):
                 self._add(row, 1, line, width - 2)
-            self._add(height - 1, 0, "↑↓/PgUp/PgDn scroll · Esc close", attr=curses.A_DIM)
+            self._add(height - 1, 0, "↑↓/PgUp/PgDn scroll · Q/Esc close", attr=curses.A_DIM)
             self._cursor()
             self.window.refresh()
             key = self._getch()
             if self._dialog_global(key):
                 continue
-            if key in (27, "q", 10, 13, curses.KEY_ENTER):
+            if key in (3, 27, "q", "Q", 10, 13, curses.KEY_ENTER):
                 return
             if key in (curses.KEY_UP,):
                 offset = max(0, offset - 1)
             elif key in (curses.KEY_DOWN,):
-                offset = min(max(0, len(lines) - visible), offset + 1)
+                offset = min(max(0, len(wrapped) - visible), offset + 1)
             elif key == curses.KEY_PPAGE:
                 offset = max(0, offset - max(1, visible))
             elif key == curses.KEY_NPAGE:
-                offset = min(max(0, len(lines) - visible), offset + max(1, visible))
+                offset = min(max(0, len(wrapped) - visible), offset + max(1, visible))
 
     def _view_scroll(self, amount):
         scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
@@ -728,13 +785,18 @@ class _UI:
 
     def _main_key(self, key):
         if key == 3:
-            self._interrupt()
+            if self.focus == "composer":
+                self._set_draft("")
+            else:
+                self._interrupt()
             return
         if key == 17:
             self._quit()
             return
         if key == 16:
             self._pick_session()
+            return
+        if self._command_key(key):
             return
         if key == 9:
             self._cycle_focus()
@@ -744,6 +806,7 @@ class _UI:
             return
         if key == 27:
             if self.focus == "composer":
+                self.command_dismissed = True
                 self._alt_enter()
             else:
                 self.focus = "sidebar"
