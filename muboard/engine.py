@@ -296,16 +296,6 @@ SNAPSHOT:
 {json.dumps(snapshot, ensure_ascii=False)}
 """
 
-    def _worker_prompt(self, session, text, mode, action):
-        return f"""You are Mu session S{session['id']} ({session['name']}) in {self.root}, scheduled by mub.
-Execution mode: {mode}. Other readonly sessions may run concurrently and observe the live checkout. Do not launch other agents or change mub controls. Do not detach processes; stop your background jobs before returning. Queued messages are not instructions for this turn; only handle the message below.
-The checkout may have changed since your previous turn: inspect before relying on prior assumptions. Keep edits scoped to this request. Do not include unrelated changes in commits. Report what happened or the input needed; do not loop on provider failures or Mu bugs.
-{'Do not make workspace changes; write attempts will trap.' if mode == 'readonly' else 'You hold the writer slot for this turn. Leave unfinished edits intact rather than hiding or discarding them.'}
-
-{'SCHEDULER HANDOFF REQUEST' if action == 'commit' else 'USER MESSAGE'}:
-{text}
-"""
-
     def _spawn(self, *, session=None, message=None, action="schedule", mode="readonly", trap=None, snapshot=None):
         kind = "worker" if session else "scheduler"
         target = session if session else self.data["scheduler"]
@@ -323,12 +313,13 @@ The checkout may have changed since your previous turn: inspect before relying o
         if kind == "scheduler":
             prompt = self._scheduler_prompt(snapshot)
         elif action == "commit":
-            prompt = self._worker_prompt(session,
-                "Commit only this session's completed, task-owned changes so another writer can run. Do not blindly stage everything, commit incomplete work, or implement more work. If a safe handoff is not possible, explain why and return.", mode, action)
+            prompt = """<system-request>
+Commit only this session's completed, task-owned changes so another writer can proceed. Do not blindly stage everything, commit incomplete work, or implement additional work. If a safe handoff is not possible, explain why and return.
+</system-request>"""
         elif action == "retry":
             prompt = ""
         else:
-            prompt = self._worker_prompt(session, message["text"], mode, action)
+            prompt = message["text"]
         record = dict(id=uuid.uuid4().hex[:12], kind=kind, session_id=session["id"] if session else None,
                       session=mu_session, action=action, mode=mode, trap=trap or ("reversible" if mode == "readonly" else "destructive"),
                       origin=session["last"]["action"] if action == "retry" and session["last"] else action,

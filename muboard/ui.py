@@ -541,7 +541,7 @@ class _UI:
         if self.selected is None:
             self.ui_error = "No session selected. Create one with /new [name]."
             return
-        message = text[1:] if text.startswith("//") else text
+        message = text[1:] if text.startswith("//") else self.draft
         if self._request({"op": "send", "session_id": self.selected, "text": message}) is not None:
             self._set_draft("")
 

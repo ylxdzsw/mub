@@ -125,7 +125,8 @@ class SchedulerSmoke(unittest.TestCase):
     def test_fifo_late_messages_and_persistent_scheduler(self):
         self.config(scheduler_delay=0.12, worker_delay=0.15)
         board = self.board()
-        first = self.new(board, "read first")
+        raw = "  read first\n<example>α & β</example>\n\n"
+        first = self.new(board, raw)
         board.tick()
         self.assertIsNotNone(board._running(None))
         second = self.new(board, "read independent")
@@ -137,8 +138,8 @@ class SchedulerSmoke(unittest.TestCase):
         self.until(board, board.idle)
         self.assertFalse(board.data["messages"])
         turns = self.journal(first)["invocations"]
-        self.assertEqual([t["prompt"].split("USER MESSAGE:\n")[1].strip() for t in turns],
-                         ["read first", "read second", "read late"])
+        self.assertEqual([t["prompt"] for t in turns],
+                         [raw, "read second", "read late"])
         self.assertEqual(len(self.journal(second)["invocations"]), 1)
         scheduler = self.journal(board.data["scheduler"])
         self.assertGreaterEqual(len(scheduler["invocations"]), 3)
@@ -169,7 +170,9 @@ class SchedulerSmoke(unittest.TestCase):
         for session in (writer1, writer2):
             turns = self.journal(session)["invocations"]
             self.assertEqual(len(turns), 2)
-            self.assertIn("SCHEDULER HANDOFF REQUEST", turns[1]["prompt"])
+            self.assertEqual(turns[0]["prompt"], "write one" if session is writer1 else "write two")
+            self.assertTrue(turns[1]["prompt"].startswith("<system-request>\n"))
+            self.assertTrue(turns[1]["prompt"].endswith("\n</system-request>"))
 
     def test_interrupt_holds_and_new_message_is_not_retry_permission(self):
         board = self.board()

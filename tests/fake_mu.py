@@ -153,9 +153,9 @@ def main():
         delay(config.get("after_plan_delay", 0))
         return finish(0, json.dumps(plan), True)
 
-    task = data["prompt"].split("USER MESSAGE:\n", 1)[-1].strip()
+    task = data["prompt"]
     own_file = ROOT / f"work-{key}.txt"
-    if "SCHEDULER HANDOFF REQUEST" in data["prompt"]:
+    if task.startswith("<system-request>\n"):
         if own_file.exists() and not config.get("commit_refused"):
             subprocess.run(["git", "add", str(own_file)], check=True)
             subprocess.run(["git", "-c", "user.name=Fake", "-c", "user.email=fake@example.com", "commit", "-qm", "Fake handoff"], check=True)

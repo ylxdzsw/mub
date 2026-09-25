@@ -107,8 +107,7 @@ class Store:
         return session
 
     def submit(self, session_id, text):
-        text = text.strip()
-        if not text:
+        if not text.strip():
             raise ValueError("Message cannot be empty")
         session = self.session(session_id)
         # A reply is not permission to retry an interrupted turn.
