@@ -56,7 +56,7 @@ class ControlServer:
         self.thread.start()
 
     def drain(self, handle):
-        # A busy agent must not starve process supervision and its deadlines.
+        # Control traffic must not starve process supervision.
         for _ in range(64):
             try:
                 request, event, result, lock = self.requests.get_nowait()

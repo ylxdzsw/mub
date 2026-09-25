@@ -1,17 +1,29 @@
-"""Replay agent history from Mu; old boards retain their archived run logs."""
+"""Mu owns durable conversation history; mub only buffers live output."""
 
+import json
 from pathlib import Path
 import subprocess
 
 
-def replay(root, run, mu="mu"):
-    if run.get("log_path") and Path(run["log_path"]).exists():
-        return Path(run["log_path"]).read_text(errors="replace"), "archived invocation"
-    try:
-        result = subprocess.run([mu, "transcript", "-s", run["session"], "-o", "full"],
-                                cwd=root, capture_output=True, text=True, timeout=20)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Mu transcript replay timed out") from None
+def journal_path(root, session):
+    return Path(root) / ".mu" / "sessions" / f"{session}.jsonl"
+
+
+def delivery(root, session, offset, clean):
+    """Read only the appended part of a Mu journal, never infer delivery from exit alone."""
+    with journal_path(root, session).open("rb") as stream:
+        stream.seek(offset)
+        events = [json.loads(line) for line in stream if line.strip()]
+    queued = {e["prompt_id"] for e in events if e["type"] == "prompt_queued"}
+    materialized = {e["prompt_id"] for e in events if e["type"] == "prompt_materialized"}
+    if not queued:
+        return "undelivered"
+    return "complete" if clean and queued <= materialized else "interrupted"
+
+
+def replay(root, session, mu="mu", *, full=False):
+    result = subprocess.run([mu, "transcript", "-s", session, "-o", "full" if full else "concise"],
+                            cwd=root, capture_output=True, text=True)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Cannot replay Mu session")
-    return result.stdout, "Mu session replay (all turns)"
+    return result.stdout

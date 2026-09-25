@@ -1,1 +1,1 @@
-"""Mu Board: persistent work, ephemeral agents."""
+"""Mu sessions with scheduled message delivery."""

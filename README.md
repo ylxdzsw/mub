@@ -1,322 +1,212 @@
-# Mu Board
+# mub — Mu session scheduler
 
-A conversational worker supervisor and ordered work queue for
-[Mu](https://github.com/ylxdzsw/mu). **One checkout, one editing worker.**
+A terminal UI for [Mu](https://github.com/ylxdzsw/mu) sessions with scheduled
+message delivery. Navigate conversations like a terminal multiplexer, but queue
+input at any time—even while a session is working.
 
-The PM understands user messages and decides what happens next. Workers do the
-technical work. The orchestrator owns processes and remembers the board.
-
-## Roles
-
-The PM has two jobs:
-
-1. **Supervise workers.** Assess progress and actual completion, request focused
-   follow-ups, choose retries and justified traps-off recovery, and ask the user
-   about genuine blockers. Normally ask the worker to commit its task changes
-   before handing the checkout to another task. Waive this when there are no
-   changes or the next task can safely continue without an isolated baseline;
-   record the reason.
-2. **Manage the queue.** Interpret status questions, new requests, clarifications,
-   priority changes, cancellations, and pause/resume requests. A message can
-   request multiple tasks. Infer prerequisites and arrange the queue accordingly;
-   otherwise preserve submission order.
-
-The PM inspects evidence proportionately; substantial investigation, technical
-design, implementation, checks, and commits belong to workers. Discussion is not
-permission to implement. There is no autonomous roadmap, separate project-wide
-knowledge base, or expectation that the PM independently solves tasks.
-
-The orchestrator launches and monitors processes, enforces checkout ownership,
-handles persistence and recovery, and bounds retries. It does not judge semantic
-completion or understand task dependencies. PMs and workers are sibling Mu
-processes, not recursively owned agents.
-
-## Queues and dispatch
-
-The board has two separate queues:
-
-- **Task queue:** work arranged and managed by the PM. Its order determines
-  which task may be dispatched next.
-- **Event queue:** pending messages to the PM, including user prompts and worker
-  outcomes or other worker events. Worker events take priority over user prompts;
-  events at the same priority are delivered in arrival order, one per PM turn.
-
-You can submit a prompt while the PM or a worker is running. It is saved and
-acknowledged immediately, then waits in the event queue if the PM is busy. It
-does not interrupt or invalidate the current PM turn. A successful PM plan
-acknowledges only that turn's event; queued prompts remain pending. Failed turns
-preserve their event for recovery. Both queues survive restarts. No worker is
-dispatched while messages to the PM remain pending.
-
-A task has an ID, display title, lifecycle state, worker session reference, and a
-**free-form PM note**. The note preserves the request, relevant clarifications,
-prerequisites, progress, and handoff considerations without required headings.
-Supervisor bookkeeping is grouped separately under `execution`; it is not
-PM-editable planning metadata.
-
-The task list is the queue order. There are **no dependency pointers or numeric
-priorities**. The PM reasons about prerequisites from task notes and outcomes.
-Ordering alone is not proof that a prerequisite succeeded.
-
-Dispatch is an explicit, single-use PM authorization for the first unfinished
-queued task. The engine never drains the queue automatically or skips a blocked
-head. After a worker outcome or relevant user input, the PM reassesses before
-another worker invocation. It can move independent work ahead, but cannot give
-another task a checkout still owned by the current worker. Reordering does not
-interrupt running work.
-
-A clean worker exit goes to **Review**, not Done. The PM may request more work,
-ask a question, or accept completion with an explicit checkout-handoff
-explanation. A worker retains ownership through review, clarification, and repair
-turns. Commits are made by the worker when asked, not automatically by the engine.
-
-The PM stages a small JSON plan through `mub plan`:
-
-```json
-{
-  "reply": "The endpoint needs to come before its client.",
-  "tasks": [
-    {"id": "endpoint", "title": "Endpoint", "state": "queued", "note": "Implement the requested endpoint."},
-    {"id": "client", "title": "Client", "state": "queued", "note": "Implement its client after the endpoint succeeds. Reconsider if that work fails."}
-  ],
-  "order": ["endpoint", "client"],
-  "dispatch": "endpoint"
-}
-```
-
-Fields are optional except task patch IDs. New tasks need a title and note;
-notes replace their previous text in full. `order` moves listed tasks to the
-front and preserves the relative order of omitted tasks. Omitted or null
-`dispatch` means wait. A completion patch needs `handoff`, explaining the verified
-commit/clean checkout or why a clean baseline is unnecessary. Handoff and
-recovery explanations are saved with the conversation or run, not as new planning
-fields. Plans apply only after a clean PM exit; stale plans are rejected.
+**Every message goes through the scheduler.** Messages remain FIFO within each
+session; the scheduler chooses between sessions. Sessions are conversations, not
+tasks with a completion lifecycle.
 
 ## Run
 
-Requires **Linux 5.3+ (pidfds), Python 3.12+, Git, and configured `mu` on PATH**.
-Run inside a Git working tree. There are no Python runtime dependencies.
+Requires Linux with pidfds, Python 3.12+, Git, and configured `mu` on PATH. There
+are no Python runtime dependencies.
 
 ```sh
-./mub -C /path/to/project
-```
-
-Or install the entry point:
-
-```sh
+./mub -C /path/to/worktree
+# or
 uv tool install .
-mub -C /path/to/project
+mub
 ```
 
-Without `-C`, the current working directory is the board's project; the board
-does not search parent directories. Mu retains its configuration, instructions,
-skills, traps, compaction, and journals. If Mu reports no project scope, the CLI
-calls `mu init`.
-Use the same project directory for the owner and every control command. Do not
-open separate boards in different subdirectories of the same checkout: owner
-locks are per board directory, not per Git working tree.
+All directories in a Git worktree resolve to the same board at its root. Only
+one mub owner may run in that worktree. Mu invocations run at the worktree root.
+Do not run another editing agent against the same checkout outside mub.
 
-Use **`/models`** in the TUI to select a PM model, worker model, or both. Choices
-persist and apply on the next invocation, including continuations. Selecting
-**Mu/session default** removes the override. Listing models makes no model
-requests. CLI options override saved choices for the current launch:
+## UI
 
-```sh
-mub --pm-model codex/gpt-5.6-luna:medium --worker-model codex/gpt-5.6-luna:high
-```
+The sidebar lists sessions. The conversation pane shows Mu history and live
+output. The composer sends to the selected session. Mailbox entries are labeled
+pending, in-flight, or interrupted; they are not mistaken for delivered history.
+Drafts are kept separately for each session while the UI is open.
 
-Use `--model` to set both. Provider-qualified names avoid provider fallback.
+Create a session with `/new [name]`, then type its first message. Use `Ctrl-P` to
+pick a session or inspect the scheduler's decisions and output.
 
-## TUI
-
-Type ordinary messages to the PM: “Build these two features,” “What is blocking
-T2?”, “Prioritize T3,” or “Pause after this worker.” Mention task IDs when useful.
-Letters are not board shortcuts while the prompt has focus.
-Selecting a task only changes the output pane; it does not retarget the prompt.
-Mention its task ID in your message, or use `mub reply T1 ...` for a task-scoped reply.
-
-The task queue sits above the PM conversation, where prompts are marked queued
-or processing until handled. Selecting a task opens its output
-in a right pane; clearing the selection restores the full-width conversation.
-
-| Key | Action |
+| Shortcut | Action |
 | --- | --- |
-| Type, then `Enter` | Send a message |
-| `Ctrl-J` | Insert a newline; `Ctrl-S` also submits |
-| `←` / `→`, `Home` / `End`, Backspace / Delete | Edit prompt; `Ctrl-U` clears it |
-| `↑` / `↓` | Select a task without leaving the prompt |
-| `Tab`, or `Enter` on an empty prompt | Focus task output; `Tab` returns to the prompt |
-| `Esc` | Clear selection and collapse the task pane |
-| `F5` / `F6` | Shrink / widen the right pane |
-| `F2` | PM conversation and execution history |
-| `/help`, `/models`, `/replan`, `/quit` | Local UI commands; `/replan` confirms a new invocation budget |
-| `Ctrl-C`, or `Ctrl-D` on an empty prompt | Quit; confirm once if work or review is active |
+| `Tab` / `Shift-Tab` | Move between sidebar, conversation, and composer |
+| `↑` / `↓` in sidebar | Select a session |
+| `Enter` in sidebar/conversation | Focus the composer |
+| `Enter` in composer | Queue a message |
+| `Alt-Enter` or `Ctrl-J` | Insert a newline |
+| `PgUp` / `PgDn` | Scroll conversation |
+| `Home` / `End` in conversation | Beginning / follow output |
+| `Ctrl-P` | Session picker, including scheduler output |
+| `Ctrl-C` | Interrupt and hold the selected session |
+| `Ctrl-Q` | Quit; confirm before stopping active agents |
+| `Ctrl-A/E`, `Ctrl-U/K`, `Ctrl-W` | Ordinary line/word editing |
 
-With output focused, arrows and `PgUp` / `PgDn` scroll, `Home` shows the beginning,
-`End` follows new output, and `[` / `]` select previous/next runs. Your prompt
-draft is preserved. Prefix a message with `//` to send a literal leading `/`.
-Task-scoped replies show the same queued/processing markers in the task pane.
+Local commands:
 
-Output is read-only: opening it neither launches another agent nor forwards
-keystrokes to a worker. While the owner is open, invocation output is captured
-in temporary streams. **After reopening, history replays the referenced Mu
-session, including all its turns**, not an exact copy of an individual invocation's
-terminal output. The pane labels this distinction. Old migrated runs can still
-use their archived logs. Dialogs continue process supervision.
+- `/new [name]`: create and select a session.
+- `/close`: detach an idle session; confirm discarding any queued messages.
+- `/models [scheduler|worker|both]`: select models and reasoning effort.
+- `/resume`: release a session hold and explicitly authorize continuation of its
+  interrupted turn, if any.
+- `/schedule`: recheck the workspace and scheduling. After a scheduler error,
+  explicitly start a fresh scheduler session instead of retrying its old turn.
+- `/help`, `/quit`.
+
+Use `//` to send a literal leading slash. Viewing output never sends keystrokes
+to a worker. Dialogs keep process supervision running.
+
+A workspace-owner marker (`◆`) can remain on an idle or held session. That
+session still owns uncommitted changes and prevents another writer from starting.
+
+## Scheduling
+
+A persistent Mu scheduler wakes on message submissions and worker exits. It can
+run alongside workers, but only one scheduler invocation runs at a time. Events
+arriving during a scheduler turn are retained for another pass. Waiting does not
+poll the model.
+
+The scheduler sees pending messages, active workers, Git cleanliness, workspace
+ownership, latest worker responses, exit reasons, and complete trap evidence.
+It may dispatch several readers and at most one writer, or explain why nothing
+should run. It returns a small JSON decision as its final answer; runtime code
+validates it against current state before acting.
+
+The scheduler reasons about prerequisites from messages and outcomes; there is
+no dependency graph, numeric priority system, task decomposition, or PM review.
+A clean exit means the turn returned—not that mub verified its implementation.
+
+### Readers and the writer
+
+- Multiple readonly workers may run alongside one readwrite worker.
+- A session can have only one invocation at a time.
+- Readers observe the **live checkout**, not an isolated snapshot. The scheduler
+  can defer reads that need a stable baseline.
+- A new writer requires a clean checkout, or must be the session that already
+  owns its dirty changes.
+- An idle, trapped, failed, or held session retains ownership while its changes
+  remain uncommitted. Independent readers may still run.
+- Existing changes without a known owner block writer dispatch. Resolve them
+  manually, then use `/schedule` to recheck.
+
+Git checks include staged, unstaged, and non-ignored untracked files. mub never
+automatically stashes, resets, switches branches, rolls back, pushes, or accepts
+abandoned changes as another worker's baseline.
+
+### Traps and handoffs
+
+Readonly workers use `--trap reversible`. These are Mu's **model-declared risk
+traps, not a sandbox**. A trapped reader may be promoted to writer only when the
+writer slot and workspace ownership permit it.
+
+The scheduler may resolve a trap within the user's authorized work. Trap
+relaxation applies to the **rest of that turn**, not one command. Ordinary writes
+start with `--trap destructive`; the scheduler can choose `off` when that broader
+permission is justified. A subsequent normal turn gets a fresh access/trap
+policy. Single-command approval is not implemented.
+
+For a dirty handoff, the scheduler may ask the owning session to commit only its
+completed, task-owned changes or explain why it cannot. This is a visibly
+scheduler-authored request, which may precede queued user messages. It is not an
+implementation follow-up or permission to commit incomplete/unrelated work.
+An unsuccessful handoff does not cause repeated commit requests without new user
+input.
+
+The scheduler does not investigate implementation quality, repair failures,
+troubleshoot provider issues, or work around Mu bugs. Failures are exposed and
+may block dependent messages. They are not automatically retried.
+
+### Interruption and shutdown
+
+Interrupting a session records a user hold before signaling its processes. The
+hold blocks all automatic work, including queued messages, retries, and commit
+requests. Selecting a session, scrolling, or changing models does not release it.
+
+A new message releases the user hold for scheduling, but **does not authorize
+retrying an interrupted turn**. `mu retry` continues the old turn and cannot
+accept changed instructions. Use `/resume` explicitly after inspecting it; new
+messages remain queued behind the interrupted work.
+
+Quitting with active workers or a scheduler asks for confirmation, defaulting to
+Cancel. Confirmation stops every owned invocation and records interruptions
+before exiting. Workers are not left detached. Reopening does not silently
+restart user-interrupted sessions.
+
+There are no mub execution deadlines, inactivity watchdogs, or retry cooldowns;
+Mu owns execution timeouts. Explicit stopping uses SIGINT, followed by SIGKILL
+for remaining owned processes after a short shutdown grace period. A second
+interrupt forces termination immediately.
 
 ## CLI and headless use
 
-Mutations go to the running owner over a private Unix socket. Only one owner may
-run per project. Status, task history, and Mu transcript replay also work with
-the owner closed. Session replay still requires Mu (use `--mu` for a custom
-executable); available archived invocation logs do not. No model request is made.
+An open TUI or headless owner accepts mutations over a private local socket.
+Submissions do not implicitly start a daemon.
 
 ```sh
-mub add 'Add session expiration' --title 'Session expiration'
-mub reply T1 'Use a fixed lifetime of seven days.'
-mub discuss 'Prioritize T1 after its prerequisites are ready.'
-mub discuss 'Pause worker dispatch.'
-mub discuss 'Stop T2 for now.'
-mub discuss 'Yes, go ahead with the retry you described.'
-mub show T1
+mub new --name API 'Implement the API endpoint'
+mub send S1 'Use cursor-based pagination'
+mub new --name Investigation 'Read the existing authentication flow'
 mub status
-mub logs RUN_ID
-mub quit --finish
+mub logs S1
+mub interrupt S1
+mub resume S1
+mub remove S2                   # add --discard to discard pending messages
+mub models
+mub models --scheduler provider/model:low --worker provider/model:high
+mub models --worker default
+mub schedule
+mub quit --yes                  # explicitly stop running agents
 
 mub run --headless
 mub run --headless --until-idle
 ```
 
-`--until-idle` exits when no work is actionable, including blocked or paused work,
-missing dispatch authorization, or an error. Inspect task states; owner exit is
-not proof that all tasks succeeded. New submissions require an open owner, not
-an implicit background daemon.
+`send` also reads text from stdin. `status` and `logs` work without an open owner.
+`--until-idle` exits when no invocation or actionable scheduling event remains;
+held, blocked, or failed sessions may still have pending messages.
 
-Low-level `stop`, `cancel`, `resume`, `approve --yes`, `accept-baseline --yes`,
-`pause`, `unpause`, and `replan` controls remain for recovery and automation.
-Resume/approval still trigger PM queue reassessment before dispatch. Owned
-agents may inspect state and the PM may stage plans, but user controls reject
-owned-agent callers based on socket peer process identity.
-
-## Recovery and safety
-
-- Startup reconciles the snapshot with actual processes, Mu session locks, and
-  Git before dispatch. Live descendants of an old invocation prevent reopening
-  with a replacement worker. Interrupted work requires user input to resume.
-- Existing checkout changes without an owner stop dispatch. The PM may accept
-  them only with user authorization after inspection. Failed/cancelled work is
-  not silently passed to another task. Failed Git inspections are errors, never
-  evidence of a clean checkout. There is no automatic stash, reset,
-  branch switch, push, or merge.
-- Worker exit code 3 goes to PM review. The PM inspects the complete trapped
-  command and stdin, then decides whether it is routine work already authorized
-  by the user's request or requires a user decision. Worker claims are evidence,
-  not authorization.
-- An approved recovery is **one `mu retry --trap off` invocation**: all Bash traps
-  are disabled for that invocation, not just the displayed command. The PM must
-  judge that broader scope. Later normal turns restore configured traps. An
-  unclean traps-off retry requires fresh user authorization before another retry.
-- Interrupted sessions use `mu retry`; clean sessions receive a new prompt in
-  the same session. Retry completes the old turn before new instructions can be
-  delivered. A changed request is not permission to execute a rejected old command.
-- Unblocking requires a relevant subsequent user message and a PM explanation.
-  The engine checks source/freshness; the PM interprets meaning. New relevant
-  messages invalidate pending approved retries and dispatch authorization.
-- The PM cannot approve its own trap override. A failed/trapped PM normally
-  restarts in a fresh session after user input. The explicit user-only
-  `approve-pm --yes` escape hatch permits one traps-off retry.
-  If the owner stops before that retry launches, explicit approval is required
-  again; it never silently substitutes a fresh turn. New user messages invalidate
-  an unlaunched PM approval and request normal PM reassessment instead.
-- Quitting stops supervision and interrupts owned processes after confirmation.
-  `quit --finish` finishes only the current task, including review/follow-up,
-  stopping if intervention is needed, dispatch is paused, or review produces no
-  actionable follow-up. Pending PM events are assessed before a follow-up starts.
-  For remote use, keep the TUI in a
-  persistent terminal.
-
-The PM is trusted, not sandboxed. Its prompt delegates edits to workers, but
-unrestricted Bash can bypass that convention. Do not run another implementation
-agent in the same checkout.
-
-### Loop bounds
-
-These are engine checks, not just PM instructions:
-
-- **32 PM/worker invocations per grant** (`--max-runs`), including failed launches.
-  Counts survive restart and ordinary messages. Only user `mub replan` grants a
-  new board batch (or confirmed `/replan` in the TUI); it does not reset task
-  limits or cooldowns. The local TUI command works even when the PM cannot run.
-- **Eight worker invocations per task grant** (`--max-turns`). More require fresh
-  user evidence, which cannot be reused for later grants.
-- Two consecutive unsuccessful worker invocations block for user input. Two
-  unsuccessful PM plans pause automatic PM retries. A PM invocation accepts at
-  most three plan submissions, including corrections.
-- Retry cooldowns begin at 30 seconds and increase with the failure streak.
-  They survive restart and user replies.
-- **Inactivity timeout:** `--idle-timeout` (alias `--timeout`) defaults to 3600
-  seconds. Captured output, Mu journal activity, and owned-process CPU/I/O or
-  process changes count as activity; board polling and unrelated edits do not.
-- **Absolute fallback:** `--max-runtime` defaults to 86400 seconds, even for
-  active/noisy runs. Timeout type and stop detail are saved. Stops send SIGINT,
-  then SIGKILL to remaining owned process-session members after five seconds.
-
-Inspect the cause before granting more work. An invocation is not an API request;
-Mu can perform many model/tool calls within it. The board neither meters tokens
-nor guarantees useful progress or a dollar ceiling. Use provider spending limits
-where available.
+`--scheduler-model`, `--worker-model`, and `--model` override models for the current
+launch. UI/CLI model selections persist and apply only to later invocations,
+including existing sessions. “Mu/session default” removes an override.
 
 ## Persistence
 
-**`.mu/mub.json` is the single durable board snapshot.** It contains ordered tasks
-and notes, user/PM conversation and pending events, pause/dispatch state, checkout
-ownership, session/run references and recovery bookkeeping, and saved model
-choices. Run outcomes include bounded excerpts for PM assessment, not full
-transcript copies. Mu journals remain the source of detailed agent history; new boards do
-not write separate durable run logs, prompt files, or a decisions database.
+**`.mu/mub.json` is the only mub-owned durable state file.** It contains session
+references, mailboxes, in-flight invocation records, holds and outcomes, workspace
+ownership, pending scheduling events, and model choices. It is atomically replaced
+and locally Git-ignored via Git's `info/exclude` without editing tracked ignore
+configuration.
 
-```text
-.mu/
-  mub.json       # durable board snapshot (private, Git-ignored)
-  mub.lock       # stable owner lock, separate from the replaced snapshot
-  mub.sock       # private control socket while the owner runs
-  sessions/      # Mu's existing journals, not board-owned copies
-```
+Mu journals own delivered conversations. mub does not copy transcripts or archive
+terminal logs. Live output and full trap evidence are transient; history replays
+from Mu. Only bounded recent outcome excerpts are kept for scheduling. A stable
+owner lock and a live control socket are runtime artifacts in `.mu/`.
 
-The owner alone writes the snapshot, using a flushed temporary file and atomic
-replacement. A PM requests updates through plans, never by editing the snapshot.
-The owner adds targeted board entries to `.mu/.gitignore`, preserving existing
-entries; the rest of `.mu/` can contain tracked configuration and instructions.
-Previously tracked files are not untracked by ignore rules.
+A journal offset records each delivery boundary, allowing mub to distinguish a
+completed message from an invocation that never accepted its input. A crash
+leaves uncertain in-flight work held for explicit inspection and continuation;
+messages are not blindly resubmitted. Live processes from a previous
+owner prevent a replacement owner from starting. Removing a session only detaches
+it from mub; it never deletes the Mu journal or undoes edits.
 
-On first opening an old board, `.mub/state.json` is imported into the new format:
-old priority/dependency order becomes list order, requests/briefs/prerequisites
-become notes, and project decisions are retained as an imported conversation
-entry for the PM to carry into relevant task notes. Existing conversation,
-execution history, ownership, and budgets survive. The legacy owner lock is
-honored to prevent simultaneous old/new owners. **The old `.mub/` files are left
-untouched as an archive**; do not resume the same project with an older mub binary.
-After import, `.mu/mub.json` is authoritative. Reopening always requires fresh
-PM dispatch authorization rather than replaying a saved launch decision.
+Old task-board snapshots are **not automatically converted**. Opening one fails
+without overwriting it. Archive the old `.mu/mub.json` explicitly before starting
+a new board; Mu journals remain untouched.
 
 ## Checks
 
-The implementation has no framework layer: `cli.py` and `ui.py` submit the same
-requests to `engine.py`; `ipc.py` serializes remote requests onto that owner's
-thread; `state.py` owns snapshots and migration; `output.py` handles history
-replay. Lifecycle and authorization rules belong in the engine, not UI handlers.
-
 ```sh
-python -m compileall -q muboard
+python -m compileall -q muboard tests
 python tests/smoke.py
 ```
 
-Smoke checks use temporary Git projects and a fake Mu executable, with no model
-requests. They cover queue ordering, staged-plan isolation, checkout ownership,
-recovery/budget bounds, graceful shutdown, persistence/migration, output provenance,
-and a real PTY-driven TUI workflow. Run `tests/smoke.py` explicitly; the filename is
-not included in default `unittest discover` patterns.
-
-For real-model checks, use an isolated temporary `MU_CONFIG_DIR` with
-only the intended provider/model; Mu deep-merges provider configuration. Keep
-credential copies private and remove them afterward.
+Smoke checks use temporary Git worktrees and fake Mu processes, with no provider
+calls. They exercise mailbox delivery, reader/writer concurrency, clean handoffs,
+traps, failures, interruption holds, stale decisions, persistence, and a real
+PTY-driven UI workflow.

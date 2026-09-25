@@ -1,123 +1,62 @@
-"""Single-writer board snapshot. Mu owns agent journals."""
+"""The single mub snapshot; Mu owns conversation journals."""
 
 import fcntl
 import json
 import os
-from datetime import datetime, timezone
 from pathlib import Path
+import subprocess
 
 
-EXECUTION_FIELDS = {"gate", "turns", "revision", "mode", "created", "updated", "question",
-                    "failed_runs", "retry_after", "blocked_after", "recovery_decision"}
+def project_root(directory):
+    result = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=directory,
+                            capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "mub requires a Git worktree")
+    return Path(result.stdout.strip()).resolve()
 
 
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def migrate(data):
-    """Import v1 without modifying its snapshot or archived execution files."""
-    by_id = {t["id"]: t for t in data["tasks"]}
-    ordered, seen = [], set()
-
-    def visit(task):
-        if task["id"] in seen:
-            return
-        seen.add(task["id"])
-        for key in task.get("depends_on", []):
-            visit(by_id[key])
-        ordered.append(task)
-
-    for task in sorted(data["tasks"], key=lambda t: (-t.get("priority", 0), t["id"])):
-        visit(task)
-    for task in ordered:
-        note = task.pop("request", "")
-        brief = task.pop("brief", "")
-        if brief and brief != note:
-            note += "\n\nLatest instructions:\n" + brief
-        dependencies = task.pop("depends_on", [])
-        if dependencies:
-            note += "\n\nRequires successful completion of " + ", ".join(f"T{k}" for k in dependencies) + ". Reassess before dispatch."
-        task.pop("priority", None)
-        result = task.pop("result", "")
-        if result:
-            note += "\n\nLast outcome:\n" + result
-        task["execution"] = {key: task.pop(key) for key in EXECUTION_FIELDS if key in task}
-        if task["execution"].get("question"):
-            note += "\n\nBlocked: " + task["execution"]["question"]
-        if task["state"] == "needs_input":
-            task["state"] = "blocked"
-        task["note"] = note
-    data["tasks"] = ordered
-    decisions = data.pop("decisions", [])
-    if decisions:
-        data["messages"].append(dict(id=len(data["messages"]) + 1, role="system", task_id=None,
-                                     content="Imported project decisions (retain relevant context in task notes):\n"
-                                     + "\n".join(d["content"] for d in decisions), created=now()))
-    data.update(version=2, dispatch=None)
-    return data
+def fresh_state():
+    return dict(version=3, next_session=1, next_message=1, next_event=1,
+                sessions=[], messages=[], inflight=[], events=[], owner=None,
+                scheduler=dict(session=None, error=None, reason=""),
+                models=dict(scheduler=None, worker=None))
 
 
 def read_state(root):
     path = Path(root) / ".mu" / "mub.json"
     if not path.exists():
-        path = Path(root) / ".mub" / "state.json"
-    if not path.exists():
         return fresh_state()
     data = json.loads(path.read_text())
-    if data.get("version") == 1:
-        data = migrate(data)
-    if data.get("version") != 2:
-        raise ValueError("Unsupported mub snapshot version")
-    # Older snapshots did not link prompt events to their conversation entries.
-    linked = {e["message_id"] for e in data["events"] if "message_id" in e}
-    for event in reversed(data["events"]):
-        if event["handled"] or "message_id" in event or event["kind"] not in ("message", "submitted"):
-            continue
-        message = next((m for m in reversed(data["messages"])
-                        if m["role"] == "user" and m["id"] not in linked
-                        and m["task_id"] == event["task_id"] and m["created"] <= event["created"]
-                        and (event["kind"] == "submitted" or m["content"] == event["text"])), None)
-        if message:
-            event["message_id"] = message["id"]
-            linked.add(message["id"])
+    if data.get("version") != 3:
+        raise ValueError("This is an old task-board snapshot. Archive .mu/mub.json before starting the session scheduler; Mu journals are unchanged.")
     return data
-
-
-def fresh_state():
-    return dict(version=2, tasks=[], messages=[], events=[], runs=[], dispatch=None,
-                models=dict(pm=None, worker=None),
-                paused=False, hold=None, workspace_block=None, error=None)
 
 
 class Store:
     def __init__(self, root):
-        self.root = Path(root)
+        self.root = project_root(root)
         self.directory = self.root / ".mu"
         self.directory.mkdir(mode=0o700, exist_ok=True)
         self.lock = (self.directory / "mub.lock").open("a+")
-        self.legacy_lock = None
         try:
             fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            legacy = self.root / ".mub" / "owner.lock"
-            if legacy.exists():
-                self.legacy_lock = legacy.open("a+")
-                fcntl.flock(self.legacy_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            self.close()
-            raise RuntimeError("This project already has a running mub") from None
+            self.lock.close()
+            raise RuntimeError("This worktree already has a running mub") from None
         try:
-            ignore = self.directory / ".gitignore"
-            previous = ignore.read_text() if ignore.exists() else ""
-            patterns = ["/mub.json", "/mub.json.tmp", "/mub.lock", "/mub.sock"]
+            self.data = read_state(self.root)
+            # Local Git metadata avoids modifying tracked project configuration.
+            result = subprocess.run(["git", "rev-parse", "--git-path", "info/exclude"],
+                                    cwd=self.root, capture_output=True, text=True, check=True)
+            exclude = self.root / result.stdout.strip()
+            previous = exclude.read_text() if exclude.exists() else ""
+            patterns = ["/.mu/mub.json", "/.mu/mub.json.tmp", "/.mu/mub.lock", "/.mu/mub.sock"]
             missing = [p for p in patterns if p not in previous.splitlines()]
             if missing:
-                # A newly created ignore file is itself local; existing tracked files stay visible.
-                if not ignore.exists():
-                    missing.insert(0, "/.gitignore")
-                ignore.write_text(previous + ("\n" if previous and not previous.endswith("\n") else "")
-                                  + "\n".join(missing) + "\n")
-            self.data = read_state(root)
+                exclude.parent.mkdir(parents=True, exist_ok=True)
+                with exclude.open("a") as stream:
+                    stream.write(("\n" if previous and not previous.endswith("\n") else "")
+                                 + "\n".join(missing) + "\n")
             self.save()
         except BaseException:
             self.close()
@@ -139,52 +78,40 @@ class Store:
             os.close(fd)
 
     def close(self):
-        if self.legacy_lock:
-            self.legacy_lock.close()
         self.lock.close()
 
-    def task(self, task_id):
-        for task in self.data["tasks"]:
-            if task["id"] == task_id:
-                return task
-        raise ValueError(f"Unknown task T{task_id}")
+    def session(self, session_id):
+        for session in self.data["sessions"]:
+            if session["id"] == session_id:
+                return session
+        raise ValueError(f"Unknown session S{session_id}")
 
-    def add_task(self, text, title=None):
+    def new_session(self, name=None):
+        key = self.data["next_session"]
+        self.data["next_session"] += 1
+        session = dict(id=key, name=name or f"Session {key}", session=None, hold=False,
+                       gate=None, reason="", blocked=None, last=None, revision=0,
+                       retry_authorized=False)
+        self.data["sessions"].append(session)
+        return session
+
+    def submit(self, session_id, text):
         text = text.strip()
         if not text:
-            raise ValueError("Task cannot be empty")
-        task = dict(id=max((t["id"] for t in self.data["tasks"]), default=0) + 1,
-                    title=title or text.splitlines()[0][:80], note=text, state="inbox", session=None,
-                    execution=dict(gate=None, turns=0, revision=1, mode="prompt", question="",
-                                   created=now(), updated=now()))
-        self.data["tasks"].append(task)
-        return task
+            raise ValueError("Message cannot be empty")
+        session = self.session(session_id)
+        # A reply is not permission to retry an interrupted turn.
+        if session["hold"] or session["gate"] or session["blocked"]:
+            session["revision"] += 1
+        session.update(hold=False, blocked=None, retry_authorized=False)
+        message = dict(id=self.data["next_message"], session_id=session_id, text=text, state="pending")
+        self.data["next_message"] += 1
+        self.data["messages"].append(message)
+        self.event("submitted", session_id, message_id=message["id"])
+        return message
 
-    def touch(self, task):
-        task["execution"]["revision"] += 1
-        task["execution"]["updated"] = now()
-
-    def message(self, role, content, task_id=None):
-        row = dict(id=len(self.data["messages"]) + 1, role=role, content=content,
-                   task_id=task_id, created=now())
-        self.data["messages"].append(row)
-        return row
-
-    def event(self, kind, task_id=None, text="", *, message_id=None):
-        self.data["dispatch"] = None
-        row = dict(id=len(self.data["events"]) + 1, kind=kind, task_id=task_id,
-                   text=text, handled=False, created=now())
-        if message_id is not None:
-            row["message_id"] = message_id
-        self.data["events"].append(row)
-        return row
-
-    def pending(self):
-        return sorted((e for e in self.data["events"] if not e["handled"]),
-                      key=lambda e: (not (e["kind"].startswith("worker_") or
-                                          (e["kind"] == "interrupted" and e["task_id"] is not None)), e["id"]))
-
-
-def update_task(task, **values):
-    for key, value in values.items():
-        (task["execution"] if key in EXECUTION_FIELDS else task)[key] = value
+    def event(self, kind, session_id=None, **detail):
+        event = dict(id=self.data["next_event"], kind=kind, session_id=session_id, **detail)
+        self.data["next_event"] += 1
+        self.data["events"].append(event)
+        return event
