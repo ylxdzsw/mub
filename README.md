@@ -54,7 +54,9 @@ appear only when relevant; model defaults and active models are available throug
 | `Ctrl-C` in sidebar/conversation | Interrupt and hold the selected session |
 | `Q` / `Esc` in dialogs | Close information screens or cancel a picker |
 | `Ctrl-Q` | Quit; confirm before stopping active agents |
-| `Ctrl-A/E`, `Ctrl-U/K`, `Ctrl-W` | Ordinary line/word editing |
+| `Home` / `End` in composer | Start / end of line |
+| `Ctrl-←` / `Ctrl-→` in composer | Jump between words |
+| `Ctrl-Backspace` in composer | Delete previous word |
 
 Local commands:
 

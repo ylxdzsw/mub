@@ -188,6 +188,9 @@ class _UI:
     def _getch_raw(self):
         try:
             key = self.window.get_wch()
+            if isinstance(key, int) and key > curses.KEY_MAX:
+                return {b"kLFT5": "ctrl-left", b"kRIT5": "ctrl-right",
+                        b"kbs5": "ctrl-backspace"}.get(curses.keyname(key), key)
             if isinstance(key, str) and len(key) == 1 and (ord(key) < 32 or key == "\x7f"):
                 return ord(key)
             return key
@@ -198,7 +201,8 @@ class _UI:
         if self.pending_key is not None:
             key, self.pending_key = self.pending_key, None
             return key
-        return self._getch_raw()
+        key = self._getch_raw()
+        return self._escape_key() if key == 27 else key
 
     def _tick(self):
         try:
@@ -490,6 +494,20 @@ class _UI:
         end = self.draft.find("\n", self.cursor)
         return start, len(self.draft) if end < 0 else end
 
+    def _word_boundary(self, direction):
+        position = self.cursor
+        if direction < 0:
+            while position and self.draft[position - 1].isspace():
+                position -= 1
+            while position and not self.draft[position - 1].isspace():
+                position -= 1
+        else:
+            while position < len(self.draft) and not self.draft[position].isspace():
+                position += 1
+            while position < len(self.draft) and self.draft[position].isspace():
+                position += 1
+        return position
+
     def _vertical_cursor(self, direction):
         start, _ = self._line_bounds()
         column = self.cursor - start
@@ -764,7 +782,8 @@ class _UI:
                  "  PgUp/PgDn      Scroll conversation", "  Ctrl-C         Clear composer input; interrupt session in other panes", "  Ctrl-Q         Quit; confirms before stopping active agents",
                  "  /              List commands; ↑/↓ select, Tab fill, Enter run, Esc hide",
                  "  Q/Esc          Close information screens or cancel pickers",
-                 "  Ctrl-A/E       Start/end of line", "  Ctrl-U/K       Delete to start/end of line", "  Ctrl-W         Delete previous word"]
+                 "  Home/End       Start/end of line", "  Ctrl-←/→       Jump between words",
+                 "  Ctrl-Backspace Delete previous word"]
         self._info("Mu Board help", lines)
 
     def _info(self, title, lines):
@@ -806,16 +825,28 @@ class _UI:
             scroll["line"] = min(scroll["line"], bottom)
             scroll["follow"] = scroll["line"] >= bottom
 
-    def _alt_enter(self):
+    def _escape_key(self):
         self.window.timeout(35)
         try:
             key = self._getch_raw()
+            if key == "[":
+                sequence = ""
+                while True:
+                    char = self._getch_raw()
+                    if not isinstance(char, str) or len(char) != 1:
+                        return None
+                    sequence += char
+                    if "@" <= char <= "~":
+                        break
+                return {"1;5D": "ctrl-left", "1;5C": "ctrl-right",
+                        "8;5u": "ctrl-backspace", "127;5u": "ctrl-backspace",
+                        "27;5;8~": "ctrl-backspace", "27;5;127~": "ctrl-backspace"}.get(sequence)
+            if key in (10, 13, curses.KEY_ENTER):
+                return 10
+            self.pending_key = key
+            return 27
         finally:
             self.window.timeout(50)
-        if key in (10, 13, curses.KEY_ENTER):
-            self._insert("\n")
-        elif key is not None:
-            self.pending_key = key
 
     def _cycle_focus(self, reverse=False):
         height, width = self.window.getmaxyx()
@@ -849,7 +880,6 @@ class _UI:
         if key == 27:
             if self.focus == "composer":
                 self.command_dismissed = True
-                self._alt_enter()
             else:
                 self.focus = "sidebar"
             return
@@ -893,13 +923,16 @@ class _UI:
             self._vertical_cursor(-1)
         elif key == curses.KEY_DOWN:
             self._vertical_cursor(1)
-        elif key in (curses.KEY_HOME, 1):
+        elif key in ("ctrl-left", "ctrl-right"):
+            self.cursor = self._word_boundary(-1 if key == "ctrl-left" else 1)
+            self._save_draft()
+        elif key == curses.KEY_HOME:
             self.cursor = self.draft.rfind("\n", 0, self.cursor) + 1
             self._save_draft()
-        elif key in (curses.KEY_END, 5):
+        elif key == curses.KEY_END:
             _, self.cursor = self._line_bounds()
             self._save_draft()
-        elif key in (curses.KEY_BACKSPACE, 8, 127):
+        elif key in (curses.KEY_BACKSPACE, 127):
             if self.cursor:
                 self.draft = self.draft[:self.cursor - 1] + self.draft[self.cursor:]
                 self.cursor -= 1
@@ -908,22 +941,8 @@ class _UI:
             if self.cursor < len(self.draft):
                 self.draft = self.draft[:self.cursor] + self.draft[self.cursor + 1:]
                 self._save_draft()
-        elif key == 21:
-            start, _ = self._line_bounds()
-            self.draft = self.draft[:start] + self.draft[self.cursor:]
-            self.cursor = start
-            self._save_draft()
-        elif key == 11:
-            _, end = self._line_bounds()
-            self.draft = self.draft[:self.cursor] + self.draft[end:]
-            self._save_draft()
-        elif key == 23:
-            start, _ = self._line_bounds()
-            begin = self.cursor
-            while begin > start and self.draft[begin - 1].isspace():
-                begin -= 1
-            while begin > start and not self.draft[begin - 1].isspace():
-                begin -= 1
+        elif key in (8, "ctrl-backspace"):
+            begin = self._word_boundary(-1)
             self.draft = self.draft[:begin] + self.draft[self.cursor:]
             self.cursor = begin
             self._save_draft()
