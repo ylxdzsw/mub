@@ -85,6 +85,10 @@ def schedule(snapshot, config):
 
 def main():
     args = sys.argv[1:]
+    if args[0] == "cat":
+        print("[stdin]\n")
+        print(sys.stdin.read(), end="")
+        return 0
     if args[0] == "new":
         key = "fake-" + uuid.uuid4().hex[:12]
         save(STORE / f"{key}.json", dict(clean=True, active=dict(busy=False), transcript="", invocations=[]))

@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import curses
+from concurrent.futures import ThreadPoolExecutor
+import re
 import sys
 import time
 import unicodedata
+
+from .output import markdown
+
+
+_ANSI = re.compile(r"(\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_]))")
 
 
 def _text(value) -> str:
@@ -57,8 +64,11 @@ class _UI:
         "/quit": "Stop work and quit",
     }
 
-    def __init__(self, window, engine):
+    def __init__(self, window, engine, renderer):
         self.window, self.engine = window, engine
+        self.renderer = renderer
+        self.render_job = None
+        self.rendered = {}
         self.state = engine.state()
         sessions = self.state["sessions"]
         self.selected = sessions[0]["id"] if sessions else None
@@ -76,6 +86,7 @@ class _UI:
         self.ui_error = ""
         self.request_ok = False
         self.colors = {}
+        self.ansi_colors = {}
         curses.raw()
         curses.nonl()
         curses.set_escdelay(25)
@@ -89,6 +100,69 @@ class _UI:
             ):
                 curses.init_pair(index, color, -1)
                 self.colors[name] = curses.color_pair(index) | curses.A_BOLD
+            for index, color in enumerate([*range(16), 215], 4):
+                if index >= curses.COLOR_PAIRS:
+                    break
+                curses.init_pair(index, color if color < curses.COLORS else color % 8, -1)
+                self.ansi_colors[color] = curses.color_pair(index)
+
+    def _styled_lines(self, text, width):
+        """Translate only display styles; never pass terminal controls to curses."""
+        lines, used, style, color = [[]], 0, 0, 0
+        styles = {1: curses.A_BOLD, 2: curses.A_DIM, 3: getattr(curses, "A_ITALIC", 0),
+                  4: curses.A_UNDERLINE, 7: curses.A_REVERSE}
+        for part in _ANSI.split(text):
+            if part.startswith("\x1b"):
+                if part.startswith("\x1b[") and part.endswith("m"):
+                    codes = [int(code or 0) for code in part[2:-1].split(";") if code.isdigit() or not code]
+                    while codes:
+                        code = codes.pop(0)
+                        if code == 0:
+                            style, color = 0, 0
+                        elif code in styles:
+                            style |= styles[code]
+                        elif code in (22, 23, 24, 27):
+                            style &= ~(styles[1] | styles[2] if code == 22 else styles[code - 20])
+                        elif code == 39:
+                            color = 0
+                        elif 30 <= code <= 37 or 90 <= code <= 97:
+                            color = self.ansi_colors.get(code - (30 if code < 90 else 82), 0)
+                        elif code == 38 and len(codes) >= 2 and codes[0] == 5:
+                            color = self.ansi_colors.get(codes[1], 0)
+                            del codes[:2]
+                continue
+            for char in _text(part):
+                cells = _width(char)
+                if char == "\n" or used + cells > width:
+                    lines.append([])
+                    used = 0
+                if char != "\n":
+                    attr = style | color
+                    if lines[-1] and lines[-1][-1][1] == attr:
+                        previous, _ = lines[-1][-1]
+                        lines[-1][-1] = (previous + char, attr)
+                    else:
+                        lines[-1].append((char, attr))
+                    used += cells
+        while len(lines) > 1 and not lines[-1]:
+            lines.pop()
+        return lines
+
+    def _output_lines(self, text, width):
+        if self.render_job and self.render_job[1].done():
+            (selected, source, columns), future = self.render_job
+            try:
+                rendered = future.result()
+            except (OSError, RuntimeError) as error:
+                self.ui_error = str(error)
+                rendered = source
+            self.rendered[selected] = (source, columns, self._styled_lines(rendered, columns))
+            self.render_job = None
+        cached = self.rendered.get(self.selected)
+        if self.render_job is None and (cached is None or cached[:2] != (text, width)):
+            self.render_job = ((self.selected, text, width),
+                               self.renderer.submit(markdown, self.engine.root, _text(text), width, self.engine.mu))
+        return cached[2] if cached else [[("Rendering…", curses.A_DIM)]]
 
     def _add(self, y, x, text, width=None, attr=0):
         height, columns = self.window.getmaxyx()
@@ -139,10 +213,6 @@ class _UI:
             fresh = self._request({"op": "output", "session_id": self.selected}, clear_error=False)
             if fresh is not None:
                 self.outputs[self.selected] = fresh
-            if self.selected is not None:
-                scheduler_output = self._request({"op": "output", "session_id": None}, clear_error=False)
-                if scheduler_output is not None:
-                    self.outputs[None] = scheduler_output
             self.output_next = time.monotonic() + 0.2
 
     def _request(self, request, *, clear_error=True):
@@ -195,21 +265,24 @@ class _UI:
 
     def _scheduler_line(self):
         scheduler = self.state["scheduler"]
-        selected = self.state["models"].get("scheduler") or "session default"
-        active = scheduler["active"]
+        status = "error" if scheduler.get("error") else "active" if scheduler["active"] else "idle"
+        return f"Scheduler {status}"
+
+    def _session_status(self, session):
+        active = session.get("active")
+        if session.get("hold"):
+            return "held"
         if active:
-            return f"Scheduler active · actual {active.get('model') or 'session default'} · default {selected}"
-        if scheduler.get("error"):
-            return f"Scheduler error · default {selected}"
-        return f"Scheduler idle · default {selected}"
+            return "stopping" if active.get("stopping") else "reading" if active["mode"] == "readonly" else "writing"
+        return session.get("gate") or ("blocked" if session.get("blocked") else "")
 
     def _draw_sidebar(self, y, width, height):
         if width <= 0 or height <= 0:
             return
         sessions = self.state["sessions"]
-        self._add(y, 1, f"Sessions · {len(sessions)}", width - 2,
+        self._add(y, 1, "Sessions", width - 2,
                   self.colors.get("title", 0) if self.focus == "sidebar" else curses.A_DIM)
-        capacity = max(0, height - (4 if height >= 5 else 2))
+        capacity = max(0, height - 1)
         index = self._selected_index()
         self.sidebar_scroll = max(0, min(self.sidebar_scroll, max(0, len(sessions) - capacity)))
         if capacity and index < self.sidebar_scroll:
@@ -218,111 +291,82 @@ class _UI:
             self.sidebar_scroll = index - capacity + 1
         for row, session in enumerate(sessions[self.sidebar_scroll:self.sidebar_scroll + capacity], y + 1):
             pending = len(self._pending(session["id"]))
-            active = session.get("active")
-            status = ("stopping" if active.get("stopping") else "reading" if active["mode"] == "readonly" else "writing") if active else "idle"
-            status = "held" if session.get("hold") else session.get("gate") or ("blocked" if session.get("blocked") else status)
             owner = "◆" if self.state["workspace"]["owner"] == session["id"] else ""
             suffix = f" +{pending}" if pending else ""
-            name = session.get("name") or f"Session {session['id']}"
-            self._add(row, 1, f"S{session['id']} {status}{owner}{suffix} · {name}", width - 2,
+            status = self._session_status(session)
+            suffix += f" {status}" if status else ""
+            prefix = f"S{session['id']}{owner} "
+            name = _clip(session["name"], max(0, width - 2 - _width(prefix + suffix)))
+            self._add(row, 1, prefix + name + suffix, width - 2,
                       curses.A_REVERSE if session["id"] == self.selected else 0)
-        scheduler = self.state["scheduler"]
-        active = scheduler["active"]
-        default = self.state["models"].get("scheduler") or "session default"
-        actual = active.get("model") or "session default" if active else "not active"
-        if height >= 5:
-            self._add(y + height - 3, 1, f"Scheduler · {'active' if active else 'idle'}", width - 2, curses.A_DIM)
-            self._add(y + height - 2, 1, f"Actual: {actual} · default: {default}", width - 2, curses.A_DIM)
-            text = self.outputs.get(None, {}).get("text", "")
-            preview = _lines(text, max(2, width - 9))[-1] if text else scheduler.get("error") or "No scheduler output"
-            self._add(y + height - 1, 1, f"Output: {preview}", width - 2, curses.A_DIM)
-        elif height > 1:
-            self._add(y + height - 1, 1, f"Sched: {actual} · def {default}", width - 2, curses.A_DIM)
 
     def _draw_conversation(self, session, x, y, width, height):
         if width <= 0 or height <= 0:
             return
         output = self.outputs.get(self.selected, {})
-        scheduler_mode = session is None
         if session:
-            name = session.get("name") or f"Session {session['id']}"
-            self._add(y, x + 1, f"{name} · #{session['id']}", width - 2,
-                      self.colors.get("title", 0) if self.focus == "conversation" else 0)
-            active = session.get("active")
-            role = active.get("kind") if active else "worker"
-            default = self.state["models"].get(role) or "session default"
-            actual = active.get("model") or "session default" if active else "not active"
-            info = f"{role} actual: {actual} · selected default: {default}"
-            if active:
-                info += f" · {active['mode']}"
+            title = f"S{session['id']} · {session['name']}"
+            status = self._session_status(session)
+            if status:
+                title += f" · {status}"
             if self.state["workspace"]["owner"] == session["id"]:
-                info += " · workspace owner"
-            if session.get("hold"):
-                info += " · held"
-            if session.get("gate"):
-                info += f" · {session['gate']}"
-            if session.get("blocked"):
-                info += f" · {session['blocked']}"
-            if height > 1:
-                self._add(y + 1, x + 1, info, width - 2, curses.A_DIM)
+                title += " · ◆"
             queue = self._pending(session["id"])
         else:
-            scheduler = self.state["scheduler"]
-            active = scheduler["active"]
-            default = self.state["models"].get("scheduler") or "session default"
-            actual = active.get("model") or "session default" if active else "not active"
-            self._add(y, x + 1, "Scheduler output", width - 2,
-                      self.colors.get("title", 0) if self.focus == "conversation" else 0)
-            if height > 1:
-                self._add(y + 1, x + 1, f"scheduler actual: {actual} · selected default: {default}", width - 2, curses.A_DIM)
-            queue = []
-
-        row = y + min(2, height)
-        if queue and row < y + height:
-            self._add(row, x + 1, f"Mailbox · {len(queue)}", width - 2, self.colors.get("warn", 0))
-            row += 1
-            available = max(0, y + height - row - 1)
-            visible = min(len(queue), available, 4)
-            for message in queue[-visible:] if visible else []:
-                label = f"{message['state']} #{message['id']}: "
-                self._add(row, x + 1, label + message["text"], width - 2, curses.A_DIM)
-                row += 1
-            hidden = len(queue) - visible
-            if hidden and row < y + height:
-                self._add(row, x + 1, f"… {hidden} earlier pending", width - 2, curses.A_DIM)
-                row += 1
-
-        source = output.get("source") or "output"
-        if row < y + height:
-            self._add(row, x + 1, f"{source} · PgUp/PgDn scroll", width - 2, curses.A_DIM)
-            row += 1
-        text = output.get("text") or ("Waiting for scheduler output…" if scheduler_mode and self.state["scheduler"]["active"] else
-                                       "No scheduler output yet." if scheduler_mode else "Waiting for session output…")
-        lines = _lines(text, max(2, width - 2))
-        visible = max(0, y + height - row)
+            title, queue = "Scheduler", []
         scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
-        bottom = max(0, len(lines) - visible)
-        if scroll["follow"]:
-            scroll["line"] = bottom
+        if not scroll["follow"]:
+            title += " · scrolled (End to follow)"
+        self._add(y, x + 1, title, width - 2,
+                  self.colors.get("title", 0) if self.focus == "conversation" else curses.A_DIM)
+        row = y + 1
+        if queue:
+            visible = min(len(queue), 3, max(0, height - 2))
+            if len(queue) > visible:
+                visible = max(0, visible - 1)
+            for message in queue[:visible]:
+                self._add(row, x + 1, f"{message['state']} · {message['text']}", width - 2, self.colors.get("warn", 0))
+                row += 1
+            if len(queue) > visible and row < y + height:
+                self._add(row, x + 1, f"… {len(queue) - visible} more queued", width - 2, curses.A_DIM)
+                row += 1
+        text = output.get("text")
+        if text:
+            lines = self._output_lines(text, max(2, width - 2))
         else:
-            scroll["line"] = max(0, min(scroll["line"], bottom))
-        scroll["visible"] = visible
-        scroll["total"] = len(lines)
-        for line_y, line in enumerate(lines[scroll["line"]:scroll["line"] + visible], row):
-            self._add(line_y, x + 1, line, width - 2)
+            empty = "No output yet." if session or self.state["sessions"] else "Create a session with /new [name]."
+            lines = [[(empty, curses.A_DIM)]]
+        visible = max(0, y + height - row)
+        bottom = max(0, len(lines) - visible)
+        scroll["line"] = bottom if scroll["follow"] else max(0, min(scroll["line"], bottom))
+        scroll.update(visible=visible, total=len(lines))
+        for line_y, spans in enumerate(lines[scroll["line"]:scroll["line"] + visible], row):
+            offset = 0
+            for text, attr in spans:
+                text = _clip(text, max(0, width - 2 - offset))
+                self._add(line_y, x + 1 + offset, text, width - 2 - offset, attr)
+                offset += _width(text)
+
+    def _notice(self):
+        if self.ui_error:
+            return self.ui_error
+        if error := self.state["scheduler"].get("error"):
+            return error
+        session = self._session()
+        if session:
+            if session.get("hold") or session.get("gate"):
+                return session.get("reason") or "Session held · /resume to continue"
+            return session.get("blocked") or ""
+        return self.state["scheduler"].get("reason") or ""
 
     def _composer_geometry(self, height, width):
-        notice_y = height - 2
-        rows = max(1, min(4, (height - 5) // 5))
+        notice_y = height - 1 - bool(self._notice())
+        rows = min(len(_lines(self.draft, max(2, width - 5))), 4, max(1, height - 5))
         label_y = notice_y - rows - 1
         top = label_y + 1
         return label_y, top, max(0, notice_y - top), notice_y
 
     def _draw_composer(self, label_y, top, rows, width):
-        if label_y >= 0:
-            focus_attr = self.colors.get("title", 0) if self.focus == "composer" else curses.A_DIM
-            prompt = "Message · Enter queue · Alt-Enter newline" if self.selected is not None else "No session · /new or Ctrl-P · Alt-Enter newline"
-            self._add(label_y, 1, prompt, width - 2, focus_attr)
         if rows <= 0:
             return None
         text_width = max(2, width - 5)
@@ -333,7 +377,8 @@ class _UI:
         start = max(0, cursor_row - rows + 1) if self.focus == "composer" else max(0, len(lines) - rows)
         for offset, line in enumerate(lines[start:start + rows]):
             row = top + offset
-            self._add(row, 1, ">" if offset == 0 else "·", attr=self.colors.get("title", 0))
+            self._add(row, 1, ">" if offset == 0 else "·",
+                      attr=self.colors.get("title", 0) if self.focus == "composer" else curses.A_DIM)
             self._add(row, 3, line, width - 5)
         if self.focus != "composer":
             return None
@@ -348,9 +393,10 @@ class _UI:
         if height <= 0 or width <= 0:
             return
         scheduler_text = self._scheduler_line()
-        self._add(0, 1, f"Mu Board · {self.state['root']}", max(0, width // 2 - 1), self.colors.get("title", 0))
+        scheduler_x = max(1, width - len(scheduler_text) - 1)
+        self._add(0, 1, f"Mu Board · {self.state['root']}", max(0, scheduler_x - 2), curses.A_DIM)
         if width > 1:
-            self._add(0, max(1, width // 2), scheduler_text, max(0, width - max(1, width // 2) - 1), curses.A_DIM)
+            self._add(0, scheduler_x, scheduler_text, attr=curses.A_DIM)
 
         if height < 6:
             if height > 1:
@@ -385,18 +431,9 @@ class _UI:
             self._add(label_y, 0, "─" * max(0, width - 1), attr=curses.A_DIM)
         cursor = self._draw_composer(label_y, composer_top, composer_rows, width)
         self._draw_commands(label_y, width)
-        notice = self.ui_error
-        if not notice:
-            if session:
-                notice = (session.get("reason") or session.get("blocked") or
-                          self.state["scheduler"].get("error") or self.state["scheduler"].get("reason") or "")
-            else:
-                scheduler = self.state["scheduler"]
-                notice = scheduler.get("error") or scheduler.get("reason") or ""
-        self._add(notice_y, 1, notice, width - 2, self.colors.get("error" if self.ui_error else "warn", 0))
-        ctrl_c = "clear input" if self.focus == "composer" else "interrupt"
-        self._add(height - 1, 0, f"Tab/Shift-Tab panes · Enter focus/queue · Ctrl-P sessions · Ctrl-C {ctrl_c} · Ctrl-Q quit · /help",
-                  attr=curses.A_DIM)
+        if notice := self._notice():
+            self._add(notice_y, 1, notice, width - 2, self.colors.get("warn", 0))
+        self._add(height - 1, 1, "Tab panes · Ctrl-P sessions · /help", attr=curses.A_DIM)
         self._cursor((composer_top + cursor[0], cursor[1]) if cursor else None)
         self.window.refresh()
 
@@ -523,6 +560,10 @@ class _UI:
                 self._info("Selected models", [
                     *(f"{role.title()}: {self.state['models'].get(role) or 'Mu/session default'}"
                       for role in ("scheduler", "worker")), "",
+                    *(f"{label} active: {active.get('model') or 'Mu/session default'} · {active['mode']}"
+                      for label, active in [("Scheduler", self.state["scheduler"]["active"]),
+                                            *((f"S{s['id']}", s.get("active")) for s in self.state["sessions"])]
+                      if active), "",
                     "Use /model scheduler, /model worker, or /model both to change models and effort.",
                     "Changes apply to later invocations; active workers keep their current model.",
                 ])
@@ -555,6 +596,7 @@ class _UI:
         self._select(target)
         self.drafts.pop(session_id, None)
         self.outputs.pop(session_id, None)
+        self.rendered.pop(session_id, None)
         self.scrolls.pop(session_id, None)
 
     def _resume(self):
@@ -778,7 +820,7 @@ class _UI:
     def _cycle_focus(self, reverse=False):
         height, width = self.window.getmaxyx()
         label_y = self._composer_geometry(height, width)[0] if height >= 6 else 0
-        body_height = max(0, label_y - 2)
+        body_height = max(0, label_y - 1)
         panes = ["sidebar", "conversation", "composer"] if width >= 62 and body_height >= 4 else ["conversation", "composer"]
         index = panes.index(self.focus) if self.focus in panes else 0
         self.focus = panes[(index + (-1 if reverse else 1)) % len(panes)]
@@ -902,4 +944,5 @@ class _UI:
 def run_ui(engine):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise RuntimeError("Mu Board UI requires an interactive terminal")
-    curses.wrapper(lambda window: _UI(window, engine)._main())
+    with ThreadPoolExecutor(max_workers=1) as renderer:
+        curses.wrapper(lambda window: _UI(window, engine, renderer)._main())

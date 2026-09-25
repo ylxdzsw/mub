@@ -26,13 +26,19 @@ Do not run another editing agent against the same checkout outside mub.
 
 ## UI
 
-The sidebar lists sessions. The conversation pane shows Mu history and live
-output. The composer sends to the selected session. Mailbox entries are labeled
+The sidebar lists sessions. The conversation pane renders Mu history and live
+output as Markdown using Mu's own `mu cat` renderer, sized to the pane. Rendering
+runs separately from process supervision; scheduler inputs and CLI logs remain
+raw text. The composer sends to the selected session and grows with its draft.
+Mailbox entries are labeled
 pending, in-flight, or interrupted; they are not mistaken for delivered history.
 Drafts are kept separately for each session while the UI is open.
 
 Create a session with `/new [name]`, then type its first message. Use `Ctrl-P` to
 pick a session or inspect the scheduler's decisions and output.
+Scheduler status appears once in the top bar. Errors, holds, and blocking reasons
+appear only when relevant; model defaults and active models are available through
+`/model`, and the full keyboard reference through `/help`.
 
 | Shortcut | Action |
 | --- | --- |
@@ -54,7 +60,7 @@ Local commands:
 
 - `/new [name]`: create and select a session.
 - `/close`: detach an idle session; confirm discarding any queued messages.
-- `/model`: show the currently selected scheduler and worker models.
+- `/model`: show the selected scheduler/worker defaults and active invocation models.
 - `/model scheduler|worker|both`: select models and reasoning effort.
 - `/resume`: release a session hold and explicitly authorize continuation of its
   interrupted turn, if any.
