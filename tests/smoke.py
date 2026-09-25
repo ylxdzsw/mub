@@ -14,6 +14,7 @@ import tempfile
 import termios
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 FAKE = ROOT / "tests/fake_mu.py"
@@ -64,6 +65,62 @@ class SchedulerSmoke(unittest.TestCase):
 
     def journal(self, session):
         return json.loads((self.root / ".mu/fake" / (session["session"] + ".json")).read_text())
+
+    def test_evolving_names_and_user_ownership(self):
+        board = self.board()
+        auto = self.new(board, "read naming design")
+        locked = board.store.session(board.request(dict(op="new", name="Session 2"))["session_id"])
+        removed = board.store.session(board.request(dict(op="new"))["session_id"])
+
+        def proposal(name):
+            snapshot = json.loads(json.dumps(dict(board.state(), events=board.data["events"])))
+            return dict(snapshot=snapshot, plan=dict(reason="Name topics", actions=[], names=[
+                dict(session_id=auto["id"], name=name),
+                dict(session_id=locked["id"], name="Must not replace user name"),
+            ]))
+
+        active = proposal("Session naming")
+        active["plan"]["names"].append(dict(session_id=removed["id"], name="Removed"))
+        active["plan"]["actions"] = [dict(type="dispatch", message_id=board.data["messages"][0]["id"], mode="readonly")]
+        board.request(dict(op="remove", session_id=removed["id"]))
+        with patch.object(board, "_spawn") as spawn:
+            board._apply_plan(active)
+            spawn.assert_called_once()
+        self.assertEqual(auto["name"], "Session naming")
+        self.assertEqual(locked["name"], "Session 2")
+        self.assertEqual(auto["name_source"], "auto")
+
+        board.request(dict(op="interrupt", session_id=auto["id"]))
+        revision = auto["revision"]
+        pending = json.loads(json.dumps(board.data["messages"]))
+        board._apply_plan(proposal("Naming implementation"))
+        self.assertEqual(auto["name"], "Naming implementation")
+        self.assertTrue(auto["hold"])
+        self.assertEqual(auto["revision"], revision)
+        self.assertEqual(board.data["messages"], pending)
+
+        active = proposal("Stale automatic name")
+        board.request(dict(op="rename", session_id=auto["id"], name="My title"))
+        board._apply_plan(active)
+        self.assertEqual(auto["name"], "My title")
+        events = list(board.data["events"])
+        board.request(dict(op="rename", session_id=auto["id"], name=None))
+        self.assertEqual(board.data["events"], events)
+        board._apply_plan(proposal("Automatic again"))
+        saved = read_state(self.root)["sessions"][0]
+        self.assertEqual((saved["name"], saved["name_source"]), ("Automatic again", "auto"))
+        for invalid in ("", "two\nlines", "x" * 81):
+            with self.assertRaises(ValueError):
+                board._validate_plan(proposal(invalid)["plan"], proposal(invalid))
+
+    def test_legacy_names_are_user_owned(self):
+        board = self.board()
+        session = self.new(board, "read legacy")
+        del session["name_source"]
+        board.store.save()
+        saved = read_state(self.root)["sessions"][0]
+        self.assertEqual(saved["name_source"], "user")
+        self.assertEqual(saved["name"], "Session 1")
 
     def test_fifo_late_messages_and_persistent_scheduler(self):
         self.config(scheduler_delay=0.12, worker_delay=0.15)

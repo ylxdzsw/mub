@@ -29,7 +29,15 @@ def read_state(root):
     data = json.loads(path.read_text())
     if data.get("version") != 3:
         raise ValueError("This is an old task-board snapshot. Archive .mu/mub.json before starting the session scheduler; Mu journals are unchanged.")
+    for session in data["sessions"]:
+        session.setdefault("name_source", "user")
     return data
+
+
+def session_name(value):
+    if not isinstance(value, str) or not value.strip() or not value.isprintable():
+        raise ValueError("Session name must be nonempty, single-line printable text")
+    return value.strip()
 
 
 class Store:
@@ -87,9 +95,12 @@ class Store:
         raise ValueError(f"Unknown session S{session_id}")
 
     def new_session(self, name=None):
+        if name is not None:
+            name = session_name(name)
         key = self.data["next_session"]
         self.data["next_session"] += 1
-        session = dict(id=key, name=name or f"Session {key}", session=None, hold=False,
+        session = dict(id=key, name=name or f"Session {key}", name_source="user" if name else "auto",
+                       session=None, hold=False,
                        gate=None, reason="", blocked=None, last=None, revision=0,
                        retry_authorized=False)
         self.data["sessions"].append(session)

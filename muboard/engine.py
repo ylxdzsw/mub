@@ -12,7 +12,7 @@ import tempfile
 import time
 import uuid
 
-from .state import Store
+from .state import Store, session_name
 from .output import delivery, journal_path, replay
 
 
@@ -176,6 +176,14 @@ class Engine:
         elif op == "send":
             message = self.store.submit(int(req["session_id"]), req["text"])
             result = dict(message_id=message["id"])
+        elif op == "rename":
+            session = self.store.session(int(req["session_id"]))
+            name = req.get("name")
+            if name is None:
+                session["name_source"] = "auto"
+            else:
+                session.update(name=session_name(name), name_source="user")
+            result = dict(name=session["name"], name_source=session["name_source"])
         elif op == "interrupt":
             session = self.store.session(int(req["session_id"]))
             session.update(hold=True, retry_authorized=False, revision=session["revision"] + 1)
@@ -271,10 +279,12 @@ Choose any number of independent readonly messages and at most one readwrite inv
 
 You may resolve traps by inspecting their FULL command and stdin in the outcome (or `{self.client} logs S<ID>` if needed) and retrying with a suitable policy, within the user's authorized scope. Readonly uses trap reversible; a write requires promotion to the writer slot. Relaxing traps authorizes the REMAINDER OF THE TURN, not one command. Use destructive for ordinary reversible writes, off only when the broader permission is justified. Retry does not accept new instructions. Never retry failures/interrupted user-stopped sessions unless retry_authorized is true. Do not troubleshoot provider or Mu bugs. Label genuine failures and withhold dependent work.
 
-You may request a commit from the dirty workspace owner to release the checkout. This is only a handoff request to commit task-owned completed changes or explain why it cannot; not a repair/implementation request. Do not repeat a commit request after an unsuccessful handoff without new user input. User holds prohibit ALL automatic actions, including commit and retry.
+You may request a commit from the dirty workspace owner to release the checkout. This is only a handoff request to commit task-owned completed changes or explain why it cannot; not a repair/implementation request. Do not repeat a commit request after an unsuccessful handoff without new user input. User holds prohibit execution actions, including commit and retry.
+
+For sessions with name_source "auto", optionally propose names based on messages and outcomes. Choose a short topic-based title (at most 80 characters) once there is enough context; rename when the main topic materially changes, not on every turn. Avoid execution status such as Running or Done. Never rename name_source "user" sessions. Names are display metadata, independent of actions: you may name active or held sessions and name and dispatch the same session. Omit names or use an empty list when no change is useful.
 
 Return ONLY a JSON decision as your final answer, without Markdown fences or surrounding prose. It applies after your clean exit. Shape:
-{{"reason":"short scheduling explanation", "actions":[
+{{"reason":"short scheduling explanation", "names":[{{"session_id":1, "name":"API pagination"}}], "actions":[
   {{"type":"dispatch", "message_id":12, "mode":"readonly"}},
   {{"type":"retry", "session_id":2, "mode":"readwrite", "trap":"destructive", "reason":"why authorized"}},
   {{"type":"commit", "session_id":3, "reason":"handoff needed"}},
@@ -383,11 +393,24 @@ The checkout may have changed since your previous turn: inspect before relying o
         return active
 
     def _validate_plan(self, plan, active):
-        if not isinstance(plan, dict) or set(plan) - {"reason", "actions"} or not isinstance(plan.get("reason"), str) or not isinstance(plan.get("actions"), list):
+        if not isinstance(plan, dict) or set(plan) - {"reason", "actions", "names"} or not isinstance(plan.get("reason"), str) or not isinstance(plan.get("actions"), list):
             raise ValueError("Plan needs reason and actions")
         snapshot = active["snapshot"]
         sessions = {s["id"]: s for s in snapshot["sessions"]}
         messages = {m["id"]: m for m in snapshot["messages"]}
+        names = plan.get("names", [])
+        if not isinstance(names, list):
+            raise ValueError("Names must be a list")
+        named = set()
+        for update in names:
+            if not isinstance(update, dict) or set(update) != {"session_id", "name"}:
+                raise ValueError("Name updates need session_id and name")
+            key = update["session_id"]
+            if type(key) is not int or key not in sessions or key in named:
+                raise ValueError("Use at most one name per snapshot session")
+            if len(session_name(update["name"])) > 80:
+                raise ValueError("Automatic names must be at most 80 characters")
+            named.add(key)
         seen = set()
         for action in plan["actions"]:
             if not isinstance(action, dict):
@@ -430,6 +453,11 @@ The checkout may have changed since your previous turn: inspect before relying o
         revisions = {s["id"]: s["revision"] for s in snapshot["sessions"]}
         messages = {m["id"]: m for m in snapshot["messages"]}
         self.data["scheduler"]["reason"] = plan["reason"]
+        automatic = {s["id"] for s in snapshot["sessions"] if s["name_source"] == "auto"}
+        for update in plan.get("names", []):
+            session = next((s for s in self.data["sessions"] if s["id"] == update["session_id"]), None)
+            if session and session["id"] in automatic and session["name_source"] == "auto":
+                session["name"] = session_name(update["name"])
         skipped = []
         for action in plan["actions"]:
             kind = action["type"]

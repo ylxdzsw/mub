@@ -44,6 +44,10 @@ def parser():
     new = sub.add_parser("new", help="Create a session, optionally queue its first message")
     new.add_argument("text", nargs="?")
     new.add_argument("--name")
+    rename = sub.add_parser("rename", help="Name a session or return it to automatic naming")
+    rename.add_argument("session_id", type=session_id)
+    rename.add_argument("name", nargs="?")
+    rename.add_argument("--auto", action="store_true")
     send = sub.add_parser("send", help="Queue a message for a session")
     send.add_argument("session_id", type=session_id)
     send.add_argument("text", nargs="?")
@@ -102,6 +106,10 @@ def main():
                         request["text"] = text
             elif command == "send":
                 request["text"] = text_arg(args.text)
+            elif command == "rename":
+                if args.auto == (args.name is not None):
+                    raise ValueError("Supply a name or --auto, not both")
+                request["name"] = args.name
             elif command == "remove":
                 request["discard"] = args.discard
             elif command == "models":

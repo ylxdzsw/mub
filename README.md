@@ -61,6 +61,8 @@ appear only when relevant; model defaults and active models are available throug
 Local commands:
 
 - `/new [name]`: create and select a session.
+- `/rename <name>`: name the selected session and protect its name from automatic changes.
+- `/rename --auto`: let the scheduler name and rename the selected session again.
 - `/close`: detach an idle session; confirm discarding any queued messages.
 - `/model`: show the selected scheduler/worker defaults and active invocation models.
 - `/model scheduler|worker|both`: select models and reasoning effort.
@@ -93,6 +95,16 @@ ownership, latest worker responses, exit reasons, and complete trap evidence.
 It may dispatch several readers and at most one writer, or explain why nothing
 should run. It returns a small JSON decision as its final answer; runtime code
 validates it against current state before acting.
+
+Sessions created without a name start as `Session N`. During ordinary scheduling
+passes, the scheduler gives them short topic-based names and updates those names
+when the conversation's main focus changes. Names do not include execution status;
+session IDs remain stable. Explicitly supplied names are user-owned and never
+overwritten by the scheduler, including when a rename happens during a scheduler
+pass. `/rename --auto` keeps the current title until a later scheduling pass finds
+a useful replacement; renaming alone does not wake the scheduler or affect queued
+work or holds. Existing sessions saved before name ownership was introduced keep
+their names as user-owned; use `/rename --auto` to opt them in.
 
 The scheduler reasons about prerequisites from messages and outcomes; there is
 no dependency graph, numeric priority system, task decomposition, or PM review.
@@ -167,6 +179,8 @@ Submissions do not implicitly start a daemon.
 ```sh
 mub new --name API 'Implement the API endpoint'
 mub send S1 'Use cursor-based pagination'
+mub rename S1 'API pagination'
+mub rename S1 --auto            # allow the name to evolve on later scheduler passes
 mub new --name Investigation 'Read the existing authentication flow'
 mub status
 mub logs S1

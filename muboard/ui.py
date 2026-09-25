@@ -56,6 +56,7 @@ def _lines(value, width: int) -> list[str]:
 class _UI:
     COMMANDS = {
         "/new [name]": "Create and select a session",
+        "/rename <name>|--auto": "Name the selected session, or let its name evolve automatically",
         "/close": "Close the selected session",
         "/model [scheduler|worker|both]": "Show selected models, or choose models and effort for a role",
         "/resume [selected]": "Resume the selected session",
@@ -551,7 +552,7 @@ class _UI:
         if command not in {item.split()[0] for item in self.COMMANDS}:
             self.ui_error = "Unknown command. Use /help for local commands."
             return
-        if command not in ("/new", "/model", "/resume") and argument:
+        if command not in ("/new", "/rename", "/model", "/resume") and argument:
             self.ui_error = f"Usage: {command}"
             return
         if command == "/model" and argument not in ("", "scheduler", "worker", "both"):
@@ -559,6 +560,9 @@ class _UI:
             return
         if command == "/resume" and argument not in ("", "selected"):
             self.ui_error = "Usage: /resume [selected]"
+            return
+        if command == "/rename" and not argument:
+            self.ui_error = "Usage: /rename <name>|--auto"
             return
         self._set_draft("")
         if command == "/new":
@@ -569,6 +573,12 @@ class _UI:
             if self.request_ok and result is not None:
                 self._select(result["session_id"])
                 self.focus = "composer"
+        elif command == "/rename":
+            if self.selected is None:
+                self.ui_error = "Select a session to rename."
+                return
+            self._request({"op": "rename", "session_id": self.selected,
+                           "name": None if argument == "--auto" else argument})
         elif command == "/close":
             self._close()
         elif command == "/model":
