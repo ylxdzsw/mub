@@ -46,7 +46,7 @@ appear only when relevant; model defaults and active models are available throug
 | `↑` / `↓` in sidebar | Select a session |
 | `Enter` in sidebar/conversation | Focus the composer |
 | `Enter` in composer | Queue a message |
-| `Alt-Enter` or `Ctrl-J` | Insert a newline |
+| `Shift-Enter`, `Alt-Enter`, or `Ctrl-J` | Insert a newline |
 | `PgUp` / `PgDn` | Scroll conversation |
 | `Home` / `End` in conversation | Beginning / follow output |
 | `Ctrl-P` | Session picker, including scheduler output |

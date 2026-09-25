@@ -190,7 +190,7 @@ class _UI:
             key = self.window.get_wch()
             if isinstance(key, int) and key > curses.KEY_MAX:
                 return {b"kLFT5": "ctrl-left", b"kRIT5": "ctrl-right",
-                        b"kbs5": "ctrl-backspace"}.get(curses.keyname(key), key)
+                        b"kbs5": "ctrl-backspace", b"kent2": 10}.get(curses.keyname(key), key)
             if isinstance(key, str) and len(key) == 1 and (ord(key) < 32 or key == "\x7f"):
                 return ord(key)
             return key
@@ -778,7 +778,7 @@ class _UI:
         lines = ["Commands:", *(f"  {name}  {description}" for name, description in self.COMMANDS.items()), "",
                  "Keyboard:", "  Ctrl-P         Pick a session", "  Tab/Shift-Tab  Cycle sidebar, conversation, composer",
                  "  ↑/↓            Move in sidebar; scroll in conversation; edit in composer",
-                 "  Enter          Focus composer, or queue its message", "  Alt-Enter      Insert a newline (Ctrl-J also inserts one)",
+                 "  Enter          Focus composer, or queue its message", "  Shift-Enter    Insert a newline (Alt-Enter and Ctrl-J also work)",
                  "  PgUp/PgDn      Scroll conversation", "  Ctrl-C         Clear composer input; interrupt session in other panes", "  Ctrl-Q         Quit; confirms before stopping active agents",
                  "  /              List commands; ↑/↓ select, Tab fill, Enter run, Esc hide",
                  "  Q/Esc          Close information screens or cancel pickers",
@@ -839,6 +839,7 @@ class _UI:
                     if "@" <= char <= "~":
                         break
                 return {"1;5D": "ctrl-left", "1;5C": "ctrl-right",
+                        "13;2u": 10, "27;2;13~": 10,
                         "8;5u": "ctrl-backspace", "127;5u": "ctrl-backspace",
                         "27;5;8~": "ctrl-backspace", "27;5;127~": "ctrl-backspace"}.get(sequence)
             if key in (10, 13, curses.KEY_ENTER):
