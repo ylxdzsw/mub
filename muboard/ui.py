@@ -788,6 +788,7 @@ class _UI:
         lines = ["Commands:", *(f"  {name}  {description}" for name, description in self.COMMANDS.items()), "",
                  "Keyboard:", "  Ctrl-P         Pick a session", "  Tab/Shift-Tab  Cycle sidebar, conversation, composer",
                  "  ↑/↓            Move in sidebar; scroll in conversation; edit in composer",
+                 "  → in sidebar   Focus conversation", "  ← in output    Focus sidebar",
                  "  Enter          Focus composer, or queue its message", "  Shift-Enter    Insert a newline (Alt-Enter and Ctrl-J also work)",
                  "  PgUp/PgDn      Scroll conversation", "  Ctrl-C         Clear composer input; interrupt session in other panes", "  Ctrl-Q         Quit; confirms before stopping active agents",
                  "  /              List commands; ↑/↓ select, Tab fill, Enter run, Esc hide",
@@ -900,7 +901,9 @@ class _UI:
             return
 
         if self.focus == "sidebar":
-            if key == curses.KEY_UP:
+            if key == curses.KEY_RIGHT:
+                self.focus = "conversation"
+            elif key == curses.KEY_UP:
                 self._move_session(-1)
             elif key == curses.KEY_DOWN:
                 self._move_session(1)
@@ -909,7 +912,9 @@ class _UI:
             return
 
         if self.focus == "conversation":
-            if key == curses.KEY_UP:
+            if key == curses.KEY_LEFT:
+                self.focus = "sidebar"
+            elif key == curses.KEY_UP:
                 self._view_scroll(-1)
             elif key == curses.KEY_DOWN:
                 self._view_scroll(1)

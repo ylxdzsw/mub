@@ -44,6 +44,8 @@ appear only when relevant; model defaults and active models are available throug
 | --- | --- |
 | `Tab` / `Shift-Tab` | Move between sidebar, conversation, and composer |
 | `↑` / `↓` in sidebar | Select a session |
+| `→` in sidebar | Focus conversation output |
+| `←` in conversation | Focus the session sidebar |
 | `Enter` in sidebar/conversation | Focus the composer |
 | `Enter` in composer | Queue a message |
 | `Shift-Enter`, `Alt-Enter`, or `Ctrl-J` | Insert a newline |
