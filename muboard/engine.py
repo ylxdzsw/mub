@@ -13,7 +13,7 @@ import time
 import uuid
 
 from .state import Store, session_name
-from .output import delivery, journal_path, replay
+from .output import delivery, history_blocks, journal_path, live_prompt, replay
 
 
 def process_stamp(pid):
@@ -89,8 +89,9 @@ class Engine:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Mu command failed")
         return result.stdout.strip()
 
-    def _session_status(self, session):
-        return json.loads(self._mu("status", "-s", session, "--json", "--include-session-details"))
+    def _session_status(self, session, model=None):
+        return json.loads(self._mu("status", "-s", session, "--json", "--include-session-details",
+                                  *(["--model", model] if model else [])))
 
     def _recover(self):
         for run in self.data["inflight"]:
@@ -264,13 +265,15 @@ class Engine:
             stream = active["output"]
             text = os.pread(stream.fileno(), os.fstat(stream.fileno()).st_size, 0).decode("utf-8", "replace")
             return dict(text=active["history"] + "\n── Live invocation ──\n" + text,
+                        blocks=active["blocks"] + [dict(kind="markdown", text=text)],
                         source="Mu history + live output")
         if not target["session"]:
             return dict(text="", source="No Mu turn yet")
         key = target["session"]
         if key not in self.history:
-            self.history[key] = replay(self.root, key, self.mu)
-        return dict(text=self.history[key], source="Mu session journal")
+            text = replay(self.root, key, self.mu)
+            self.history[key] = dict(text=text, blocks=history_blocks(self.root, key, text))
+        return dict(self.history[key], source="Mu session journal")
 
     def _scheduler_prompt(self, snapshot):
         return f"""You schedule messages for Mu sessions sharing {self.root}. You do NOT manage implementation quality, review code, invent tasks, or fix failures. Do not edit project files, launch agents, or call user controls. The runtime owns processes and delivery. Interpret dependencies from messages and worker responses; preserve FIFO within sessions, prefer global submission order unless priorities/prerequisites justify another choice. Readers see a live, possibly changing checkout.
@@ -303,12 +306,13 @@ SNAPSHOT:
             target["session"] = self._mu("new")
             self.store.save()
         mu_session = target["session"]
-        status = self._session_status(mu_session)
+        status = self._session_status(mu_session, self.models[kind])
         if status.get("active", {}).get("busy"):
             raise RuntimeError(f"Mu session {mu_session} is already busy")
         if action != "retry" and not status["clean"]:
             raise RuntimeError(f"Mu session {mu_session} has an interrupted turn; use explicit continuation")
         history = replay(self.root, mu_session, self.mu)
+        blocks = history_blocks(self.root, mu_session, history)
         self.history.pop(mu_session, None)
         if kind == "scheduler":
             prompt = self._scheduler_prompt(snapshot)
@@ -320,6 +324,8 @@ Commit only this session's completed, task-owned changes so another writer can p
             prompt = ""
         else:
             prompt = message["text"]
+        if action != "retry":
+            blocks.append(live_prompt(prompt, self.root, status))
         record = dict(id=uuid.uuid4().hex[:12], kind=kind, session_id=session["id"] if session else None,
                       session=mu_session, action=action, mode=mode, trap=trap or ("reversible" if mode == "readonly" else "destructive"),
                       origin=session["last"]["action"] if action == "retry" and session["last"] else action,
@@ -337,7 +343,7 @@ Commit only this session's completed, task-owned changes so another writer can p
         self.data["inflight"].append(record)
         self.store.save()
         output = tempfile.TemporaryFile()
-        active = dict(record=record, output=output, history=history, snapshot=snapshot, plan=None,
+        active = dict(record=record, output=output, history=history, blocks=blocks, snapshot=snapshot, plan=None,
                       stopped_at=None)
         env = dict(os.environ, NO_COLOR="1", MUB_PROJECT=str(self.root), MUB_ROLE=kind)
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent.parent), env.get("PYTHONPATH")]))

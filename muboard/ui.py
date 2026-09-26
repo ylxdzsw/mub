@@ -9,17 +9,10 @@ import sys
 import time
 import unicodedata
 
-from .output import markdown
+from .output import literal as _text, render_blocks
 
 
 _ANSI = re.compile(r"(\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_]))")
-
-
-def _text(value) -> str:
-    return "".join(
-        "    " if char == "\t" else "�" if char != "\n" and unicodedata.category(char) in {"Cc", "Cf"} else char
-        for char in str(value or "")
-    )
 
 
 def _width(text: str) -> int:
@@ -70,6 +63,7 @@ class _UI:
         self.renderer = renderer
         self.render_job = None
         self.rendered = {}
+        self.markdown_cache = {}
         self.state = engine.state()
         sessions = self.state["sessions"]
         self.selected = sessions[0]["id"] if sessions else None
@@ -149,20 +143,21 @@ class _UI:
             lines.pop()
         return lines
 
-    def _output_lines(self, text, width):
+    def _output_lines(self, blocks, width):
         if self.render_job and self.render_job[1].done():
             (selected, source, columns), future = self.render_job
             try:
                 rendered = future.result()
             except (OSError, RuntimeError) as error:
                 self.ui_error = str(error)
-                rendered = source
+                rendered = "\n\n".join(_text(block["text"]) for block in source)
             self.rendered[selected] = (source, columns, self._styled_lines(rendered, columns))
             self.render_job = None
         cached = self.rendered.get(self.selected)
-        if self.render_job is None and (cached is None or cached[:2] != (text, width)):
-            self.render_job = ((self.selected, text, width),
-                               self.renderer.submit(markdown, self.engine.root, _text(text), width, self.engine.mu))
+        if self.render_job is None and (cached is None or cached[:2] != (blocks, width)):
+            self.render_job = ((self.selected, blocks, width),
+                               self.renderer.submit(render_blocks, self.engine.root, blocks, width,
+                                                    self.engine.mu, self.markdown_cache))
         return cached[2] if cached else [[("Rendering…", curses.A_DIM)]]
 
     def _add(self, y, x, text, width=None, attr=0):
@@ -335,9 +330,9 @@ class _UI:
             if len(queue) > visible and row < y + height:
                 self._add(row, x + 1, f"… {len(queue) - visible} more queued", width - 2, curses.A_DIM)
                 row += 1
-        text = output.get("text")
-        if text:
-            lines = self._output_lines(text, max(2, width - 2))
+        blocks = output.get("blocks", [])
+        if blocks:
+            lines = self._output_lines(blocks, max(2, width - 2))
         else:
             empty = "No output yet." if session or self.state["sessions"] else "Create a session with /new [name]."
             lines = [[(empty, curses.A_DIM)]]

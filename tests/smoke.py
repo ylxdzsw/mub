@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from muboard.engine import Engine, owned_members
 from muboard.ipc import ControlServer
+from muboard.output import render_blocks
 from muboard.state import read_state
 
 
@@ -134,12 +135,24 @@ class SchedulerSmoke(unittest.TestCase):
         saved = read_state(self.root)
         self.assertEqual(len(saved["messages"]), 3)
         self.until(board, lambda: board._running(first["id"]) is not None)
+        display = board.output(first["id"])
+        prompt = display["blocks"][0]
+        self.assertEqual(prompt, dict(kind="prompt", text=raw, model="fake/model", context="~42%", cwd=str(self.root)))
+        with patch("muboard.output.markdown", return_value="Rendered response") as markdown:
+            rendered = render_blocks(self.root, [prompt, dict(kind="markdown", text="**response**")], 37, str(FAKE))
+            markdown.assert_called_once_with(self.root, "**response**", 37, str(FAKE))
+        self.assertIn("\x1b[94mfake/model\x1b[0m \x1b[35m~42%\x1b[0m", rendered)
+        self.assertIn("\x1b[36m" + str(self.root) + "\x1b[0m\nmu> " + raw, rendered)
+        self.assertNotIn("Live invocation", rendered)
         board.request(dict(op="send", session_id=first["id"], text="read late"))
         self.until(board, board.idle)
         self.assertFalse(board.data["messages"])
         turns = self.journal(first)["invocations"]
         self.assertEqual([t["prompt"] for t in turns],
                          [raw, "read second", "read late"])
+        prompts = [b for b in board.output(first["id"])["blocks"] if b["kind"] == "prompt"]
+        self.assertEqual([b["text"] for b in prompts], [raw, "read second", "read late"])
+        self.assertTrue(all(b["context"] == "~42%" for b in prompts))
         self.assertEqual(len(self.journal(second)["invocations"]), 1)
         scheduler = self.journal(board.data["scheduler"])
         self.assertGreaterEqual(len(scheduler["invocations"]), 3)
@@ -212,6 +225,8 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(turns[0]["args"][turns[0]["args"].index("--trap") + 1], "reversible")
         self.assertIn("retry", turns[1]["args"])
         self.assertEqual(turns[1]["args"][turns[1]["args"].index("--trap") + 1], "off")
+        prompts = [b for b in board.output(session["id"])["blocks"] if b["kind"] == "prompt"]
+        self.assertEqual([b["text"] for b in prompts], ["trap write"])
         snapshots = [json.loads(p.read_text()) for p in (self.root / ".mu/fake").glob("snapshot-*")]
         trapped = next(s for snap in snapshots for s in snap["sessions"] if s["gate"] == "trapped")
         self.assertIn("complete stdin", trapped["last"]["trap_output"])

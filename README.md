@@ -26,10 +26,13 @@ Do not run another editing agent against the same checkout outside mub.
 
 ## UI
 
-The sidebar lists sessions. The conversation pane renders Mu history and live
-output as Markdown using Mu's own `mu cat` renderer, sized to the pane. Rendering
-runs separately from process supervision; scheduler inputs and CLI logs remain
-raw text. The composer sends to the selected session and grows with its draft.
+The sidebar lists sessions. The conversation pane shows Mu-style colored
+model/context/cwd headers and literal `mu>` prompts, including multiline input.
+History prompts are matched against Mu's journal; live prompts appear when an
+invocation starts. Output between prompts uses Mu's own `mu cat` Markdown
+renderer, sized to the pane and reflowed on resize. Rendering runs separately
+from process supervision; scheduler inputs and CLI logs remain raw text.
+The composer sends to the selected session and grows with its draft.
 Mailbox entries are labeled
 pending, in-flight, or interrupted; they are not mistaken for delivered history.
 Drafts are kept separately for each session while the UI is open.

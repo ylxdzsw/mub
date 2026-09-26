@@ -101,7 +101,9 @@ def main():
     if args[0] == "status":
         if data:
             busy = data["active"]["busy"] and Path(f"/proc/{data['active'].get('pid', 0)}").exists()
-            print(json.dumps(dict(clean=data["clean"], active=dict(busy=busy))))
+            model = args[args.index("--model") + 1] if "--model" in args else "fake/model"
+            print(json.dumps(dict(clean=data["clean"], active=dict(busy=busy), model=dict(canonical=model),
+                                  context_tokens=420, context_window=1000, context_usage_source="estimated")))
         else:
             print(json.dumps(dict(project_root=str(ROOT), available_models=dict(providers=[dict(models=[
                 dict(id="fake/model", supported_efforts=["low", "high"]), dict(id="fake/other", supported_efforts=[])
@@ -125,11 +127,13 @@ def main():
     data["invocations"].append(dict(args=args, prompt=prompt, role=role))
     if not retry:
         data["prompt"] = prompt
-        data["transcript"] += "\nuser: " + prompt + "\n"
+        model = args[args.index("-m") + 1] if "-m" in args else "fake/model"
+        data["transcript"] += f"\n{model} ~42% {ROOT}\nmu> " + prompt + "\n"
         with (JOURNALS / f"{key}.jsonl").open("a") as journal:
             prompt_id = f"p{len(data['invocations'])}"
-            for kind in ("prompt_queued", "prompt_materialized"):
-                journal.write(json.dumps(dict(type=kind, prompt_id=prompt_id)) + "\n")
+            journal.write(json.dumps(dict(type="prompt_queued", prompt_id=prompt_id, cwd=str(ROOT),
+                                          prompt=dict(kind="text", text=prompt))) + "\n")
+            journal.write(json.dumps(dict(type="prompt_materialized", prompt_id=prompt_id)) + "\n")
     save(path, data)
     if role == "worker":
         print("LIVE: worker started", flush=True)
