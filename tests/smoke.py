@@ -276,6 +276,29 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertTrue(held["hold"])
         self.assertEqual(len(board.data["messages"]), 2)
 
+    def test_session_models(self):
+        board = self.board()
+        first = board.request(dict(op="new", model="fake/other"))["session_id"]
+        second = board.request(dict(op="new"))["session_id"]
+        self.assertEqual([s["next_model"] for s in board.state()["sessions"]], ["fake/other", "fake/model"])
+        board.request(dict(op="set_models", models=dict(worker="fake/model:low")))
+        board.request(dict(op="send", session_id=first, text="read hold"))
+        session = board.store.session(first)
+        self.until(board, lambda: board._running(first) is not None and self.journal(session)["active"]["busy"])
+        run = board._running(first)["record"]
+        args = self.journal(session)["invocations"][0]["args"]
+        self.assertEqual(args[args.index("-m") + 1], "fake/other")
+        board.request(dict(op="set_session_model", session_id=first, model="fake/model:high"))
+        self.assertEqual(run["model"], "fake/other")
+        self.assertEqual(board.state()["sessions"][0]["next_model"], "fake/model:high")
+        self.assertIsNone(board.store.session(second)["model"])
+        board.close()
+        reopened = self.board()
+        self.assertEqual(reopened.store.session(first)["model"], "fake/model:high")
+        reopened.request(dict(op="set_session_model", session_id=first, model=None))
+        self.assertEqual(reopened.state()["sessions"][0]["next_model"], "fake/model:low")
+        self.assertTrue(reopened.store.session(first)["hold"])
+
     def test_worktree_lock_models_restart_and_removal(self):
         board = self.board()
         child = self.root / "nested"

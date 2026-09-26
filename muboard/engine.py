@@ -73,6 +73,7 @@ class Engine:
         self.server = None
         self.done = self.stopping = self.closed = False
         self.history = {}
+        self.model_cache = {}
         self.traps = {}
         self.client = shlex.join([sys.executable, "-m", "muboard", "-C", str(self.root)])
         try:
@@ -132,12 +133,33 @@ class Engine:
         return next((a for a in self.active.values() if a["record"]["session_id"] == session_id), None)
 
     def state(self):
-        sessions = [dict(s, active=(a["record"] if (a := self._running(s["id"])) else None))
+        sessions = [dict(s, next_model=self._next_model(s),
+                         active=(a["record"] if (a := self._running(s["id"])) else None))
                     for s in self.data["sessions"]]
         scheduler = self._running(None)
         return dict(root=str(self.root), sessions=sessions, messages=self.data["messages"],
                     scheduler=dict(self.data["scheduler"], active=scheduler["record"] if scheduler else None),
                     workspace=self.workspace, models=self.models, stopping=self.stopping)
+
+    def _next_model(self, session):
+        override = session.get("model") or self.models["worker"]
+        if override:
+            return override
+        key = session["session"]
+        if key not in self.model_cache:
+            try:
+                status = (self._session_status(session["session"]) if session["session"] else
+                          json.loads(self._mu("status", "--json")))
+                self.model_cache[key] = status.get("model", {}).get("canonical") or "Mu/session default"
+            except (RuntimeError, ValueError):
+                self.model_cache[key] = "Mu/session default (unavailable)"
+        return self.model_cache[key]
+
+    @staticmethod
+    def _model_reference(value):
+        if value is not None and (not isinstance(value, str) or not value.strip() or not value.isprintable()):
+            raise ValueError("Model must be a reference or null for default")
+        return value.strip() if value is not None else None
 
     def _agent_peer(self, pid):
         agents = {a["record"].get("pid") for a in self.active.values()}
@@ -170,7 +192,9 @@ class Engine:
         if op == "new":
             if "text" in req and not req["text"].strip():
                 raise ValueError("Message cannot be empty")
+            model = self._model_reference(req.get("model"))
             session = self.store.new_session(req.get("name"))
+            session["model"] = model
             if req.get("text"):
                 self.store.submit(session["id"], req["text"])
             result = dict(session_id=session["id"])
@@ -224,6 +248,10 @@ class Engine:
             self.data["messages"] = [m for m in self.data["messages"] if m["session_id"] != session["id"]]
             self.store.event("removed", session["id"])
             result = dict(removed=True)
+        elif op == "set_session_model":
+            session = self.store.session(int(req["session_id"]))
+            session["model"] = self._model_reference(req["model"])
+            result = dict(session_id=session["id"], model=session["model"], next_model=self._next_model(session))
         elif op == "set_models":
             models = req["models"]
             if not isinstance(models, dict) or not models or set(models) - {"scheduler", "worker"}:
@@ -306,7 +334,8 @@ SNAPSHOT:
             target["session"] = self._mu("new")
             self.store.save()
         mu_session = target["session"]
-        status = self._session_status(mu_session, self.models[kind])
+        model = target.get("model") or self.models[kind]
+        status = self._session_status(mu_session, model)
         if status.get("active", {}).get("busy"):
             raise RuntimeError(f"Mu session {mu_session} is already busy")
         if action != "retry" and not status["clean"]:
@@ -330,7 +359,7 @@ Commit only this session's completed, task-owned changes so another writer can p
                       session=mu_session, action=action, mode=mode, trap=trap or ("reversible" if mode == "readonly" else "destructive"),
                       origin=session["last"]["action"] if action == "retry" and session["last"] else action,
                       journal_offset=session["last"]["journal_offset"] if action == "retry" and session["last"] else journal_path(self.root, mu_session).stat().st_size,
-                      model=self.models[kind] or status.get("model", {}).get("canonical"), message_id=message["id"] if message else
+                      model=model or status.get("model", {}).get("canonical"), message_id=message["id"] if message else
                       (session["last"].get("message_id") if action == "retry" and session["last"] else None),
                       pid=None, stamp=None, stopping=False)
         if session:
@@ -351,8 +380,8 @@ Commit only this session's completed, task-owned changes so another writer can p
             env["MUB_SOCKET"] = str(self.server.path)
         args = [self.mu, *(["retry"] if action == "retry" else []), "-s", mu_session,
                 "-o", "final" if kind == "scheduler" else "concise", "--trap", record["trap"]]
-        if self.models[kind]:
-            args += ["-m", self.models[kind]]
+        if model:
+            args += ["-m", model]
         ready, release = os.pipe()
         # The child cannot execute Mu until its PID is durable. Parent death closes
         # the pipe, so a crash in the launch window cannot create an untracked writer.
@@ -520,6 +549,7 @@ Commit only this session's completed, task-owned changes so another writer can p
 
     def _finish(self, active):
         run = active["record"]
+        self.model_cache.pop(run["session"], None)
         self.data["inflight"].remove(run)
         self.history.pop(run["session"], None)
         stream = active["output"]

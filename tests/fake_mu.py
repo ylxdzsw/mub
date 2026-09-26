@@ -105,7 +105,7 @@ def main():
             print(json.dumps(dict(clean=data["clean"], active=dict(busy=busy), model=dict(canonical=model),
                                   context_tokens=420, context_window=1000, context_usage_source="estimated")))
         else:
-            print(json.dumps(dict(project_root=str(ROOT), available_models=dict(providers=[dict(models=[
+            print(json.dumps(dict(project_root=str(ROOT), model=dict(canonical="fake/model"), available_models=dict(providers=[dict(models=[
                 dict(id="fake/model", supported_efforts=["low", "high"]), dict(id="fake/other", supported_efforts=[])
             ])]))))
         return 0

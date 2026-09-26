@@ -31,6 +31,7 @@ def read_state(root):
         raise ValueError("This is an old task-board snapshot. Archive .mu/mub.json before starting the session scheduler; Mu journals are unchanged.")
     for session in data["sessions"]:
         session.setdefault("name_source", "user")
+        session.setdefault("model", None)
     return data
 
 
@@ -100,7 +101,7 @@ class Store:
         key = self.data["next_session"]
         self.data["next_session"] += 1
         session = dict(id=key, name=name or f"Session {key}", name_source="user" if name else "auto",
-                       session=None, hold=False,
+                       session=None, model=None, hold=False,
                        gate=None, reason="", blocked=None, last=None, revision=0,
                        retry_authorized=False)
         self.data["sessions"].append(session)

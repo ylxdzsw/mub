@@ -44,6 +44,10 @@ def parser():
     new = sub.add_parser("new", help="Create a session, optionally queue its first message")
     new.add_argument("text", nargs="?")
     new.add_argument("--name")
+    new.add_argument("--model", default=argparse.SUPPRESS, help="Model for this session only")
+    model = sub.add_parser("model", help="Set one session's model for later invocations")
+    model.add_argument("session_id", type=session_id)
+    model.add_argument("reference", help="Model reference, or default to inherit worker/Mu selection")
     rename = sub.add_parser("rename", help="Name a session or return it to automatic naming")
     rename.add_argument("session_id", type=session_id)
     rename.add_argument("name", nargs="?")
@@ -100,10 +104,13 @@ def main():
                 request["session_id"] = args.session_id
             if command == "new":
                 request["name"] = args.name
+                request["model"] = None if args.model == "default" else args.model
                 if args.text is not None or not sys.stdin.isatty():
                     text = text_arg(args.text)
                     if text.strip():
                         request["text"] = text
+            elif command == "model":
+                request.update(op="set_session_model", model=None if args.reference == "default" else args.reference)
             elif command == "send":
                 request["text"] = text_arg(args.text)
             elif command == "rename":

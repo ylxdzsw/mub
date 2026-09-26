@@ -51,7 +51,7 @@ class _UI:
         "/new [name]": "Create and select a session",
         "/rename <name>|--auto": "Name the selected session, or let its name evolve automatically",
         "/close": "Close the selected session",
-        "/model [scheduler|worker|both]": "Show selected models, or choose models and effort for a role",
+        "/model [session|scheduler|worker|both]": "Show models, or choose a session/role model and effort",
         "/resume [selected]": "Resume the selected session",
         "/schedule": "Explicitly recheck or recover the scheduler",
         "/help": "Show commands and keyboard controls",
@@ -320,8 +320,16 @@ class _UI:
         self._add(y, x + 1, title, width - 2,
                   self.colors.get("title", 0) if self.focus == "conversation" else curses.A_DIM)
         row = y + 1
+        if session and row < y + height:
+            model = session.get("next_model") or "Mu/session default"
+            active = session.get("active")
+            label = f"Model: {model} · /model session to change"
+            if active and active.get("model") != model:
+                label = f"Active: {active.get('model')} · Next: {model}"
+            self._add(row, x + 1, label, width - 2, curses.A_DIM)
+            row += 1
         if queue:
-            visible = min(len(queue), 3, max(0, height - 2))
+            visible = min(len(queue), 3, max(0, y + height - row - 1))
             if len(queue) > visible:
                 visible = max(0, visible - 1)
             for message in queue[:visible]:
@@ -550,8 +558,8 @@ class _UI:
         if command not in ("/new", "/rename", "/model", "/resume") and argument:
             self.ui_error = f"Usage: {command}"
             return
-        if command == "/model" and argument not in ("", "scheduler", "worker", "both"):
-            self.ui_error = "Usage: /model [scheduler|worker|both]"
+        if command == "/model" and argument not in ("", "session", "scheduler", "worker", "both"):
+            self.ui_error = "Usage: /model [session|scheduler|worker|both]"
             return
         if command == "/resume" and argument not in ("", "selected"):
             self.ui_error = "Usage: /resume [selected]"
@@ -581,13 +589,17 @@ class _UI:
                 self._models(argument)
             else:
                 self._info("Selected models", [
+                    *([f"S{self.selected} next: {self._session().get('next_model') or 'Mu/session default'}",
+                       f"Session override: {self._session().get('model') or 'Inherit worker/Mu selection'}", ""]
+                      if self._session() else []),
                     *(f"{role.title()}: {self.state['models'].get(role) or 'Mu/session default'}"
                       for role in ("scheduler", "worker")), "",
                     *(f"{label} active: {active.get('model') or 'Mu/session default'} · {active['mode']}"
                       for label, active in [("Scheduler", self.state["scheduler"]["active"]),
                                             *((f"S{s['id']}", s.get("active")) for s in self.state["sessions"])]
                       if active), "",
-                    "Use /model scheduler, /model worker, or /model both to change models and effort.",
+                    "Use /model session to change only the selected session.",
+                    "Use /model scheduler, /model worker, or /model both to change defaults.",
                     "Changes apply to later invocations; active workers keep their current model.",
                 ])
         elif command == "/resume":
@@ -635,19 +647,23 @@ class _UI:
         self._request({"op": "resume", "session_id": session["id"]})
 
     def _models(self, role):
+        session = self._session()
+        if role == "session" and session is None:
+            self.ui_error = "Select a session first, or create one with /new."
+            return
         response = self._request({"op": "models"})
         if response is None:
             return
         roles = ("scheduler", "worker") if role == "both" else (role,)
         chosen = {}
         for current_role in roles:
-            selected = response["selected"].get(current_role)
+            selected = session.get("model") if current_role == "session" else response["selected"].get(current_role)
             base, separator, effort = (selected or "").rpartition(":")
             if not separator:
                 base, effort = selected or "", ""
             available = response["available"]
             models = [model["id"] for model in available]
-            options = ["Mu/session default", *models]
+            options = ["Inherit worker/Mu selection" if current_role == "session" else "Mu/session default", *models]
             initial = models.index(base) + 1 if base in models else 0
             choice = self._pick(f"{current_role.title()} model · next invocation", options, initial)
             if choice is None:
@@ -665,7 +681,10 @@ class _UI:
                     if effort_choice:
                         reference += ":" + efforts[effort_choice - 1]
             chosen[current_role] = reference
-        self._request({"op": "set_models", "models": chosen})
+        if role == "session":
+            self._request({"op": "set_session_model", "session_id": session["id"], "model": chosen["session"]})
+        else:
+            self._request({"op": "set_models", "models": chosen})
 
     def _interrupt(self):
         if self.selected is None:

@@ -39,6 +39,9 @@ Drafts are kept separately for each session while the UI is open.
 
 Create a session with `/new [name]`, then type its first message. Use `Ctrl-P` to
 pick a session or inspect the scheduler's decisions and output.
+The conversation pane shows the session's model even before its first message.
+Use `/model session` to choose a model and reasoning effort for that session only,
+whether it is new or already has history.
 Scheduler status appears once in the top bar. Errors, holds, and blocking reasons
 appear only when relevant; model defaults and active models are available through
 `/model`, and the full keyboard reference through `/help`.
@@ -71,6 +74,7 @@ Local commands:
 - `/close`: detach an idle session; confirm discarding any queued messages.
 - `/model`: show the selected scheduler/worker defaults and active invocation models.
 - `/model scheduler|worker|both`: select models and reasoning effort.
+- `/model session`: select the current session's model and effort, or remove its override.
 - `/resume`: release a session hold and explicitly authorize continuation of its
   interrupted turn, if any.
 - `/schedule`: recheck the workspace and scheduling. After a scheduler error,
@@ -183,6 +187,9 @@ Submissions do not implicitly start a daemon.
 
 ```sh
 mub new --name API 'Implement the API endpoint'
+mub new --name Review --model provider/model:high 'Review the API'
+mub model S1 provider/model:high # change only S1, starting with its next invocation
+mub model S1 default             # remove S1's override
 mub send S1 'Use cursor-based pagination'
 mub rename S1 'API pagination'
 mub rename S1 --auto            # allow the name to evolve on later scheduler passes
@@ -209,6 +216,11 @@ held, blocked, or failed sessions may still have pending messages.
 `--scheduler-model`, `--worker-model`, and `--model` override models for the current
 launch. UI/CLI model selections persist and apply only to later invocations,
 including existing sessions. “Mu/session default” removes an override.
+Per-session model choices persist and take precedence over the worker default,
+including launch overrides. Removing a session override inherits the worker
+selection, or Mu's remembered session/configured model when no worker override
+is set. Active invocations retain their model; changing a model does not release
+a hold or trigger work.
 
 ## Persistence
 
