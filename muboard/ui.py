@@ -47,6 +47,7 @@ class _UI:
         "/rename <name>|--auto": "Name the selected session, or let its name evolve automatically",
         "/close": "Close the selected session",
         "/model [session|scheduler|worker|both]": "Show models, or choose a session/role model and effort",
+        "/interrupt": "Interrupt and hold the selected session",
         "/resume [selected]": "Resume the selected session",
         "/schedule": "Explicitly recheck or recover the scheduler",
         "/bell": "Toggle audible live bells (background sessions also get a ! marker)",
@@ -68,9 +69,10 @@ class _UI:
         self.command_query = None
         self.command_index = 0
         self.command_dismissed = False
-        self.focus = "sidebar" if sessions else "composer"
         self.scrolls = {}
         self.sidebar_scroll = 0
+        self.session_hits = []
+        self.output_rect = None
         self.pending_key = None
         self.ui_error = ""
         self.request_ok = False
@@ -80,6 +82,8 @@ class _UI:
         curses.set_escdelay(25)
         window.keypad(True)
         window.timeout(50)
+        curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
+        curses.mouseinterval(0)
         if curses.has_colors():
             curses.start_color()
             curses.use_default_colors()
@@ -150,8 +154,16 @@ class _UI:
     def _getch_raw(self):
         try:
             key = self.window.get_wch()
+            if key == curses.KEY_MOUSE:
+                _, x, y, _, buttons = curses.getmouse()
+                return ("mouse", x, y, buttons)
+            key = {curses.KEY_SR: "shift-up", curses.KEY_SF: "shift-down",
+                   curses.KEY_SLEFT: "shift-left", curses.KEY_SRIGHT: "shift-right"}.get(key, key)
             if isinstance(key, int) and key > curses.KEY_MAX:
                 return {b"kLFT5": "ctrl-left", b"kRIT5": "ctrl-right",
+                        b"kUP2": "shift-up", b"kDN2": "shift-down",
+                        b"kLFT2": "shift-left", b"kRIT2": "shift-right",
+                        b"kHOM5": "ctrl-home", b"kEND5": "ctrl-end",
                         b"kbs5": "ctrl-backspace", b"kent2": 10}.get(curses.keyname(key), key)
             if isinstance(key, str) and len(key) == 1 and (ord(key) < 32 or key == "\x7f"):
                 return ord(key)
@@ -198,8 +210,7 @@ class _UI:
         return next((item for item in self.state["sessions"] if item["id"] == session_id), None)
 
     def _save_draft(self):
-        if self.selected is not None:
-            self.drafts[self.selected] = (self.draft, self.cursor)
+        self.drafts[self.selected] = (self.draft, self.cursor)
 
     def _select(self, session_id):
         if session_id == self.selected:
@@ -207,7 +218,9 @@ class _UI:
         self._save_draft()
         self.selected = session_id
         self.draft, self.cursor = self.drafts.get(session_id, ("", 0))
-        self.focus = "sidebar" if session_id is not None else "composer"
+        self.command_query = None
+        self.command_index = 0
+        self.command_dismissed = False
 
     def _set_draft(self, text, cursor=None):
         self.draft = text
@@ -217,12 +230,11 @@ class _UI:
     def _selected_index(self):
         return next((i for i, session in enumerate(self.state["sessions"]) if session["id"] == self.selected), 0)
 
-    def _move_session(self, amount):
+    def _cycle_session(self, amount):
         sessions = self.state["sessions"]
         if sessions:
-            index = self._selected_index()
-            index = max(0, min(len(sessions) - 1, index + amount))
-            self._select(sessions[index]["id"])
+            index = self._selected_index() if self.selected is not None else (-1 if amount > 0 else 0)
+            self._select(sessions[(index + amount) % len(sessions)]["id"])
 
     def _pending(self, session_id):
         return [message for message in self.state["messages"] if message["session_id"] == session_id]
@@ -244,8 +256,7 @@ class _UI:
         if width <= 0 or height <= 0:
             return
         sessions = self.state["sessions"]
-        self._add(y, 1, "Sessions", width - 2,
-                  self.colors.get("title", 0) if self.focus == "sidebar" else curses.A_DIM)
+        self._add(y, 1, "Sessions", width - 2, curses.A_DIM)
         capacity = max(0, height - 1)
         index = self._selected_index()
         self.sidebar_scroll = max(0, min(self.sidebar_scroll, max(0, len(sessions) - capacity)))
@@ -254,6 +265,7 @@ class _UI:
         elif capacity and index >= self.sidebar_scroll + capacity:
             self.sidebar_scroll = index - capacity + 1
         for row, session in enumerate(sessions[self.sidebar_scroll:self.sidebar_scroll + capacity], y + 1):
+            self.session_hits.append((row, width, session["id"]))
             pending = len(self._pending(session["id"]))
             owner = "◆" if self.state["workspace"]["owner"] == session["id"] else ""
             suffix = f" +{pending}" if pending else ""
@@ -268,6 +280,7 @@ class _UI:
     def _draw_conversation(self, session, x, y, width, height):
         if width <= 0 or height <= 0:
             return
+        self.output_rect = (x, y, width, height)
         if session:
             title = f"S{session['id']} · {session['name']}"
             status = self._session_status(session)
@@ -279,10 +292,7 @@ class _UI:
         else:
             title, queue = "Scheduler", []
         scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
-        if not scroll["follow"]:
-            title += " · scrolled (End to follow)"
-        self._add(y, x + 1, title, width - 2,
-                  self.colors.get("title", 0) if self.focus == "conversation" else curses.A_DIM)
+        hint = " · History · Ctrl-End for live" if not scroll["follow"] else ""
         row = y + 1
         if session and row < y + height:
             model = session.get("next_model") or "Mu/session default"
@@ -316,10 +326,12 @@ class _UI:
                 self.ui_error = screen.error
             self._terminal_frame(screen, x + 1, row, columns, visible, scroll)
             if screen.cols > columns:
-                self._add(y, x + 1, title + " · [/] pan", width - 2, curses.A_DIM)
+                hint += " · Shift-←/→ pan"
         else:
             message = "Loading Mu history…" if (session and session.get("session")) or (not session and self.state["scheduler"].get("session")) else "No output yet."
             self._add(row, x + 1, message, columns, curses.A_DIM)
+        self._add(y, x + 1, _clip(title, max(0, width - 2 - _width(hint))) + hint,
+                  width - 2, self.colors.get("title", 0))
 
     def _notice(self):
         if self.ui_error:
@@ -348,14 +360,11 @@ class _UI:
         before = _lines(self.draft[:self.cursor], text_width)
         cursor_row = len(before) - 1
         cursor_col = _width(before[-1])
-        start = max(0, cursor_row - rows + 1) if self.focus == "composer" else max(0, len(lines) - rows)
+        start = max(0, cursor_row - rows + 1)
         for offset, line in enumerate(lines[start:start + rows]):
             row = top + offset
-            self._add(row, 1, ">" if offset == 0 else "·",
-                      attr=self.colors.get("title", 0) if self.focus == "composer" else curses.A_DIM)
+            self._add(row, 1, ">" if offset == 0 else "·", attr=self.colors.get("title", 0))
             self._add(row, 3, line, width - 5)
-        if self.focus != "composer":
-            return None
         row = cursor_row - start
         if 0 <= row < rows:
             return row, min(max(0, width - 1), 3 + cursor_col)
@@ -363,6 +372,8 @@ class _UI:
 
     def _draw_main(self):
         self.window.erase()
+        self.session_hits = []
+        self.output_rect = None
         height, width = self.window.getmaxyx()
         if height <= 0 or width <= 0:
             return
@@ -403,11 +414,13 @@ class _UI:
 
         if label_y >= 0:
             self._add(label_y, 0, "─" * max(0, width - 1), attr=curses.A_DIM)
+            recipient = f"To S{session['id']} · {session['name']}" if session else "Scheduler · commands only · /new to create a session"
+            self._add(label_y, 1, f" {recipient} ", width - 3, self.colors.get("title", 0))
         cursor = self._draw_composer(label_y, composer_top, composer_rows, width)
         self._draw_commands(label_y, width)
         if notice := self._notice():
             self._add(notice_y, 1, notice, width - 2, self.colors.get("warn", 0))
-        self._add(height - 1, 1, "Tab panes · Ctrl-P sessions · /help", attr=curses.A_DIM)
+        self._add(height - 1, 1, "Tab/Shift-Tab sessions · PgUp/PgDn output · Ctrl-P picker · /help", attr=curses.A_DIM)
         self._cursor((composer_top + cursor[0], cursor[1]) if cursor else None)
         self.window.refresh()
 
@@ -416,7 +429,7 @@ class _UI:
             self.command_query = self.draft
             self.command_index = 0
             self.command_dismissed = False
-        if (self.focus != "composer" or self.command_dismissed or self.cursor != len(self.draft)
+        if (self.command_dismissed or self.cursor != len(self.draft)
                 or not self.draft.startswith("/") or any(char.isspace() for char in self.draft)):
             return []
         return [(name, description) for name, description in self.COMMANDS.items()
@@ -430,7 +443,7 @@ class _UI:
         box_width = min(88, width - 2)
         top = bottom - visible - 2
         start = max(0, min(self.command_index - visible + 1, len(matches) - visible))
-        header = f" Commands {self.command_index + 1}/{len(matches)} · ↑↓ select · Tab fill · Enter run · Esc hide "
+        header = f" Commands {self.command_index + 1}/{len(matches)} · ↑↓ select · → fill · Enter run · Esc hide "
         self._add(top, 1, "┌" + _clip(header, box_width - 2).ljust(box_width - 2, "─") + "┐", box_width, curses.A_DIM)
         for row, index in enumerate(range(start, start + visible), top + 1):
             name, description = matches[index]
@@ -445,10 +458,10 @@ class _UI:
             return False
         if key in (curses.KEY_UP, curses.KEY_DOWN):
             self.command_index = max(0, min(len(matches) - 1, self.command_index + (-1 if key == curses.KEY_UP else 1)))
-        elif key in (9, 13, curses.KEY_ENTER):
+        elif key in (curses.KEY_RIGHT, 13, curses.KEY_ENTER):
             name = matches[self.command_index][0].split()[0]
-            self._set_draft(name + (" " if key == 9 else ""))
-            if key != 9:
+            self._set_draft(name + (" " if key == curses.KEY_RIGHT else ""))
+            if key != curses.KEY_RIGHT:
                 self._submit()
         else:
             return False
@@ -501,8 +514,6 @@ class _UI:
     def _submit(self):
         text = self.draft.strip()
         if not text:
-            if self.focus != "composer":
-                self.focus = "composer"
             return
         if text.startswith("/") and not text.startswith("//"):
             self._command(text)
@@ -541,7 +552,6 @@ class _UI:
             result = self._request(request)
             if self.request_ok and result is not None:
                 self._select(result["session_id"])
-                self.focus = "composer"
         elif command == "/rename":
             if self.selected is None:
                 self.ui_error = "Select a session to rename."
@@ -568,6 +578,8 @@ class _UI:
                     "Use /model scheduler, /model worker, or /model both to change defaults.",
                     "Changes apply to later invocations; active workers keep their current model.",
                 ])
+        elif command == "/interrupt":
+            self._interrupt()
         elif command == "/resume":
             self._resume()
         elif command == "/schedule":
@@ -771,13 +783,18 @@ class _UI:
 
     def _help(self):
         lines = ["Commands:", *(f"  {name}  {description}" for name, description in self.COMMANDS.items()), "",
-                 "Keyboard:", "  Ctrl-P         Pick a session", "  Tab/Shift-Tab  Cycle sidebar, conversation, composer",
-                 "  ↑/↓            Move in sidebar; scroll in conversation; edit in composer",
-                 "  → in sidebar   Focus conversation", "  ← in output    Focus sidebar",
-                 "  [ / ] in output  Pan a running terminal horizontally after resize",
-                 "  Enter          Focus composer, or queue its message", "  Shift-Enter    Insert a newline (Alt-Enter and Ctrl-J also work)",
-                 "  PgUp/PgDn      Scroll conversation", "  Ctrl-C         Clear composer input; interrupt session in other panes", "  Ctrl-Q         Quit; confirms before stopping active agents",
-                 "  /              List commands; ↑/↓ select, Tab fill, Enter run, Esc hide",
+                 "Keyboard:", "  Ctrl-P         Pick a session or view scheduler output",
+                 "  Tab/Shift-Tab  Next/previous session (wraps; skips scheduler)",
+                 "  ↑/↓/←/→        Edit the prompt; typing always goes to the composer",
+                 "  Shift-↑/↓      Scroll output one line", "  Shift-←/→      Pan wider output after resize",
+                 "  Ctrl-Home/End  Oldest retained output / follow live output",
+                 "  Enter          Queue the prompt", "  Shift-Enter    Insert a newline (Alt-Enter and Ctrl-J also work)",
+                 "  PgUp/PgDn      Scroll output by a page with overlap",
+                 "  Mouse wheel    Scroll output under the pointer; click a sidebar session to select it",
+                 "  Shift-drag     Native terminal selection in terminals supporting this bypass",
+                 "  Ctrl-C         Clear the draft only; /interrupt stops and holds the session",
+                 "  Ctrl-Q         Quit; confirms before stopping active agents",
+                 "  /              List commands; ↑/↓ select, → fill, Enter run, Esc hide",
                  "  Q/Esc          Close information screens or cancel pickers",
                  "  Home/End       Start/end of line", "  Ctrl-←/→       Jump between words",
                  "  Ctrl-Backspace Delete previous word"]
@@ -822,6 +839,28 @@ class _UI:
             scroll["line"] = min(scroll["line"], bottom)
             scroll["follow"] = scroll["line"] >= bottom
 
+    @staticmethod
+    def _wheel(key):
+        if isinstance(key, tuple) and key[0] == "mouse":
+            if key[3] & curses.BUTTON4_PRESSED:
+                return -3
+            if key[3] & curses.BUTTON5_PRESSED:
+                return 3
+        return 0
+
+    def _mouse_key(self, key):
+        _, x, y, buttons = key
+        if amount := self._wheel(key):
+            if self.output_rect:
+                left, top, width, height = self.output_rect
+                if left <= x < left + width and top <= y < top + height:
+                    self._view_scroll(amount)
+        elif buttons & curses.BUTTON1_PRESSED:
+            for row, width, session_id in self.session_hits:
+                if y == row and 0 <= x < width:
+                    self._select(session_id)
+                    break
+
     def _escape_key(self):
         self.window.timeout(35)
         try:
@@ -836,6 +875,11 @@ class _UI:
                     if "@" <= char <= "~":
                         break
                 return {"1;5D": "ctrl-left", "1;5C": "ctrl-right",
+                        "1;2A": "shift-up", "1;2B": "shift-down",
+                        "1;2D": "shift-left", "1;2C": "shift-right",
+                        "1;5H": "ctrl-home", "1;5F": "ctrl-end",
+                        "1;5~": "ctrl-home", "7;5~": "ctrl-home",
+                        "4;5~": "ctrl-end", "8;5~": "ctrl-end",
                         "13;2u": 10, "27;2;13~": 10,
                         "8;5u": "ctrl-backspace", "127;5u": "ctrl-backspace",
                         "27;5;8~": "ctrl-backspace", "27;5;127~": "ctrl-backspace"}.get(sequence)
@@ -846,20 +890,12 @@ class _UI:
         finally:
             self.window.timeout(50)
 
-    def _cycle_focus(self, reverse=False):
-        height, width = self.window.getmaxyx()
-        label_y = self._composer_geometry(height, width)[0] if height >= 6 else 0
-        body_height = max(0, label_y - 1)
-        panes = ["sidebar", "conversation", "composer"] if width >= 62 and body_height >= 4 else ["conversation", "composer"]
-        index = panes.index(self.focus) if self.focus in panes else 0
-        self.focus = panes[(index + (-1 if reverse else 1)) % len(panes)]
-
     def _main_key(self, key):
+        if isinstance(key, tuple) and key[0] == "mouse":
+            self._mouse_key(key)
+            return
         if key == 3:
-            if self.focus == "composer":
-                self._set_draft("")
-            else:
-                self._interrupt()
+            self._set_draft("")
             return
         if key == 17:
             self._quit()
@@ -867,53 +903,31 @@ class _UI:
         if key == 16:
             self._pick_session()
             return
-        if self._command_key(key):
-            return
         if key == 9:
-            self._cycle_focus()
+            self._cycle_session(1)
             return
         if key == curses.KEY_BTAB:
-            self._cycle_focus(reverse=True)
+            self._cycle_session(-1)
+            return
+        if self._command_key(key):
             return
         if key == 27:
-            if self.focus == "composer":
-                self.command_dismissed = True
-            else:
-                self.focus = "sidebar"
+            self.command_dismissed = True
             return
         if key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
-            visible = max(1, self.scrolls.get(self.selected, {}).get("visible", 1))
-            self._view_scroll(-visible if key == curses.KEY_PPAGE else visible)
+            step = max(1, self.scrolls.get(self.selected, {}).get("visible", 1) - 2)
+            self._view_scroll(-step if key == curses.KEY_PPAGE else step)
             return
-
-        if self.focus == "sidebar":
-            if key == curses.KEY_RIGHT:
-                self.focus = "conversation"
-            elif key == curses.KEY_UP:
-                self._move_session(-1)
-            elif key == curses.KEY_DOWN:
-                self._move_session(1)
-            elif key in (10, 13, curses.KEY_ENTER):
-                self.focus = "composer"
+        if key in ("shift-up", "shift-down"):
+            self._view_scroll(-1 if key == "shift-up" else 1)
             return
-
-        if self.focus == "conversation":
-            if key in ("[", "]"):
-                scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
-                scroll["left"] = max(0, scroll.get("left", 0) + (-8 if key == "[" else 8))
-            elif key == curses.KEY_LEFT:
-                self.focus = "sidebar"
-            elif key == curses.KEY_UP:
-                self._view_scroll(-1)
-            elif key == curses.KEY_DOWN:
-                self._view_scroll(1)
-            elif key == curses.KEY_HOME:
-                scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
-                scroll.update(follow=False, line=0)
-            elif key == curses.KEY_END:
-                self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})["follow"] = True
-            elif key in (10, 13, curses.KEY_ENTER):
-                self.focus = "composer"
+        if key in ("shift-left", "shift-right"):
+            scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
+            scroll["left"] = max(0, scroll.get("left", 0) + (-8 if key == "shift-left" else 8))
+            return
+        if key in ("ctrl-home", "ctrl-end"):
+            scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
+            scroll.update(follow=key == "ctrl-end", line=0)
             return
 
         if key in (13, curses.KEY_ENTER):

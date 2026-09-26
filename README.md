@@ -37,13 +37,19 @@ behind the durable launch gate, so it cannot overlap the new turn's journal.
 Independent readers drain every worker PTY, including hidden/headless sessions.
 Scheduler JSON stays on a separate non-terminal path. CLI logs and trap evidence
 use complete captured output rather than a bounded screen snapshot.
-The composer sends to the selected session and grows with its draft.
+The composer is always active, sends to the selected session, and grows with its
+draft. There is no pane focus: typing edits the prompt, Tab switches sessions,
+and output navigation leaves the prompt cursor alone. Dialogs and pickers
+temporarily take keyboard input.
 Mailbox entries are labeled
 pending, in-flight, or interrupted; they are not mistaken for delivered history.
-Drafts are kept separately for each session while the UI is open.
+Drafts, prompt cursors, and output positions are kept separately for each session
+while the UI is open. Scrolling up pauses live following; typing and new output
+do not jump back to the bottom. Scroll to the bottom or use Ctrl-End to follow
+live output again.
 
 An active invocation keeps its launch-time terminal dimensions. After narrowing
-the pane, use `[` / `]` in the conversation to pan horizontally. Idle history
+the pane, use `Shift-←` / `Shift-→` to pan horizontally. Idle history
 replays at the new size; failed/interrupted screens stay available so transient
 errors are not lost. Unused cells are not rewrapped by curses. Colors are mapped
 to the outer terminal's available palette (RGB colors to the nearest ANSI color).
@@ -70,24 +76,27 @@ appear only when relevant; model defaults and active models are available throug
 
 | Shortcut | Action |
 | --- | --- |
-| `Tab` / `Shift-Tab` | Move between sidebar, conversation, and composer |
-| `↑` / `↓` in sidebar | Select a session |
-| `→` in sidebar | Focus conversation output |
-| `←` in conversation | Focus the session sidebar |
-| `Enter` in sidebar/conversation | Focus the composer |
-| `Enter` in composer | Queue a message |
+| `Tab` / `Shift-Tab` | Next / previous session, wrapping around; skips scheduler output |
+| `↑` / `↓` / `←` / `→` | Move the prompt cursor (or select/fill a visible slash command) |
+| `Enter` | Queue a message |
 | `Shift-Enter`, `Alt-Enter`, or `Ctrl-J` | Insert a newline |
-| `PgUp` / `PgDn` | Scroll conversation |
-| `Home` / `End` in conversation | Beginning / follow output |
-| `[` / `]` in conversation | Pan a wider terminal left / right |
+| `PgUp` / `PgDn` | Scroll output by a page with two lines of overlap |
+| `Shift-↑` / `Shift-↓` | Scroll output one line |
+| `Ctrl-Home` / `Ctrl-End` | Oldest retained output / follow live output |
+| `Shift-←` / `Shift-→` | Pan a wider terminal left / right |
+| Mouse wheel over output | Scroll output without moving the prompt cursor |
+| Click a sidebar session | Select it, keeping input in the composer |
 | `Ctrl-P` | Session picker, including scheduler output |
-| `Ctrl-C` in composer | Clear the current input buffer |
-| `Ctrl-C` in sidebar/conversation | Interrupt and hold the selected session |
+| `Ctrl-C` | Clear the draft only, even if already empty; use `/interrupt` to stop work |
 | `Q` / `Esc` in dialogs | Close information screens or cancel a picker |
 | `Ctrl-Q` | Quit; confirm before stopping active agents |
 | `Home` / `End` in composer | Start / end of line |
 | `Ctrl-←` / `Ctrl-→` in composer | Jump between words |
 | `Ctrl-Backspace` in composer | Delete previous word |
+
+Modified keys depend on terminal support. Mouse reporting does not request motion
+events; use your terminal's native-selection bypass (often Shift-drag) to select
+and copy text.
 
 Local commands:
 
@@ -100,6 +109,7 @@ Local commands:
 - `/model session`: select the current session's model and effort, or remove its override.
 - `/bell`: toggle audible live terminal bells (background attention markers remain).
 - `/links`: show hyperlink targets from the selected terminal without opening them.
+- `/interrupt`: interrupt and hold the selected session.
 - `/resume`: release a session hold and explicitly authorize continuation of its
   interrupted turn, if any.
 - `/schedule`: recheck the workspace and scheduling. After a scheduler error,
@@ -107,9 +117,10 @@ Local commands:
 - `/help`, `/quit`.
 
 Typing `/` in the composer opens a bounded command list, filtered as you type.
-Use `↑` / `↓` to select, `Tab` to fill the command before adding arguments,
-`Enter` to run it, or `Esc` to hide the list. At most five commands are shown;
-the list scrolls with the selection.
+Use `↑` / `↓` to select, `→` at the end of the draft to fill the command before
+adding arguments, `Enter` to run it, or `Esc` to hide the list. At most five commands are shown;
+the list scrolls with the selection. Tab and Shift-Tab always switch sessions,
+including while this list is visible.
 
 Use `//` to send a literal leading slash. Viewing output never sends keystrokes
 to a worker. Dialogs keep process supervision running.

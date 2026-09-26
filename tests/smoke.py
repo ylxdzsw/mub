@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Essential invariants, using only fake Mu processes and temporary worktrees."""
 import fcntl
+import curses
 from concurrent.futures import Future
 import json
 import os
@@ -15,7 +16,7 @@ import tempfile
 import termios
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import DEFAULT, MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 FAKE = ROOT / "tests/fake_mu.py"
@@ -26,6 +27,75 @@ from muboard.ipc import ControlServer
 from muboard.output import live_prompt, plain_output, prompt_bytes
 from muboard.terminal import Capture, Screen
 from muboard.state import read_state
+from muboard.ui import _UI
+
+
+class InputSmoke(unittest.TestCase):
+    def test_composer_sessions_and_output_are_independent(self):
+        engine = MagicMock()
+        engine.state.return_value = {"sessions": [{"id": 1}, {"id": 2}]}
+        with patch.multiple("muboard.ui.curses", raw=DEFAULT, nonl=DEFAULT, set_escdelay=DEFAULT,
+                            mousemask=DEFAULT, mouseinterval=DEFAULT, has_colors=DEFAULT) as mocks:
+            mocks["has_colors"].return_value = False
+            ui = _UI(MagicMock(), engine)
+
+        ui._set_draft("/ren")
+        ui._main_key(9)
+        self.assertEqual((ui.selected, ui.draft), (2, ""))
+        ui._set_draft("second", 2)
+        ui._main_key(9)
+        self.assertEqual((ui.selected, ui.draft, ui.cursor), (1, "/ren", 4))
+        ui._main_key(curses.KEY_RIGHT)
+        self.assertEqual(ui.draft, "/rename ")
+        ui._main_key(curses.KEY_BTAB)
+        self.assertEqual((ui.selected, ui.draft, ui.cursor), (2, "second", 2))
+        ui._main_key("[")
+        ui._main_key("]")
+        self.assertEqual((ui.draft, ui.cursor), ("se[]cond", 4))
+
+        scroll = ui.scrolls[2] = dict(follow=True, line=80, total=100, visible=20)
+        ui._main_key(curses.KEY_PPAGE)
+        self.assertEqual((scroll["line"], scroll["follow"]), (62, False))
+        ui._main_key("shift-up")
+        self.assertEqual(scroll["line"], 61)
+        ui._main_key("shift-right")
+        self.assertEqual(scroll["left"], 8)
+        ui._main_key("!")
+        self.assertEqual((scroll["line"], scroll["follow"]), (61, False))
+        ui._main_key(curses.KEY_HOME)
+        self.assertEqual(ui.cursor, 0)
+        ui._main_key("ctrl-home")
+        self.assertEqual((scroll["line"], scroll["follow"]), (0, False))
+        ui._main_key("ctrl-end")
+        self.assertTrue(scroll["follow"])
+        scroll.update(line=80)
+
+        ui.output_rect = (30, 1, 70, 20)
+        ui.session_hits = [(2, 30, 1), (3, 30, 2)]
+        ui._main_key(("mouse", 35, 5, curses.BUTTON4_PRESSED))
+        self.assertEqual((scroll["line"], scroll["follow"]), (77, False))
+        ui._main_key(("mouse", 5, 5, curses.BUTTON4_PRESSED))
+        self.assertEqual(scroll["line"], 77)
+        ui._main_key(("mouse", 35, 5, curses.BUTTON5_PRESSED))
+        self.assertEqual((scroll["line"], scroll["follow"]), (80, True))
+        ui._main_key("shift-up")
+        ui._main_key(("mouse", 5, 2, curses.BUTTON1_PRESSED))
+        self.assertEqual(ui.selected, 1)
+        ui._main_key(9)
+        self.assertEqual((ui.draft, ui.cursor, scroll["line"], scroll["follow"]), ("se[]!cond", 0, 79, False))
+        ui._main_key(3)
+        ui._main_key(3)
+        self.assertEqual(ui.draft, "")
+        engine.request.assert_not_called()
+        ui._command("/interrupt")
+        engine.request.assert_called_once_with({"op": "interrupt", "session_id": 2})
+
+        ui._select(None)
+        ui._main_key(curses.KEY_BTAB)
+        self.assertEqual(ui.selected, 2)
+        ui._select(None)
+        ui._main_key(9)
+        self.assertEqual(ui.selected, 1)
 
 
 class TerminalSmoke(unittest.TestCase):
@@ -477,13 +547,19 @@ class SchedulerSmoke(unittest.TestCase):
                                    start_new_session=True)
         os.close(slave)
         screen = bytearray()
+        rendered = Screen(110, 30)
+
+        def visible():
+            return "\n".join("".join(cell[0] for cell in rendered.core.get_line_cells(row)) for row in range(30))
 
         def pump(seconds=0.1):
             deadline = time.monotonic() + seconds
             while time.monotonic() < deadline:
                 if select.select([master], [], [], 0.02)[0]:
                     try:
-                        screen.extend(os.read(master, 65536))
+                        data = os.read(master, 65536)
+                        screen.extend(data)
+                        rendered.feed(data)
                     except OSError:
                         break
 
@@ -498,7 +574,7 @@ class SchedulerSmoke(unittest.TestCase):
                 if condition():
                     return
                 self.assertIsNone(process.poll(), screen[-2000:].decode(errors="replace"))
-            self.fail(screen[-3000:].decode(errors="replace"))
+            self.fail(visible() + "\n" + screen[-3000:].decode(errors="replace"))
 
         def state():
             return read_state(self.root)
@@ -517,14 +593,35 @@ class SchedulerSmoke(unittest.TestCase):
             self.assertIsNone(process.poll())
             send("discard this draft\x03")
             self.assertFalse(state()["sessions"][0]["hold"])
-            send("\x1b[Z")
             send("\x03")
+            self.assertFalse(state()["sessions"][0]["hold"])
+            send("/interrupt\r")
             wait(lambda: state()["sessions"][0]["hold"] and not any(r["kind"] == "worker" for r in state()["inflight"]))
             wait(lambda: not state()["inflight"] and not state()["events"])
-            send("\r")
             send("/new Exit check\r")
-            send("read hold\r")
+            wait(lambda: "To S2" in visible())
+            send("read ho\t")
+            wait(lambda: "To S1" in visible())
+            send("/ren\t")
+            wait(lambda: "To S2" in visible() and "> read ho" in visible())
+            send("\x1b[Z")
+            wait(lambda: "To S1" in visible() and "> /ren" in visible())
+            send("\x1bOC")
+            wait(lambda: "> /rename " in visible())
+            send("\x03\t")
+            wait(lambda: "To S2" in visible())
+            send("\x1b[<0;5;3M\x1b[<0;5;3m")
+            wait(lambda: "To S1" in visible())
+            send("\x1b[<64;40;6M")
+            wait(lambda: "History" in visible())
+            send("\x1b[1;5F")
+            wait(lambda: "History" not in visible())
+            send("\x1b[<0;5;4M\x1b[<0;5;4m")
+            wait(lambda: "To S2" in visible() and "> read ho" in visible())
+            send("\x1b[1;2A\x1b[1;2B\x1b[1;2C\x1b[1;2D\x1b[1;5H\x1b[1;5F\x1b[5~\x1b[6~")
+            send("ld\r")
             wait(lambda: any(r["kind"] == "worker" for r in state()["inflight"]))
+            self.assertEqual(state()["messages"][-1]["text"], "read hold")
             running = list(state()["inflight"])
             send("\x11")
             send("y")
