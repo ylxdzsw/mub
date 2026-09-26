@@ -3,16 +3,11 @@
 from __future__ import annotations
 
 import curses
-from concurrent.futures import ThreadPoolExecutor
-import re
 import sys
 import time
 import unicodedata
 
-from .output import literal as _text, render_blocks
-
-
-_ANSI = re.compile(r"(\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_]))")
+from .output import literal as _text
 
 
 def _width(text: str) -> int:
@@ -54,16 +49,17 @@ class _UI:
         "/model [session|scheduler|worker|both]": "Show models, or choose a session/role model and effort",
         "/resume [selected]": "Resume the selected session",
         "/schedule": "Explicitly recheck or recover the scheduler",
+        "/bell": "Toggle audible live bells (background sessions also get a ! marker)",
+        "/links": "Show hyperlink targets from the selected terminal",
         "/help": "Show commands and keyboard controls",
         "/quit": "Stop work and quit",
     }
 
-    def __init__(self, window, engine, renderer):
+    def __init__(self, window, engine):
         self.window, self.engine = window, engine
-        self.renderer = renderer
-        self.render_job = None
-        self.rendered = {}
-        self.markdown_cache = {}
+        self.bell_muted = False
+        self.bell_next = 0.0
+        self.terminal_colors = {}
         self.state = engine.state()
         sessions = self.state["sessions"]
         self.selected = sessions[0]["id"] if sessions else None
@@ -73,15 +69,12 @@ class _UI:
         self.command_index = 0
         self.command_dismissed = False
         self.focus = "sidebar" if sessions else "composer"
-        self.outputs = {}
         self.scrolls = {}
-        self.output_next = 0.0
         self.sidebar_scroll = 0
         self.pending_key = None
         self.ui_error = ""
         self.request_ok = False
         self.colors = {}
-        self.ansi_colors = {}
         curses.raw()
         curses.nonl()
         curses.set_escdelay(25)
@@ -95,70 +88,43 @@ class _UI:
             ):
                 curses.init_pair(index, color, -1)
                 self.colors[name] = curses.color_pair(index) | curses.A_BOLD
-            for index, color in enumerate([*range(16), 215], 4):
-                if index >= curses.COLOR_PAIRS:
-                    break
-                curses.init_pair(index, color if color < curses.COLORS else color % 8, -1)
-                self.ansi_colors[color] = curses.color_pair(index)
 
-    def _styled_lines(self, text, width):
-        """Translate only display styles; never pass terminal controls to curses."""
-        lines, used, style, color = [[]], 0, 0, 0
-        styles = {1: curses.A_BOLD, 2: curses.A_DIM, 3: getattr(curses, "A_ITALIC", 0),
-                  4: curses.A_UNDERLINE, 7: curses.A_REVERSE}
-        for part in _ANSI.split(text):
-            if part.startswith("\x1b"):
-                if part.startswith("\x1b[") and part.endswith("m"):
-                    codes = [int(code or 0) for code in part[2:-1].split(";") if code.isdigit() or not code]
-                    while codes:
-                        code = codes.pop(0)
-                        if code == 0:
-                            style, color = 0, 0
-                        elif code in styles:
-                            style |= styles[code]
-                        elif code in (22, 23, 24, 27):
-                            style &= ~(styles[1] | styles[2] if code == 22 else styles[code - 20])
-                        elif code == 39:
-                            color = 0
-                        elif 30 <= code <= 37 or 90 <= code <= 97:
-                            color = self.ansi_colors.get(code - (30 if code < 90 else 82), 0)
-                        elif code == 38 and len(codes) >= 2 and codes[0] == 5:
-                            color = self.ansi_colors.get(codes[1], 0)
-                            del codes[:2]
-                continue
-            for char in _text(part):
-                cells = _width(char)
-                if char == "\n" or used + cells > width:
-                    lines.append([])
-                    used = 0
-                if char != "\n":
-                    attr = style | color
-                    if lines[-1] and lines[-1][-1][1] == attr:
-                        previous, _ = lines[-1][-1]
-                        lines[-1][-1] = (previous + char, attr)
-                    else:
-                        lines[-1].append((char, attr))
-                    used += cells
-        while len(lines) > 1 and not lines[-1]:
-            lines.pop()
-        return lines
+    def _cell_style(self, screen, fg, bg, attrs):
+        style = 0
+        for name, flag in (("bold", curses.A_BOLD), ("dim", curses.A_DIM),
+                           ("italic", getattr(curses, "A_ITALIC", 0)), ("underline", curses.A_UNDERLINE),
+                           ("reverse", curses.A_REVERSE), ("blink", curses.A_BLINK),
+                           ("strikethrough", getattr(curses, "A_STRIKEOUT", 0))):
+            if getattr(attrs, name):
+                style |= flag
+        if attrs.hyperlink_id is not None:
+            style |= curses.A_UNDERLINE
+        if curses.has_colors():
+            colors = tuple(c if c == -1 else c % curses.COLORS
+                           for c in (screen.color(fg), screen.color(bg, background=True)))
+            if colors not in self.terminal_colors and len(self.terminal_colors) + 4 < curses.COLOR_PAIRS:
+                pair = len(self.terminal_colors) + 4
+                curses.init_pair(pair, *colors)
+                self.terminal_colors[colors] = curses.color_pair(pair)
+            style |= self.terminal_colors.get(colors, 0)
+        return style
 
-    def _output_lines(self, blocks, width):
-        if self.render_job and self.render_job[1].done():
-            (selected, source, columns), future = self.render_job
-            try:
-                rendered = future.result()
-            except (OSError, RuntimeError) as error:
-                self.ui_error = str(error)
-                rendered = "\n\n".join(_text(block["text"]) for block in source)
-            self.rendered[selected] = (source, columns, self._styled_lines(rendered, columns))
-            self.render_job = None
-        cached = self.rendered.get(self.selected)
-        if self.render_job is None and (cached is None or cached[:2] != (blocks, width)):
-            self.render_job = ((self.selected, blocks, width),
-                               self.renderer.submit(render_blocks, self.engine.root, blocks, width,
-                                                    self.engine.mu, self.markdown_cache))
-        return cached[2] if cached else [[("Rendering…", curses.A_DIM)]]
+    def _terminal_frame(self, screen, x, row, width, height, scroll):
+        start, total, lines = screen.frame(scroll["line"], height, follow=scroll["follow"])
+        scroll.update(line=start, total=total, visible=height)
+        left = max(0, min(scroll.get("left", 0), max(0, screen.cols - width)))
+        scroll["left"] = left
+        for y, cells in enumerate(lines, row):
+            for column in range(left, min(len(cells), left + width)):
+                char, fg, bg, attrs = cells[column]
+                if attrs.wide_char_spacer or (attrs.wide_char and column + 1 >= left + width):
+                    continue
+                if attrs.hidden:
+                    char = "  " if attrs.wide_char else " "
+                try:
+                    self.window.addstr(y, x + column - left, char, self._cell_style(screen, fg, bg, attrs))
+                except curses.error:
+                    pass
 
     def _add(self, y, x, text, width=None, attr=0):
         height, columns = self.window.getmaxyx()
@@ -209,11 +175,10 @@ class _UI:
         ids = [session["id"] for session in self.state["sessions"]]
         if self.selected is not None and self.selected not in ids:
             self._select(ids[0] if ids else None)
-        if time.monotonic() >= self.output_next:
-            fresh = self._request({"op": "output", "session_id": self.selected}, clear_error=False)
-            if fresh is not None:
-                self.outputs[self.selected] = fresh
-            self.output_next = time.monotonic() + 0.2
+        bells = sum(screen.take_bells() for screen in self.engine.screens.values())
+        if bells and not self.bell_muted and time.monotonic() >= self.bell_next:
+            curses.beep()
+            self.bell_next = time.monotonic() + 1
 
     def _request(self, request, *, clear_error=True):
         try:
@@ -243,7 +208,6 @@ class _UI:
         self.selected = session_id
         self.draft, self.cursor = self.drafts.get(session_id, ("", 0))
         self.focus = "sidebar" if session_id is not None else "composer"
-        self.output_next = 0.0
 
     def _set_draft(self, text, cursor=None):
         self.draft = text
@@ -295,7 +259,8 @@ class _UI:
             suffix = f" +{pending}" if pending else ""
             status = self._session_status(session)
             suffix += f" {status}" if status else ""
-            prefix = f"S{session['id']}{owner} "
+            attention = "!" if (screen := self.engine.screens.get(session["id"])) and screen.attention else ""
+            prefix = f"S{session['id']}{owner}{attention} "
             name = _clip(session["name"], max(0, width - 2 - _width(prefix + suffix)))
             self._add(row, 1, prefix + name + suffix, width - 2,
                       curses.A_REVERSE if session["id"] == self.selected else 0)
@@ -303,7 +268,6 @@ class _UI:
     def _draw_conversation(self, session, x, y, width, height):
         if width <= 0 or height <= 0:
             return
-        output = self.outputs.get(self.selected, {})
         if session:
             title = f"S{session['id']} · {session['name']}"
             status = self._session_status(session)
@@ -338,22 +302,24 @@ class _UI:
             if len(queue) > visible and row < y + height:
                 self._add(row, x + 1, f"… {len(queue) - visible} more queued", width - 2, curses.A_DIM)
                 row += 1
-        blocks = output.get("blocks", [])
-        if blocks:
-            lines = self._output_lines(blocks, max(2, width - 2))
-        else:
-            empty = "No output yet." if session or self.state["sessions"] else "Create a session with /new [name]."
-            lines = [[(empty, curses.A_DIM)]]
         visible = max(0, y + height - row)
-        bottom = max(0, len(lines) - visible)
-        scroll["line"] = bottom if scroll["follow"] else max(0, min(scroll["line"], bottom))
-        scroll.update(visible=visible, total=len(lines))
-        for line_y, spans in enumerate(lines[scroll["line"]:scroll["line"] + visible], row):
-            offset = 0
-            for text, attr in spans:
-                text = _clip(text, max(0, width - 2 - offset))
-                self._add(line_y, x + 1 + offset, text, width - 2 - offset, attr)
-                offset += _width(text)
+        columns = max(2, width - 2)
+        self.engine.terminal_size = (columns, max(2, visible))
+        try:
+            screen = self.engine.display(self.selected, columns, max(2, visible))
+        except (OSError, RuntimeError, ValueError) as error:
+            self.ui_error = str(error)
+            screen = self.engine.screens.get(self.selected)
+        if screen:
+            screen.attention = False
+            if screen.error:
+                self.ui_error = screen.error
+            self._terminal_frame(screen, x + 1, row, columns, visible, scroll)
+            if screen.cols > columns:
+                self._add(y, x + 1, title + " · [/] pan", width - 2, curses.A_DIM)
+        else:
+            message = "Loading Mu history…" if (session and session.get("session")) or (not session and self.state["scheduler"].get("session")) else "No output yet."
+            self._add(row, x + 1, message, columns, curses.A_DIM)
 
     def _notice(self):
         if self.ui_error:
@@ -606,6 +572,13 @@ class _UI:
             self._resume()
         elif command == "/schedule":
             self._request({"op": "schedule"})
+        elif command == "/bell":
+            self.bell_muted = not self.bell_muted
+            self._info("Terminal bell", ["Muted" if self.bell_muted else "Enabled (outer terminal controls sound/flash)"])
+        elif command == "/links":
+            screen = self.engine.screens.get(self.selected)
+            self._info("Terminal links · targets only; nothing opens automatically",
+                       screen.links() or ["No links"] if screen else ["No terminal output yet"])
         elif command == "/help":
             self._help()
         elif command == "/quit":
@@ -630,8 +603,6 @@ class _UI:
         target = remaining[min(index, len(remaining) - 1)]["id"] if remaining else None
         self._select(target)
         self.drafts.pop(session_id, None)
-        self.outputs.pop(session_id, None)
-        self.rendered.pop(session_id, None)
         self.scrolls.pop(session_id, None)
 
     def _resume(self):
@@ -803,6 +774,7 @@ class _UI:
                  "Keyboard:", "  Ctrl-P         Pick a session", "  Tab/Shift-Tab  Cycle sidebar, conversation, composer",
                  "  ↑/↓            Move in sidebar; scroll in conversation; edit in composer",
                  "  → in sidebar   Focus conversation", "  ← in output    Focus sidebar",
+                 "  [ / ] in output  Pan a running terminal horizontally after resize",
                  "  Enter          Focus composer, or queue its message", "  Shift-Enter    Insert a newline (Alt-Enter and Ctrl-J also work)",
                  "  PgUp/PgDn      Scroll conversation", "  Ctrl-C         Clear composer input; interrupt session in other panes", "  Ctrl-Q         Quit; confirms before stopping active agents",
                  "  /              List commands; ↑/↓ select, Tab fill, Enter run, Esc hide",
@@ -926,7 +898,10 @@ class _UI:
             return
 
         if self.focus == "conversation":
-            if key == curses.KEY_LEFT:
+            if key in ("[", "]"):
+                scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
+                scroll["left"] = max(0, scroll.get("left", 0) + (-8 if key == "[" else 8))
+            elif key == curses.KEY_LEFT:
                 self.focus = "sidebar"
             elif key == curses.KEY_UP:
                 self._view_scroll(-1)
@@ -982,6 +957,7 @@ class _UI:
             self._insert(key)
 
     def _main(self):
+        self._draw_main()
         while not self.engine.done:
             self._tick()
             if self.engine.done:
@@ -993,5 +969,4 @@ class _UI:
 def run_ui(engine):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise RuntimeError("Mu Board UI requires an interactive terminal")
-    with ThreadPoolExecutor(max_workers=1) as renderer:
-        curses.wrapper(lambda window: _UI(window, engine, renderer)._main())
+    curses.wrapper(lambda window: _UI(window, engine)._main())

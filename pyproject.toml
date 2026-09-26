@@ -7,7 +7,7 @@ name = "mu-board"
 version = "0.2.0"
 description = "Mu sessions with scheduled message delivery"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["par-term-emu-core-rust==0.52.0"]
 
 [project.scripts]
 mub = "muboard.cli:main"

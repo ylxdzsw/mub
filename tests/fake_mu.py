@@ -124,7 +124,7 @@ def main():
             return 130 if STOPPED else 1
     data["active"] = dict(busy=True, pid=os.getpid())
     data["clean"] = False
-    data["invocations"].append(dict(args=args, prompt=prompt, role=role))
+    data["invocations"].append(dict(args=args, prompt=prompt, role=role, tty=sys.stdout.isatty()))
     if not retry:
         data["prompt"] = prompt
         model = args[args.index("-m") + 1] if "-m" in args else "fake/model"

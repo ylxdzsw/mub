@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Essential invariants, using only fake Mu processes and temporary worktrees."""
 import fcntl
+from concurrent.futures import Future
 import json
 import os
 from pathlib import Path
@@ -22,8 +23,75 @@ sys.path.insert(0, str(ROOT))
 
 from muboard.engine import Engine, owned_members
 from muboard.ipc import ControlServer
-from muboard.output import render_blocks
+from muboard.output import live_prompt, plain_output, prompt_bytes
+from muboard.terminal import Capture, Screen
 from muboard.state import read_state
+
+
+class TerminalSmoke(unittest.TestCase):
+    def test_native_controls_events_and_unicode(self):
+        prompt = Screen(60, 5)
+        prompt.feed(prompt_bytes(live_prompt("# **literal**\n```", "/work", {})))
+        self.assertIn("mu> # **literal**", prompt.core.get_line(1))
+        self.assertTrue(prompt.core.get_line(2).startswith("```"))
+        screen = Screen(32, 5)
+        screen.feed(b"old progress\r\x1b[2K\x1b[94mdone\x1b[0m", live=True)
+        self.assertTrue(screen.core.get_line(0).startswith("done"))
+        self.assertNotIn("progress", screen.core.get_line(0))
+        self.assertEqual(screen.color(screen.core.get_line_cells(0)[0][1]), 12)
+        screen.feed(b"\r\n\x1b]0;worker title\x07\x1b]8;;https://example.com\x07link\x1b]8;;\x07", live=True)
+        self.assertEqual(screen.take_bells(), 0)  # OSC terminators aren't bells.
+        self.assertEqual(screen.links(), ["https://example.com"])
+        self.assertEqual(screen.core.title(), "worker title")
+        wide = "中".encode()
+        screen.feed(b"\r\n" + wide[:1])
+        screen.feed(wide[1:])
+        self.assertTrue(screen.core.get_line_cells(2)[0][3].wide_char)
+        self.assertTrue(screen.core.get_line_cells(2)[1][3].wide_char_spacer)
+        screen.feed(b"\x1b[?1049h\x1b[2J\x1b[Halternate")
+        self.assertTrue(screen.core.is_alt_screen_active())
+        screen.feed(b"\x1b[?1049l")
+        self.assertFalse(screen.core.is_alt_screen_active())
+        self.assertTrue(screen.core.get_line(0).startswith("done"))
+        screen.feed(b"\x07")  # Replay must not notify.
+        self.assertEqual(screen.take_bells(), 0)
+        screen.feed(b"\x07", live=True)
+        self.assertEqual(screen.take_bells(), 1)
+        self.assertTrue(screen.attention)
+        screen.feed(b"\x1b]52;c;dGVzdA==\x07\x1b]52;c;?\x07\x1b[6n", live=True)
+        self.assertFalse(screen.core.allow_clipboard_read())
+        self.assertEqual(screen.core.drain_responses(), b"")
+
+    def test_pty_drains_without_ui_and_keeps_complete_evidence(self):
+        screen = Screen(30, 6)
+        capture = Capture(screen)
+        extra_slave = os.dup(capture.slave)
+        process = None
+        try:
+            process = subprocess.Popen([sys.executable, "-c",
+                "import os; assert os.isatty(1) and os.isatty(2); "
+                "os.write(1, b'line\\n' * 15000); "
+                "os.write(1, b'< \\t' + b'x' * 20000 + b'\\nFINAL\\x07')"],
+                stdin=subprocess.DEVNULL, stdout=capture.slave, stderr=subprocess.STDOUT)
+            capture.start()
+            self.assertEqual(process.wait(timeout=15), 0)
+            capture.finish()
+            self.assertIsNone(capture.error)
+            self.assertIsNone(screen.error)
+            data = os.pread(capture.raw.fileno(), os.fstat(capture.raw.fileno()).st_size, 0)
+            text = plain_output(data)
+            self.assertIn("< \t" + "x" * 20000 + "\nFINAL", text)
+            self.assertEqual(text.count("line\n"), 15000)
+            self.assertLessEqual(screen.core.scrollback_len(), 10000)
+            self.assertEqual(screen.take_bells(), 1)
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            if capture.thread is None or capture.thread.is_alive():
+                capture.finish()
+            os.close(extra_slave)
+            capture.raw.close()
 
 
 class SchedulerSmoke(unittest.TestCase):
@@ -51,7 +119,7 @@ class SchedulerSmoke(unittest.TestCase):
         (folder / ".gitignore").write_text("*\n")
         (folder / "config.json").write_text(json.dumps(values))
 
-    def until(self, board, condition, seconds=8):
+    def until(self, board, condition, seconds=15):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             board.tick()
@@ -135,14 +203,11 @@ class SchedulerSmoke(unittest.TestCase):
         saved = read_state(self.root)
         self.assertEqual(len(saved["messages"]), 3)
         self.until(board, lambda: board._running(first["id"]) is not None)
-        display = board.output(first["id"])
-        prompt = display["blocks"][0]
-        self.assertEqual(prompt, dict(kind="prompt", text=raw, model="fake/model", context="~42%", cwd=str(self.root)))
-        with patch("muboard.output.markdown", return_value="Rendered response") as markdown:
-            rendered = render_blocks(self.root, [prompt, dict(kind="markdown", text="**response**")], 37, str(FAKE))
-            markdown.assert_called_once_with(self.root, "**response**", 37, str(FAKE))
-        self.assertIn("\x1b[94mfake/model\x1b[0m \x1b[35m~42%\x1b[0m", rendered)
-        self.assertIn("\x1b[36m" + str(self.root) + "\x1b[0m\nmu> " + raw, rendered)
+        screen = board.screens[first["id"]]
+        _, _, rows = screen.frame(0, 100)
+        rendered = "\n".join("".join(cell[0] for cell in row).rstrip() for row in rows)
+        self.assertIn("fake/model ~42%", rendered)
+        self.assertIn("mu> " + raw.rstrip(), rendered)
         self.assertNotIn("Live invocation", rendered)
         board.request(dict(op="send", session_id=first["id"], text="read late"))
         self.until(board, board.idle)
@@ -150,9 +215,10 @@ class SchedulerSmoke(unittest.TestCase):
         turns = self.journal(first)["invocations"]
         self.assertEqual([t["prompt"] for t in turns],
                          [raw, "read second", "read late"])
-        prompts = [b for b in board.output(first["id"])["blocks"] if b["kind"] == "prompt"]
-        self.assertEqual([b["text"] for b in prompts], [raw, "read second", "read late"])
-        self.assertTrue(all(b["context"] == "~42%" for b in prompts))
+        self.assertEqual(board.output(first["id"])["text"].count("mu> "), 3)
+        _, _, rows = board.screens[first["id"]].frame(0, 10000)
+        self.assertEqual("\n".join("".join(cell[0] for cell in row) for row in rows).count("mu> "), 3)
+        self.assertTrue(all(t["tty"] for t in turns))
         self.assertEqual(len(self.journal(second)["invocations"]), 1)
         scheduler = self.journal(board.data["scheduler"])
         self.assertGreaterEqual(len(scheduler["invocations"]), 3)
@@ -225,8 +291,7 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(turns[0]["args"][turns[0]["args"].index("--trap") + 1], "reversible")
         self.assertIn("retry", turns[1]["args"])
         self.assertEqual(turns[1]["args"][turns[1]["args"].index("--trap") + 1], "off")
-        prompts = [b for b in board.output(session["id"])["blocks"] if b["kind"] == "prompt"]
-        self.assertEqual([b["text"] for b in prompts], ["trap write"])
+        self.assertEqual(board.output(session["id"])["text"].count("mu> "), 1)
         snapshots = [json.loads(p.read_text()) for p in (self.root / ".mu/fake").glob("snapshot-*")]
         trapped = next(s for snap in snapshots for s in snap["sessions"] if s["gate"] == "trapped")
         self.assertIn("complete stdin", trapped["last"]["trap_output"])
@@ -361,6 +426,26 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(len(turns), 1)
         self.assertNotIn("retry", turns[0]["args"])
 
+    def test_history_preparation_gate_and_failure(self):
+        board = self.board()
+        session = self.new(board, "read gated")
+        session["session"] = board._mu("new")
+        data = self.journal(session)
+        data["transcript"] = "Prior history\n"
+        (self.root / ".mu/fake" / (session["session"] + ".json")).write_text(json.dumps(data))
+        future = Future()
+        with patch.object(board.replay_pool, "submit", return_value=future):
+            active = board._spawn(session=session, message=board.data["messages"][0], action="message")
+        self.assertEqual(self.journal(session)["invocations"], [])
+        self.assertIsNotNone(active["release"])
+        future.set_exception(RuntimeError("Replay fixture failed"))
+        board._prepare(active)
+        self.until(board, board.idle)
+        self.assertEqual(session["gate"], "failed")
+        self.assertIn("Replay fixture failed", session["last"]["summary"])
+        self.assertEqual(self.journal(session)["invocations"], [])
+        self.assertEqual(len(board.data["messages"]), 1)
+
     def test_crash_recovery_holds_dirty_work_and_retains_mailbox(self):
         board = self.board()
         session = self.new(board, "write hold")
@@ -368,8 +453,10 @@ class SchedulerSmoke(unittest.TestCase):
         active = board._running(session["id"])
         active["process"].kill()
         active["process"].wait()
+        active["capture"].finish()
         active["output"].close()
         board.active.clear()
+        board.replay_pool.shutdown(wait=True, cancel_futures=True)
         board.server.close()
         board.store.close()
         board.closed = True

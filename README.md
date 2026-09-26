@@ -10,14 +10,16 @@ tasks with a completion lifecycle.
 
 ## Run
 
-Requires Linux with pidfds, Python 3.12+, Git, and configured `mu` on PATH. There
-are no Python runtime dependencies.
+Requires Linux with pidfds, Python 3.12+, Git, and configured `mu` on PATH.
+Installation includes the embedded Rust terminal engine
+`par-term-emu-core-rust` (and its Pillow dependency); no shell, GUI toolkit,
+terminal server, or system terminal library is needed.
 
 ```sh
-./mub -C /path/to/worktree
-# or
 uv tool install .
-mub
+mub -C /path/to/worktree
+# From the checkout, with dependencies managed by uv:
+uv run ./mub -C /path/to/worktree
 ```
 
 All directories in a Git worktree resolve to the same board at its root. Only
@@ -26,16 +28,36 @@ Do not run another editing agent against the same checkout outside mub.
 
 ## UI
 
-The sidebar lists sessions. The conversation pane shows Mu-style colored
-model/context/cwd headers and literal `mu>` prompts, including multiline input.
-History prompts are matched against Mu's journal; live prompts appear when an
-invocation starts. Output between prompts uses Mu's own `mu cat` Markdown
-renderer, sized to the pane and reflowed on resize. Rendering runs separately
-from process supervision; scheduler inputs and CLI logs remain raw text.
+The sidebar lists sessions. The read-only conversation pane displays Mu's native
+PTY output: Markdown, tool calls, colors, progress updates, and terminal wrapping.
+Saved history is rendered by `mu transcript` on a sized PTY, not reinterpreted
+as Markdown. mub adds only the live model/context/cwd header and literal `mu>`
+prompt; retry does not duplicate the user prompt. History preparation runs
+behind the durable launch gate, so it cannot overlap the new turn's journal.
+Independent readers drain every worker PTY, including hidden/headless sessions.
+Scheduler JSON stays on a separate non-terminal path. CLI logs and trap evidence
+use complete captured output rather than a bounded screen snapshot.
 The composer sends to the selected session and grows with its draft.
 Mailbox entries are labeled
 pending, in-flight, or interrupted; they are not mistaken for delivered history.
 Drafts are kept separately for each session while the UI is open.
+
+An active invocation keeps its launch-time terminal dimensions. After narrowing
+the pane, use `[` / `]` in the conversation to pan horizontally. Idle history
+replays at the new size; failed/interrupted screens stay available so transient
+errors are not lost. Unused cells are not rewrapped by curses. Colors are mapped
+to the outer terminal's available palette (RGB colors to the nearest ANSI color).
+The display retains 10,000 scrollback rows; Mu journals remain the durable history.
+Headless workers use an 80-column, 24-row terminal.
+
+Live bells ring through the outer terminal and mark background sessions with `!`.
+`/bell` toggles audible bells for this UI; rapid bells are coalesced. Replay and
+resize never replay notifications. OSC 8 hyperlinks remain in the terminal model,
+are underlined, and their targets are available with `/links`; nothing opens
+automatically. Worker title changes never rename the host terminal. Clipboard
+requests, terminal replies, graphics and external notifications are not forwarded.
+The engine interprets alternate screens and cursor controls, but mub does not
+forward keyboard/mouse input or claim to host arbitrary interactive applications.
 
 Create a session with `/new [name]`, then type its first message. Use `Ctrl-P` to
 pick a session or inspect the scheduler's decisions and output.
@@ -57,6 +79,7 @@ appear only when relevant; model defaults and active models are available throug
 | `Shift-Enter`, `Alt-Enter`, or `Ctrl-J` | Insert a newline |
 | `PgUp` / `PgDn` | Scroll conversation |
 | `Home` / `End` in conversation | Beginning / follow output |
+| `[` / `]` in conversation | Pan a wider terminal left / right |
 | `Ctrl-P` | Session picker, including scheduler output |
 | `Ctrl-C` in composer | Clear the current input buffer |
 | `Ctrl-C` in sidebar/conversation | Interrupt and hold the selected session |
@@ -75,6 +98,8 @@ Local commands:
 - `/model`: show the selected scheduler/worker defaults and active invocation models.
 - `/model scheduler|worker|both`: select models and reasoning effort.
 - `/model session`: select the current session's model and effort, or remove its override.
+- `/bell`: toggle audible live terminal bells (background attention markers remain).
+- `/links`: show hyperlink targets from the selected terminal without opening them.
 - `/resume`: release a session hold and explicitly authorize continuation of its
   interrupted turn, if any.
 - `/schedule`: recheck the workspace and scheduling. After a scheduler error,
@@ -249,11 +274,13 @@ a new board; Mu journals remain untouched.
 ## Checks
 
 ```sh
-python -m compileall -q muboard tests
-python tests/smoke.py
+uv run python -m compileall -q muboard tests
+uv run python tests/smoke.py
 ```
 
 Smoke checks use temporary Git worktrees and fake Mu processes, with no provider
 calls. They exercise mailbox delivery, reader/writer concurrency, clean handoffs,
 traps, failures, interruption holds, stale decisions, persistence, and a real
-PTY-driven UI workflow.
+PTY-driven UI workflow. Terminal checks cover cursor/erase updates, color,
+split UTF-8, wide cells, alternate screens, hyperlinks, bell/replay separation,
+and draining large output while preserving complete trap evidence.

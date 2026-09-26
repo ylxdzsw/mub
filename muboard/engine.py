@@ -1,6 +1,7 @@
 """Session mailboxes and a small, event-driven Mu scheduler."""
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -9,11 +10,13 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
 from .state import Store, session_name
-from .output import delivery, history_blocks, journal_path, live_prompt, replay
+from .output import delivery, journal_path, live_prompt, plain_output, prompt_bytes, replay
+from .terminal import Capture, Screen, replay_screen, terminal_env
 
 
 def process_stamp(pid):
@@ -73,6 +76,11 @@ class Engine:
         self.server = None
         self.done = self.stopping = self.closed = False
         self.history = {}
+        self.screens = {}
+        self.replays = {}
+        self.replay_stop = threading.Event()
+        self.replay_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mub-history")
+        self.terminal_size = (80, 24)
         self.model_cache = {}
         self.traps = {}
         self.client = shlex.join([sys.executable, "-m", "muboard", "-C", str(self.root)])
@@ -245,6 +253,10 @@ class Engine:
             if pending and not req.get("discard"):
                 raise ValueError("Session has queued/interrupted messages; confirm discarding them")
             self.data["sessions"].remove(session)
+            self.screens.pop(session["id"], None)
+            pending_replay = self.replays.pop(session["id"], None)
+            if pending_replay:
+                pending_replay[1].cancel()
             self.data["messages"] = [m for m in self.data["messages"] if m["session_id"] != session["id"]]
             self.store.event("removed", session["id"])
             result = dict(removed=True)
@@ -274,6 +286,7 @@ class Engine:
             if self.active and not req.get("confirmed"):
                 raise ValueError("Running agents: confirm stopping them before quitting")
             self.stopping = True
+            self.replay_stop.set()
             for active in list(self.active.values()):
                 if active["record"]["kind"] == "worker":
                     session = self.store.session(active["record"]["session_id"])
@@ -291,17 +304,45 @@ class Engine:
         active = self._running(session_id)
         if active:
             stream = active["output"]
-            text = os.pread(stream.fileno(), os.fstat(stream.fileno()).st_size, 0).decode("utf-8", "replace")
+            text = plain_output(os.pread(stream.fileno(), os.fstat(stream.fileno()).st_size, 0))
             return dict(text=active["history"] + "\n── Live invocation ──\n" + text,
-                        blocks=active["blocks"] + [dict(kind="markdown", text=text)],
                         source="Mu history + live output")
         if not target["session"]:
             return dict(text="", source="No Mu turn yet")
         key = target["session"]
         if key not in self.history:
-            text = replay(self.root, key, self.mu)
-            self.history[key] = dict(text=text, blocks=history_blocks(self.root, key, text))
-        return dict(self.history[key], source="Mu session journal")
+            self.history[key] = replay(self.root, key, self.mu)
+        return dict(text=self.history[key], source="Mu session journal")
+
+    def display(self, session_id, cols, rows):
+        """Local UI API: return cells, never route worker controls through IPC."""
+        target = self.data["scheduler"] if session_id is None else self.store.session(session_id)
+        if not target["session"]:
+            return None
+        screen = self.screens.get(session_id)
+        if self._running(session_id):
+            return screen
+        # Keep failed/interrupted live output visible, including transient errors
+        # absent from Mu's journal. It remains horizontally scrollable on resize.
+        failed = target.get("error") if session_id is None else (target.get("last") or {}).get("exit") not in (None, "clean")
+        if screen and (failed or (screen.cols, screen.rows) == (cols, rows)):
+            return screen
+        key = (target["session"], cols, rows)
+        pending = self.replays.get(session_id)
+        if pending and pending[1].done():
+            if pending[0] == key:
+                result = pending[1].result()
+                if screen:
+                    result.bells += screen.take_bells()
+                    result.attention = screen.attention
+                self.screens[session_id] = result
+                del self.replays[session_id]
+                return result
+            del self.replays[session_id]
+            pending = None
+        if pending is None:
+            self.replays[session_id] = (key, self.replay_pool.submit(replay_screen, self.root, *key, self.mu, self.replay_stop))
+        return screen
 
     def _scheduler_prompt(self, snapshot):
         return f"""You schedule messages for Mu sessions sharing {self.root}. You do NOT manage implementation quality, review code, invent tasks, or fix failures. Do not edit project files, launch agents, or call user controls. The runtime owns processes and delivery. Interpret dependencies from messages and worker responses; preserve FIFO within sessions, prefer global submission order unless priorities/prerequisites justify another choice. Readers see a live, possibly changing checkout.
@@ -341,7 +382,24 @@ SNAPSHOT:
         if action != "retry" and not status["clean"]:
             raise RuntimeError(f"Mu session {mu_session} has an interrupted turn; use explicit continuation")
         history = replay(self.root, mu_session, self.mu)
-        blocks = history_blocks(self.root, mu_session, history)
+        # Complete replay BEFORE releasing the worker: replaying its growing
+        # journal concurrently would duplicate new output at the history boundary.
+        key = session["id"] if session else None
+        previous = self.screens.get(key)
+        preparation = None
+        pending = self.replays.pop(key, None)
+        if pending:
+            pending[1].cancel()
+        if (previous and previous.finished and not previous.error and previous.session == mu_session
+                and not previous.core.is_alt_screen_active()
+                and (previous.cols, previous.rows) == self.terminal_size):
+            screen = previous
+        else:
+            screen = Screen(*self.terminal_size)
+            screen.session = mu_session
+            if history:
+                preparation = self.replay_pool.submit(replay_screen, self.root, mu_session,
+                                                      *self.terminal_size, self.mu, self.replay_stop)
         self.history.pop(mu_session, None)
         if kind == "scheduler":
             prompt = self._scheduler_prompt(snapshot)
@@ -353,8 +411,15 @@ Commit only this session's completed, task-owned changes so another writer can p
             prompt = ""
         else:
             prompt = message["text"]
+        prefix = b"\x1b[0m\r\n"
         if action != "retry":
-            blocks.append(live_prompt(prompt, self.root, status))
+            prefix += prompt_bytes(live_prompt(prompt, self.root, status))
+        screen.feed(prefix)
+        if previous and previous is not screen:
+            screen.bells += previous.take_bells()
+            screen.attention = previous.attention
+        screen.finished = False
+        self.screens[key] = screen
         record = dict(id=uuid.uuid4().hex[:12], kind=kind, session_id=session["id"] if session else None,
                       session=mu_session, action=action, mode=mode, trap=trap or ("reversible" if mode == "readonly" else "destructive"),
                       origin=session["last"]["action"] if action == "retry" and session["last"] else action,
@@ -371,10 +436,21 @@ Commit only this session's completed, task-owned changes so another writer can p
                     item["state"] = "inflight"
         self.data["inflight"].append(record)
         self.store.save()
-        output = tempfile.TemporaryFile()
-        active = dict(record=record, output=output, history=history, blocks=blocks, snapshot=snapshot, plan=None,
-                      stopped_at=None)
-        env = dict(os.environ, NO_COLOR="1", MUB_PROJECT=str(self.root), MUB_ROLE=kind)
+        try:
+            capture = Capture(screen) if kind == "worker" else None
+            output = capture.raw if capture else tempfile.TemporaryFile()
+        except OSError:
+            if preparation:
+                preparation.cancel()
+            self.data["inflight"].remove(record)
+            if message:
+                message["state"] = "pending"
+            self.store.save()
+            raise
+        active = dict(record=record, output=output, capture=capture, screen=screen, screen_offset=0,
+                      history=history, snapshot=snapshot, plan=None,
+                      stopped_at=None, preparation=preparation, preparation_error=None, prefix=prefix, release=None)
+        env = dict(terminal_env() if capture else os.environ, MUB_PROJECT=str(self.root), MUB_ROLE=kind)
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent.parent), env.get("PYTHONPATH")]))
         if self.server:
             env["MUB_SOCKET"] = str(self.server.path)
@@ -383,6 +459,7 @@ Commit only this session's completed, task-owned changes so another writer can p
         if model:
             args += ["-m", model]
         ready, release = os.pipe()
+        release_owned = False
         # The child cannot execute Mu until its PID is durable. Parent death closes
         # the pipe, so a crash in the launch window cannot create an untracked writer.
         launcher = [sys.executable, "-c",
@@ -396,8 +473,13 @@ Commit only this session's completed, task-owned changes so another writer can p
                     source.seek(0)
                     process = subprocess.Popen(launcher, cwd=self.root, env=env, pass_fds=(ready,),
                                                stdin=source if action != "retry" else subprocess.DEVNULL,
-                                               stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+                                               stdout=capture.slave if capture else output,
+                                               stderr=subprocess.STDOUT, start_new_session=True)
             except OSError:
+                if preparation:
+                    preparation.cancel()
+                if capture:
+                    capture.finish()
                 output.close()
                 self.data["inflight"].remove(record)
                 if message:
@@ -407,16 +489,52 @@ Commit only this session's completed, task-owned changes so another writer can p
             record.update(pid=process.pid, stamp=process_stamp(process.pid))
             active["process"] = process
             self.active[record["id"]] = active
+            active["release"] = release
+            release_owned = True
+            if capture:
+                capture.start()
             self.store.save()
             if self.stopping:
                 self._stop(active)
-            else:
-                os.write(release, b"1")
+            elif preparation is None:
+                self._release(active)
         finally:
             os.close(ready)
-            os.close(release)
+            if not release_owned:
+                os.close(release)
         self._workspace()
         return active
+
+    def _release(self, active, execute=True):
+        fd, active["release"] = active["release"], None
+        if fd is not None:
+            try:
+                if execute:
+                    os.write(fd, b"1")
+            finally:
+                os.close(fd)
+
+    def _prepare(self, active):
+        future = active["preparation"]
+        if future is None or not future.done() or active["record"]["stopping"]:
+            return
+        active["preparation"] = None
+        try:
+            screen = future.result()
+            screen.feed(active["prefix"])
+            screen.finished = False
+            previous = active["screen"]
+            screen.bells += previous.take_bells()
+            screen.attention = previous.attention
+            active["screen"] = screen
+            self.screens[active["record"]["session_id"]] = screen
+            if active["capture"]:
+                active["capture"].screen = screen
+            self._release(active)
+        except (OSError, RuntimeError, ValueError) as error:
+            active["preparation_error"] = str(error)
+            active["screen"].error = "Cannot prepare Mu history: " + str(error)
+            self._release(active, execute=False)
 
     def _validate_plan(self, plan, active):
         if not isinstance(plan, dict) or set(plan) - {"reason", "actions", "names"} or not isinstance(plan.get("reason"), str) or not isinstance(plan.get("actions"), list):
@@ -549,11 +667,20 @@ Commit only this session's completed, task-owned changes so another writer can p
 
     def _finish(self, active):
         run = active["record"]
+        self._release(active, execute=False)
+        if active["preparation"]:
+            active["preparation"].cancel()
+        if active["capture"]:
+            active["capture"].finish()
+        else:
+            self._scheduler_display(active)
+        active["screen"].finished = True
         self.model_cache.pop(run["session"], None)
         self.data["inflight"].remove(run)
         self.history.pop(run["session"], None)
         stream = active["output"]
-        raw = os.pread(stream.fileno(), os.fstat(stream.fileno()).st_size, 0).decode("utf-8", "replace")
+        data = os.pread(stream.fileno(), os.fstat(stream.fileno()).st_size, 0)
+        raw = plain_output(data) if active["capture"] else data.decode("utf-8", "replace")
         stream.close()
         code = active["process"].returncode
         try:
@@ -562,6 +689,12 @@ Commit only this session's completed, task-owned changes so another writer can p
             clean = False
             raw += "\nCannot inspect Mu session: " + str(error)
         exit_reason = "interrupted" if run["stopping"] else "trapped" if code == 3 else "failed" if code else "clean" if clean else "interrupted"
+        if active["preparation_error"]:
+            exit_reason = "failed"
+            raw += "\nCannot prepare Mu history: " + active["preparation_error"]
+        if active["capture"] and active["capture"].error:
+            exit_reason = "failed"
+            raw += "\nPTY capture failed: " + active["capture"].error
         if run["kind"] == "scheduler":
             if exit_reason != "clean":
                 self.data["scheduler"]["error"] = f"Scheduler {exit_reason}; no decision applied. {raw[-2000:]} Use /schedule to try a fresh scheduler session."
@@ -605,11 +738,25 @@ Commit only this session's completed, task-owned changes so another writer can p
             self.data["scheduler"]["error"] = f"Cannot inspect workspace: {error}"
         self.store.save()
 
+    def _scheduler_display(self, active):
+        stream = active["output"]
+        offset = active["screen_offset"]
+        chunk = os.pread(stream.fileno(), max(0, os.fstat(stream.fileno()).st_size - offset), offset)
+        active["screen_offset"] += len(chunk)
+        active["screen"].feed(chunk.replace(b"\n", b"\r\n"), live=True)
+
     def tick(self):
         if self.server:
             self.server.drain(self.request)
         for key, active in list(self.active.items()):
             process, record = active["process"], active["record"]
+            if process.poll() is None:
+                self._prepare(active)
+            if active["capture"]:
+                if active["capture"].error and not record["stopping"]:
+                    self._stop(active)
+            else:
+                self._scheduler_display(active)
             ended = process.poll() is not None
             members = owned_members(record) if ended or record["stopping"] else []
             if record["stopping"] and active["stopped_at"] is not None and time.monotonic() - active["stopped_at"] >= 5:
@@ -653,6 +800,7 @@ Commit only this session's completed, task-owned changes so another writer can p
             time.sleep(0.05)
         if self.server:
             self.server.close()
+        self.replay_pool.shutdown(wait=True, cancel_futures=True)
         self.store.save()
         self.store.close()
         self.closed = True
