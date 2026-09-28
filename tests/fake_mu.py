@@ -55,7 +55,7 @@ def schedule(snapshot, config):
         if session["active"] or session["hold"]:
             continue
         writable = not writer and (not dirty or owner == key)
-        if session["gate"] == "trapped" or session["retry_authorized"]:
+        if session["gate"] == "trapped" or session["user_retry_authorized"]:
             if writable:
                 actions.append(dict(type="retry", session_id=key, mode="readwrite", trap="off", reason="Scripted trap approval for this turn"))
                 writer = True
@@ -148,6 +148,8 @@ def main():
     if role == "scheduler":
         snapshot = json.loads(prompt.split("SNAPSHOT:\n", 1)[1])
         save(STORE / ("snapshot-" + uuid.uuid4().hex + ".json"), snapshot)
+        if diagnostic := config.get("scheduler_stderr"):
+            print(diagnostic, file=sys.stderr, flush=True)
         delay(config.get("scheduler_delay", 0.02))
         if STOPPED:
             return finish(130, "scheduler interrupted", False)
@@ -155,7 +157,7 @@ def main():
             return finish(1, "fake provider failure", False)
         plan = schedule(snapshot, config)
         delay(config.get("after_plan_delay", 0))
-        return finish(0, json.dumps(plan), True)
+        return finish(0, config.get("scheduler_stdout", json.dumps(plan)), True)
 
     task = data["prompt"]
     own_file = ROOT / f"work-{key}.txt"

@@ -43,8 +43,11 @@ as Markdown. mub adds only the live model/context/cwd header and literal `mu>`
 prompt; retry does not duplicate the user prompt. History preparation runs
 behind the durable launch gate, so it cannot overlap the new turn's journal.
 Independent readers drain every worker PTY, including hidden/headless sessions.
-Scheduler JSON stays on a separate non-terminal path. CLI logs and trap evidence
-use complete captured output rather than a bounded screen snapshot.
+Scheduler JSON stays on a separate non-terminal path: only stdout is parsed as
+the decision. Stderr diagnostics, including compaction reports, remain visible
+in the scheduler pane and live CLI logs; the latest scheduler stderr is also
+available in CLI logs after exit while the owner remains open. CLI logs and trap
+evidence use complete captured output rather than a bounded screen snapshot.
 The composer is always active, sends to the selected session, and grows with its
 draft. There is no pane focus: typing edits the prompt, Tab completes an open
 command panel or switches sessions otherwise,
@@ -193,8 +196,20 @@ Readonly workers use `--trap reversible`. These are Mu's **model-declared risk
 traps, not a sandbox**. A trapped reader may be promoted to writer only when the
 writer slot and workspace ownership permit it.
 
-The scheduler may resolve a trap within the user's authorized work. Trap
-relaxation applies to the **rest of that turn**, not one command. Ordinary writes
+The scheduler resolves ordinary task-related traps automatically, without
+requiring `/resume`. Its initial readonly classification is provisional, not a
+user prohibition on writes. It interprets conversational change requests in
+context, but blocks writes when the user clearly requested only discussion or
+inspection, the worker departs from the task, or broader permission is needed.
+The blocking reason explains the conflict.
+
+A trap is not a failure. A session waiting for the writer slot or workspace stays
+trapped and can be retried automatically when available. Scheduler failure labels
+on trapped sessions are treated as blocking explanations, not as changes to the
+invocation's outcome. Explicit continuation permission is still required for
+genuine failures and interrupted turns; user holds always prohibit execution.
+
+Trap relaxation applies to the **rest of that turn**, not one command. Ordinary writes
 start with `--trap destructive`; the scheduler can choose `off` when that broader
 permission is justified. A subsequent normal turn gets a fresh access/trap
 policy. Single-command approval is not implemented.

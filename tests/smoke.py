@@ -472,19 +472,37 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(subprocess.check_output(["git", "status", "--porcelain"], cwd=self.root), b"")
 
     def test_scheduler_failure_needs_explicit_recheck(self):
-        self.config(scheduler_fail=True)
+        diagnostic = "[mu] compacted epoch 0 → 1"
+        self.config(scheduler_fail=True, scheduler_stderr=diagnostic, scheduler_delay=0.2)
         board = self.board()
         session = self.new(board, "read queued")
+        self.until(board, lambda: diagnostic in board.output(None)["text"])
+        active = board._running(None)
+        self.assertIsNotNone(active)
         self.until(board, board.idle)
+        self.assertTrue(active["output"].closed)
+        self.assertTrue(active["stderr"].closed)
         old = board.data["scheduler"]["session"]
-        self.assertIsNotNone(board.data["scheduler"]["error"])
+        self.assertIn(diagnostic, board.data["scheduler"]["error"])
+        self.assertIn(diagnostic, board.output(None)["text"])
+        _, _, rows = board.screens[None].frame(0, 10000)
+        self.assertIn(diagnostic, "\n".join("".join(cell[0] for cell in row) for row in rows))
         self.new(board, "read also queued")
         board.tick()
         self.assertFalse(board.active)
-        self.config()
+        self.config(scheduler_stdout="not JSON", scheduler_stderr=json.dumps(dict(
+            reason="Not a stdout decision", actions=[dict(type="dispatch", message_id=1, mode="readonly")])))
+        board.request(dict(op="schedule"))
+        self.until(board, board.idle)
+        self.assertIn("Invalid scheduler decision", board.data["scheduler"]["error"])
+        self.assertIsNone(session["session"])
+        self.assertTrue(all(m["state"] == "pending" for m in board.data["messages"]))
+        self.config(scheduler_stderr=diagnostic)
         board.request(dict(op="schedule"))
         self.until(board, board.idle)
         self.assertNotEqual(board.data["scheduler"]["session"], old)
+        self.assertIsNone(board.data["scheduler"]["error"])
+        self.assertIn(diagnostic, board.output(None)["text"])
         self.assertEqual(session["last"]["exit"], "clean")
 
     def test_early_exit_keeps_undelivered_input(self):

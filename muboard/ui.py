@@ -359,6 +359,8 @@ class _UI:
             return error
         session = self._session()
         if session:
+            if session.get("gate") == "trapped" and not session.get("hold") and session.get("blocked"):
+                return session["blocked"]
             if session.get("hold") or session.get("gate"):
                 return session.get("reason") or "Session held · /resume to continue"
             return session.get("blocked") or ""

@@ -83,6 +83,7 @@ class Engine:
         self.terminal_size = (80, 24)
         self.model_cache = {}
         self.traps = {}
+        self.scheduler_diagnostics = None
         self.client = shlex.join([sys.executable, "-m", "muboard", "-C", str(self.root)])
         try:
             self._recover()
@@ -305,6 +306,10 @@ class Engine:
         if active:
             stream = active["output"]
             text = plain_output(os.pread(stream.fileno(), os.fstat(stream.fileno()).st_size, 0))
+            if stream := active["stderr"]:
+                diagnostics = plain_output(os.pread(stream.fileno(), os.fstat(stream.fileno()).st_size, 0))
+                if diagnostics:
+                    text += "\n── Scheduler stderr ──\n" + diagnostics
             return dict(text=active["history"] + "\n── Live invocation ──\n" + text,
                         source="Mu history + live output")
         if not target["session"]:
@@ -312,6 +317,9 @@ class Engine:
         key = target["session"]
         if key not in self.history:
             self.history[key] = replay(self.root, key, self.mu)
+        if session_id is None and self.scheduler_diagnostics and self.scheduler_diagnostics[0] == key:
+            return dict(text=self.history[key] + "\n── Latest scheduler stderr ──\n" + self.scheduler_diagnostics[1],
+                        source="Mu session journal + captured stderr")
         return dict(text=self.history[key], source="Mu session journal")
 
     def display(self, session_id, cols, rows):
@@ -346,7 +354,9 @@ class Engine:
 
 Choose any number of independent readonly messages and at most one readwrite invocation. Messages can only go to idle, unheld sessions with a clean Mu turn. A writer needs a clean checkout or its own dirty checkout. A failed/held dirty owner blocks other writers, not independent readers. Do not run dependents merely because a prerequisite exited or failed. Mark blocked sessions with a short reason; reconsider them when circumstances change. A worker's own response and exit reason are sufficient evidence; do not review its implementation.
 
-You may resolve traps by inspecting their FULL command and stdin in the outcome (or `{self.client} logs S<ID>` if needed) and retrying with a suitable policy, within the user's authorized scope. Readonly uses trap reversible; a write requires promotion to the writer slot. Relaxing traps authorizes the REMAINDER OF THE TURN, not one command. Use destructive for ordinary reversible writes, off only when the broader permission is justified. Retry does not accept new instructions. Never retry failures/interrupted user-stopped sessions unless retry_authorized is true. Do not troubleshoot provider or Mu bugs. Label genuine failures and withhold dependent work.
+Resolve ordinary traps automatically: inspect their FULL command and stdin in the outcome (or `{self.client} logs S<ID>` if needed), then retry reasonable task-related work with a suitable policy. Your initial readonly classification is provisional, not a user prohibition on writes. Interpret conversational change requests in context; do not require imperative wording or a separate approval for ordinary implementation. Do not approve writes when the user clearly requested only discussion/inspection, the worker clearly departs from the task, or the operation needs broader permission than the user granted. In those cases label blocked with the concrete scope or permission conflict.
+
+A trapped session does NOT require user_retry_authorized to retry. That flag records explicit user continuation permission for failures/interrupted turns; false is NOT a denial of trap resolution. A trap is not a failure: never label failed merely because a turn trapped, lacks explicit retry permission, or must wait for the writer. If the writer slot or workspace is unavailable, leave the session trapped and label blocked with the waiting reason; reconsider it when circumstances change. Readonly uses trap reversible; writes require promotion to the writer slot. Use readwrite with trap destructive for ordinary reversible writes, off only when the broader permission is justified. Relaxing traps authorizes the REMAINDER OF THE TURN, not one command. Retry does not accept new instructions. Never retry genuine failures or interrupted turns unless user_retry_authorized is true; user holds always prohibit retry. Do not troubleshoot provider or Mu bugs. Label genuine failures and withhold dependent work.
 
 You may request a commit from the dirty workspace owner to release the checkout. This is only a handoff request to commit task-owned completed changes or explain why it cannot; not a repair/implementation request. Do not repeat a commit request after an unsuccessful handoff without new user input. User holds prohibit execution actions, including commit and retry.
 
@@ -430,10 +440,14 @@ Commit only this session's completed, task-owned changes so another writer can p
                     item["state"] = "inflight"
         self.data["inflight"].append(record)
         self.store.save()
+        output = None
         try:
             capture = Capture(screen) if kind == "worker" else None
             output = capture.raw if capture else tempfile.TemporaryFile()
+            stderr = None if capture else tempfile.TemporaryFile()
         except OSError:
+            if output is not None:
+                output.close()
             if preparation:
                 preparation.cancel()
             self.data["inflight"].remove(record)
@@ -441,7 +455,8 @@ Commit only this session's completed, task-owned changes so another writer can p
                 message["state"] = "pending"
             self.store.save()
             raise
-        active = dict(record=record, output=output, capture=capture, screen=screen, screen_offset=0,
+        active = dict(record=record, output=output, stderr=stderr, capture=capture,
+                      screen=screen, screen_offset=0, stderr_offset=0,
                       history=history, snapshot=snapshot, plan=None,
                       stopped_at=None, preparation=preparation, preparation_error=None, prefix=prefix, release=None)
         env = dict(terminal_env() if capture else os.environ, MUB_PROJECT=str(self.root), MUB_ROLE=kind)
@@ -468,13 +483,15 @@ Commit only this session's completed, task-owned changes so another writer can p
                     process = subprocess.Popen(launcher, cwd=self.root, env=env, pass_fds=(ready,),
                                                stdin=source if action != "retry" else subprocess.DEVNULL,
                                                stdout=capture.slave if capture else output,
-                                               stderr=subprocess.STDOUT, start_new_session=True)
+                                               stderr=subprocess.STDOUT if capture else stderr, start_new_session=True)
             except OSError:
                 if preparation:
                     preparation.cancel()
                 if capture:
                     capture.finish()
                 output.close()
+                if stderr is not None:
+                    stderr.close()
                 self.data["inflight"].remove(record)
                 if message:
                     message["state"] = "pending"
@@ -602,10 +619,11 @@ Commit only this session's completed, task-owned changes so another writer can p
                 skipped.append(f"S{key}: state changed or held")
                 continue
             if kind == "label":
-                if action["status"] == "failed":
+                if action["status"] == "failed" and session["gate"] != "trapped":
                     session.update(gate="failed", reason=action["reason"], retry_authorized=False)
                 else:
-                    session["blocked"] = action["reason"] if action["status"] == "blocked" else None
+                    # Scheduler labels must not turn a trap into a failed invocation.
+                    session["blocked"] = None if action["status"] == "clear" else action["reason"]
                 session["revision"] += 1
                 continue
             mode = action.get("mode", "readwrite")
@@ -613,6 +631,7 @@ Commit only this session's completed, task-owned changes so another writer can p
             if mode == "readwrite":
                 writer = any(a["record"]["kind"] == "worker" and a["record"]["mode"] == "readwrite" for a in self.active.values())
                 if writer or (not self.workspace["clean"] and self.data["owner"] != key):
+                    session["blocked"] = "Waiting for the writer slot or dirty workspace to be released."
                     skipped.append(f"S{key}: writer slot or dirty workspace unavailable")
                     continue
             message = None
@@ -673,6 +692,11 @@ Commit only this session's completed, task-owned changes so another writer can p
         data = os.pread(stream.fileno(), os.fstat(stream.fileno()).st_size, 0)
         raw = plain_output(data) if active["capture"] else data.decode("utf-8", "replace")
         stream.close()
+        diagnostics = ""
+        if stream := active["stderr"]:
+            diagnostics = plain_output(os.pread(stream.fileno(), os.fstat(stream.fileno()).st_size, 0))
+            stream.close()
+            self.scheduler_diagnostics = (run["session"], diagnostics) if diagnostics else None
         code = active["process"].returncode
         try:
             clean = self._session_status(run["session"])["clean"]
@@ -688,7 +712,8 @@ Commit only this session's completed, task-owned changes so another writer can p
             raw += "\nPTY capture failed: " + active["capture"].error
         if run["kind"] == "scheduler":
             if exit_reason != "clean":
-                self.data["scheduler"]["error"] = f"Scheduler {exit_reason}; no decision applied. {raw[-2000:]} Use /schedule to try a fresh scheduler session."
+                detail = raw + ("\nScheduler stderr:\n" + diagnostics if diagnostics else "")
+                self.data["scheduler"]["error"] = f"Scheduler {exit_reason}; no decision applied. {detail[-2000:]} Use /schedule to try a fresh scheduler session."
             elif not self.stopping:
                 try:
                     active["plan"] = json.loads(raw)
@@ -730,11 +755,12 @@ Commit only this session's completed, task-owned changes so another writer can p
         self.store.save()
 
     def _scheduler_display(self, active):
-        stream = active["output"]
-        offset = active["screen_offset"]
-        chunk = os.pread(stream.fileno(), max(0, os.fstat(stream.fileno()).st_size - offset), offset)
-        active["screen_offset"] += len(chunk)
-        active["screen"].feed(chunk.replace(b"\n", b"\r\n"))
+        for name, position in (("stderr", "stderr_offset"), ("output", "screen_offset")):
+            stream = active[name]
+            offset = active[position]
+            chunk = os.pread(stream.fileno(), max(0, os.fstat(stream.fileno()).st_size - offset), offset)
+            active[position] += len(chunk)
+            active["screen"].feed(chunk.replace(b"\n", b"\r\n"))
 
     def tick(self):
         if self.server:
@@ -769,6 +795,7 @@ Commit only this session's completed, task-owned changes so another writer can p
             self._workspace()
             snapshot = copy.deepcopy(dict(self.state(), events=self.data["events"]))
             for session in snapshot["sessions"]:
+                session["user_retry_authorized"] = session.pop("retry_authorized")
                 if session["gate"] == "trapped" and not session["hold"]:
                     evidence = self.traps.get(session["id"])
                     if evidence is None:
