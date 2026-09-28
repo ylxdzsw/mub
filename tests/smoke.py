@@ -94,10 +94,15 @@ class InputSmoke(unittest.TestCase):
         ui._command("/interrupt")
         engine.request.assert_called_once_with({"op": "interrupt", "session_id": 2})
 
-        ui._select(None)
+        ui._set_draft("/scheduler")
+        ui._main_key(13)
+        self.assertIsNone(ui.selected)
+        self.assertEqual(ui.draft, "")
         ui._main_key(curses.KEY_BTAB)
         self.assertEqual(ui.selected, 2)
-        ui._select(None)
+        ui._command("/scheduler")
+        self.assertIsNone(ui.selected)
+        engine.request.assert_called_once_with({"op": "interrupt", "session_id": 2})
         ui._main_key(9)
         self.assertEqual(ui.selected, 1)
 

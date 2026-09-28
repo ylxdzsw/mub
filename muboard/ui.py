@@ -51,6 +51,7 @@ class _UI:
         "/interrupt": "Interrupt and hold the selected session",
         "/resume [selected]": "Resume the selected session",
         "/schedule": "Explicitly recheck or recover the scheduler",
+        "/scheduler": "Select the scheduler's decisions and output",
         "/links": "Show hyperlink targets from the selected terminal",
         "/help": "Show commands and keyboard controls",
         "/quit": "Stop work and quit",
@@ -417,7 +418,7 @@ class _UI:
             if height == 5:
                 self._add(height - 2, 1, self.draft, width - 2)
             if height > 1:
-                self._add(height - 1, 0, "Ctrl-P sessions · /quit quit", attr=curses.A_DIM)
+                self._add(height - 1, 0, "Tab sessions · /scheduler · /quit", attr=curses.A_DIM)
             self._cursor()
             self.window.refresh()
             return
@@ -443,7 +444,7 @@ class _UI:
         self._draw_commands(label_y, width)
         if notice := self._notice():
             self._add(notice_y, 1, notice, width - 2, self.colors.get("warn", 0))
-        self._add(height - 1, 1, "Tab/Shift-Tab sessions · PgUp/PgDn output · Ctrl-P picker · /help", attr=curses.A_DIM)
+        self._add(height - 1, 1, "Tab/Shift-Tab sessions · PgUp/PgDn output · /scheduler · /help", attr=curses.A_DIM)
         self._cursor((composer_top + cursor[0], cursor[1]) if cursor else None)
         self.window.refresh()
 
@@ -610,6 +611,8 @@ class _UI:
             self._resume()
         elif command == "/schedule":
             self._request({"op": "schedule"})
+        elif command == "/scheduler":
+            self._select(None)
         elif command == "/links":
             screen = self.engine.screens.get(self.selected)
             self._info("Terminal links · targets only; nothing opens automatically",
@@ -753,15 +756,6 @@ class _UI:
                 selected = min(len(options) - 1, selected + max(1, visible))
         return None
 
-    def _pick_session(self):
-        sessions = self.state["sessions"]
-        options = ["Scheduler · decisions and output"]
-        options.extend(self._session_label(session) for session in sessions)
-        initial = self._selected_index() + 1 if self.selected is not None else 0
-        choice = self._pick("Select session · Ctrl-P", options, initial)
-        if choice is not None:
-            self._select(sessions[choice - 1]["id"] if choice else None)
-
     def _confirm(self, title, message):
         while not self.engine.done:
             self._tick()
@@ -785,7 +779,7 @@ class _UI:
         lines = ["Commands:", *(f"  {name}  {description}" for name, description in self.COMMANDS.items()), "",
                  "Session icons:", "  ✎ writing · ≋ reading · ○ idle after writing · ● idle after reading",
                  "  · new/idle · × failed/trapped · ■ held/interrupted/stopping · … blocked", "",
-                 "Keyboard:", "  Ctrl-P         Pick a session or view scheduler output",
+                 "Keyboard:",
                  "  Ctrl-N         Create and select a session, preserving the current draft",
                  "  Tab/Shift-Tab  Next/previous session (Tab fills an open command panel)",
                  "  ↑/↓/←/→        Edit the prompt; typing always goes to the composer",
@@ -908,9 +902,6 @@ class _UI:
             result = self._request({"op": "new"})
             if result is not None:
                 self._select(result["session_id"])
-            return
-        if key == 16:
-            self._pick_session()
             return
         if self._command_key(key):
             return

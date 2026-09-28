@@ -73,8 +73,8 @@ The engine interprets alternate screens and cursor controls, but mub does not
 forward keyboard/mouse input or claim to host arbitrary interactive applications.
 
 Type your first message to automatically create a session, or use `/new [name]`
-to create one explicitly. Use `Ctrl-P` to
-pick a session or inspect the scheduler's decisions and output.
+to create one explicitly. Use `Tab` / `Shift-Tab` to switch sessions and
+`/scheduler` to inspect the scheduler's decisions and output.
 The conversation pane shows the session's model even before its first message.
 Use `/model session` to choose a model and reasoning effort for that session only,
 whether it is new or already has history.
@@ -100,7 +100,6 @@ not whether its output has been viewed. Queue details remain in the conversation
 | `Shift-←` / `Shift-→` | Pan a wider terminal left / right |
 | Mouse wheel over output | Scroll output without moving the prompt cursor |
 | Click a sidebar session | Select it, keeping input in the composer |
-| `Ctrl-P` | Session picker, including scheduler output |
 | `Ctrl-N` | Create and select a new session, preserving the previous session's draft |
 | `Ctrl-C` | Clear the draft only, even if already empty; use `/interrupt` to stop work |
 | `Ctrl-D` (EOF) | Close the selected session (warn if not idle); quit if no sessions are open |
@@ -128,6 +127,8 @@ Local commands:
   interrupted turn, if any.
 - `/schedule`: recheck the workspace and scheduling. After a scheduler error,
   explicitly start a fresh scheduler session instead of retrying its old turn.
+- `/scheduler`: select the scheduler's decisions and output without triggering a
+  scheduling pass. Use `Tab` / `Shift-Tab` to return to worker sessions.
 - `/help`, `/quit`.
 
 Typing `/` in the composer opens a bounded command list, filtered as you type.
