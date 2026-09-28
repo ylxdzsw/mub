@@ -35,7 +35,7 @@ class InputSmoke(unittest.TestCase):
         engine = MagicMock()
         engine.state.return_value = {"sessions": [{"id": 1}, {"id": 2}]}
         with patch.multiple("muboard.ui.curses", raw=DEFAULT, nonl=DEFAULT, set_escdelay=DEFAULT,
-                            mousemask=DEFAULT, mouseinterval=DEFAULT, has_colors=DEFAULT) as mocks:
+                            typeahead=DEFAULT, mousemask=DEFAULT, mouseinterval=DEFAULT, has_colors=DEFAULT) as mocks:
             mocks["has_colors"].return_value = False
             ui = _UI(MagicMock(), engine)
 
@@ -106,8 +106,68 @@ class InputSmoke(unittest.TestCase):
         ui._main_key(9)
         self.assertEqual(ui.selected, 1)
 
+        ui.scrolls[1] = dict(follow=False, line=0, total=100, visible=20)
+        ui.pending_keys.extend(["ctrl-end", "shift-up", "x"])
+        ui._coalesce_scroll()
+        self.assertEqual(ui.scrolls[1]["line"], 79)
+        self.assertEqual(ui._getch(), "x")
+        ui.window.get_wch.side_effect = ["\x1b", "z"]
+        ui._coalesce_scroll()
+        self.assertEqual([ui._getch(), ui._getch()], [27, "z"])
+
+    def test_redraw_invalidation_and_prompt_reuse(self):
+        screen = Screen(77, 24)
+        screen.feed(b"output\r\n" * 50)
+        session = dict(id=1, name="Example", session="mu-session", active=dict(mode="readonly"))
+        engine = MagicMock()
+        engine.state.return_value = dict(root="/work", sessions=[session], messages=[],
+                                         workspace=dict(owner=None), scheduler=dict(active=None))
+        engine.display.return_value = screen
+        window = MagicMock()
+        window.getmaxyx.return_value = (30, 110)
+        with patch.multiple("muboard.ui.curses", raw=DEFAULT, nonl=DEFAULT, set_escdelay=DEFAULT,
+                            typeahead=DEFAULT, mousemask=DEFAULT, mouseinterval=DEFAULT, has_colors=DEFAULT) as mocks:
+            mocks["has_colors"].return_value = False
+            ui = _UI(window, engine)
+            ui._refresh = MagicMock()
+            ui._draw_main()
+            ui._draw_main()
+            self.assertEqual(window.erase.call_count, 1)
+            self.assertEqual(engine.display.call_count, 2)  # Poll replay completion even without painting.
+            session["name"] = "Renamed"
+            ui._draw_main()
+            self.assertEqual(window.erase.call_count, 2)
+            screen.feed(b"new output")
+            ui._draw_main()
+            self.assertEqual(window.erase.call_count, 3)
+            session["active"] = None
+            ui._draw_main()
+            prompt = ui.prompt_screen
+            ui._set_draft("draft")
+            ui._draw_main()
+            self.assertIs(ui.prompt_screen, prompt)
+            window.getmaxyx.return_value = (30, 100)
+            ui._draw_main()
+            self.assertIsNot(ui.prompt_screen, prompt)
+
 
 class TerminalSmoke(unittest.TestCase):
+    def test_viewport_cache_and_history_anchor(self):
+        screen = Screen(12, 3)
+        screen.feed(b"line\r\n" * 20)
+        _, total, first = screen.frame(2, 5)
+        _, _, second = screen.frame(3, 5)
+        self.assertIs(first[1], second[0])
+        self.assertEqual(screen.frame(total - 2, 10)[0], total - 2)
+        revision = screen.revision
+        screen.feed(b"replacement\r\n" * 10001)
+        self.assertGreater(screen.revision, revision)
+        self.assertIsNot(screen.frame(3, 5)[2][0], second[0])
+        screen.feed(b"\x1b[?1049h\x1b[2J\x1b[Halt")
+        _, total, alternate = screen.frame(0, 5)
+        self.assertEqual(total, 3)
+        self.assertEqual("".join(cell[0] for cell in alternate[0]).strip(), "alt")
+
     def test_native_controls_events_and_unicode(self):
         prompt = Screen(60, 5)
         prompt.feed(prompt_bytes(live_prompt("# **literal**\n```", "/work", {})))
@@ -658,6 +718,8 @@ class SchedulerSmoke(unittest.TestCase):
             self.assertEqual(len(state()["messages"]), 3)
             self.assertFalse(state()["inflight"])
             self.assertTrue(all(not owned_members(run) for run in running))
+            self.assertGreater(screen.count(b"\x1b[?2026h"), 0)
+            self.assertEqual(screen.count(b"\x1b[?2026h"), screen.count(b"\x1b[?2026l"))
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)

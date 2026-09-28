@@ -38,9 +38,17 @@ class Screen:
         self.error = None
         self.finished = False
         self.session = None
+        self.revision = 0
+        self._extent = None
+        self._lines = {}
 
     def feed(self, data):
+        if not data:
+            return
         with self.lock:
+            self.revision += 1
+            self._extent = None
+            self._lines.clear()
             self.core.process(data)
             self.core.poll_events()
             # No terminal-generated input, clipboard actions, graphics, or host
@@ -58,15 +66,27 @@ class Screen:
     def frame(self, start, count, *, follow=False):
         with self.lock:
             core = self.core
-            history = 0 if core.is_alt_screen_active() else core.scrollback_len()
-            used = self.rows if core.is_alt_screen_active() else max(
-                core.cursor_position()[1] + 1,
-                max((row + 1 for row in range(self.rows) if core.get_line(row).strip()), default=0))
-            total = history + used
-            start = max(0, total - count) if follow else max(0, min(start, max(0, total - count)))
-            lines = [core.scrollback_line(row) if row < history else core.get_line_cells(row - history)
-                     for row in range(start, min(total, start + count))]
-            return start, total, lines
+            if self._extent is None:
+                alternate = core.is_alt_screen_active()
+                history = 0 if alternate else core.scrollback_len()
+                used = self.rows if alternate else max(
+                    core.cursor_position()[1] + 1,
+                    max((row + 1 for row in range(self.rows) if core.get_line(row).strip()), default=0))
+                self._extent = history, history + used
+            history, total = self._extent
+            # History keeps its top row anchored when the viewport grows (for
+            # example when leaving live mode hides the idle prompt).
+            start = max(0, total - count) if follow else max(0, min(start, max(0, total - 1)))
+            # Retain only this viewport, reusing overlapping rows while scrolling.
+            # Any input invalidates the cache, including scrollback rollover and
+            # alternate-screen transitions; callers treat returned cells as read-only.
+            lines = {}
+            for row in range(start, min(total, start + count)):
+                lines[row] = self._lines[row] if row in self._lines else (
+                    core.scrollback_line(row) if row < history else core.get_line_cells(row - history))
+            if count:
+                self._lines = lines
+            return start, total, list(lines.values())
 
     def color(self, rgb, *, background=False):
         rgb = tuple(rgb)

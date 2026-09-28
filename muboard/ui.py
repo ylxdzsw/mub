@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import curses
+import json
+import os
 import sys
 import unicodedata
+from collections import deque
 
 from .output import literal as _text
 from .output import live_prompt, prompt_bytes
@@ -43,6 +46,11 @@ def _lines(value, width: int) -> list[str]:
 
 
 class _UI:
+    CELL_FLAGS = (("bold", curses.A_BOLD), ("dim", curses.A_DIM),
+                  ("italic", getattr(curses, "A_ITALIC", 0)), ("underline", curses.A_UNDERLINE),
+                  ("reverse", curses.A_REVERSE), ("blink", curses.A_BLINK),
+                  ("strikethrough", getattr(curses, "A_STRIKEOUT", 0)))
+
     COMMANDS = {
         "/new [name]": "Create and select a session",
         "/rename <name>|--auto": "Name the selected session, or let its name evolve automatically",
@@ -60,6 +68,11 @@ class _UI:
     def __init__(self, window, engine):
         self.window, self.engine = window, engine
         self.terminal_colors = {}
+        self.cell_colors = {}
+        self.row_runs = {}
+        self.next_row_runs = {}
+        self.prompt_key = self.prompt_screen = None
+        self.drawn = None
         self.state = engine.state()
         sessions = self.state["sessions"]
         self.selected = sessions[0]["id"] if sessions else None
@@ -72,13 +85,15 @@ class _UI:
         self.sidebar_scroll = 0
         self.session_hits = []
         self.output_rect = None
-        self.pending_key = None
+        self.pending_keys = deque()
         self.ui_error = ""
         self.request_ok = False
         self.colors = {}
         curses.raw()
         curses.nonl()
         curses.set_escdelay(25)
+        # Finish each physical frame even if more input arrives during refresh.
+        curses.typeahead(-1)
         window.keypad(True)
         window.timeout(50)
         curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
@@ -94,23 +109,51 @@ class _UI:
 
     def _cell_style(self, screen, fg, bg, attrs):
         style = 0
-        for name, flag in (("bold", curses.A_BOLD), ("dim", curses.A_DIM),
-                           ("italic", getattr(curses, "A_ITALIC", 0)), ("underline", curses.A_UNDERLINE),
-                           ("reverse", curses.A_REVERSE), ("blink", curses.A_BLINK),
-                           ("strikethrough", getattr(curses, "A_STRIKEOUT", 0))):
+        for name, flag in self.CELL_FLAGS:
             if getattr(attrs, name):
                 style |= flag
         if attrs.hyperlink_id is not None:
             style |= curses.A_UNDERLINE
         if curses.has_colors():
-            colors = tuple(c if c == -1 else c % curses.COLORS
-                           for c in (screen.color(fg), screen.color(bg, background=True)))
-            if colors not in self.terminal_colors and len(self.terminal_colors) + 4 < curses.COLOR_PAIRS:
-                pair = len(self.terminal_colors) + 4
-                curses.init_pair(pair, *colors)
-                self.terminal_colors[colors] = curses.color_pair(pair)
-            style |= self.terminal_colors.get(colors, 0)
+            key = fg, bg
+            if key not in self.cell_colors:
+                colors = tuple(c if c == -1 else c % curses.COLORS
+                               for c in (screen.color(fg), screen.color(bg, background=True)))
+                if colors not in self.terminal_colors and len(self.terminal_colors) + 4 < curses.COLOR_PAIRS:
+                    pair = len(self.terminal_colors) + 4
+                    curses.init_pair(pair, *colors)
+                    self.terminal_colors[colors] = curses.color_pair(pair)
+                if len(self.cell_colors) >= 4096:
+                    self.cell_colors.clear()
+                self.cell_colors[key] = self.terminal_colors.get(colors, 0)
+            style |= self.cell_colors[key]
         return style
+
+    def _runs(self, screen, cells, left, width):
+        key = id(cells), left, width
+        if key in self.row_runs:
+            cached = self.row_runs[key]
+        else:
+            runs, text, end, style, start = [], [], -1, 0, 0
+            for column in range(left, min(len(cells), left + width)):
+                char, fg, bg, attrs = cells[column]
+                if attrs.wide_char_spacer or (attrs.wide_char and column + 1 >= left + width):
+                    continue
+                if attrs.hidden:
+                    char = "  " if attrs.wide_char else " "
+                cell_style = self._cell_style(screen, fg, bg, attrs)
+                if column != end or cell_style != style:
+                    if text:
+                        runs.append((start - left, "".join(text), style))
+                    text, start, style = [], column, cell_style
+                text.append(char)
+                end = column + (2 if attrs.wide_char else 1)
+            if text:
+                runs.append((start - left, "".join(text), style))
+            # Keep the cells alive so identity keys cannot alias recycled lists.
+            cached = cells, runs
+        self.next_row_runs[key] = cached
+        return cached[1]
 
     def _terminal_frame(self, screen, x, row, width, height, scroll):
         start, total, lines = screen.frame(scroll["line"], height, follow=scroll["follow"])
@@ -118,14 +161,9 @@ class _UI:
         left = max(0, min(scroll.get("left", 0), max(0, screen.cols - width)))
         scroll["left"] = left
         for y, cells in enumerate(lines, row):
-            for column in range(left, min(len(cells), left + width)):
-                char, fg, bg, attrs = cells[column]
-                if attrs.wide_char_spacer or (attrs.wide_char and column + 1 >= left + width):
-                    continue
-                if attrs.hidden:
-                    char = "  " if attrs.wide_char else " "
+            for column, text, style in self._runs(screen, cells, left, width):
                 try:
-                    self.window.addstr(y, x + column - left, char, self._cell_style(screen, fg, bg, attrs))
+                    self.window.addstr(y, x + column, text, style)
                 except curses.error:
                     pass
         return len(lines)
@@ -151,6 +189,18 @@ class _UI:
         except curses.error:
             pass
 
+    def _refresh(self, cursor=None):
+        self.drawn = None
+        # Unsupported terminals ignore this private mode. Keep the transaction
+        # around physical output only, never engine work or a blocking input read.
+        fd = sys.stdout.fileno()
+        os.write(fd, b"\x1b[?2026h")
+        try:
+            self._cursor(cursor)
+            self.window.refresh()
+        finally:
+            os.write(fd, b"\x1b[?2026l")
+
     def _getch_raw(self):
         try:
             key = self.window.get_wch()
@@ -172,9 +222,8 @@ class _UI:
             return None
 
     def _getch(self):
-        if self.pending_key is not None:
-            key, self.pending_key = self.pending_key, None
-            return key
+        if self.pending_keys:
+            return self.pending_keys.popleft()
         key = self._getch_raw()
         return self._escape_key() if key == 27 else key
 
@@ -291,9 +340,42 @@ class _UI:
     def _session_label(self, session):
         return f"S{session['id']} {self._session_icon(session)} {session.get('name') or 'Session'}"
 
-    def _draw_conversation(self, session, x, y, width, height):
+    def _prepare_output(self, session, width, height):
+        queue = self._pending(session["id"]) if session else []
+        queued = min(len(queue), 3, max(0, height - 2))
+        if len(queue) > queued:
+            queued = max(0, queued - 1)
+        queue_rows = queued + (len(queue) > queued and queued < height - 1)
+        visible = max(0, height - 1 - queue_rows)
+        columns = max(2, width - 2)
+        self.engine.terminal_size = (columns, max(2, visible))
+        try:
+            screen = self.engine.display(self.selected, *self.engine.terminal_size)
+        except (OSError, RuntimeError, ValueError) as error:
+            self.ui_error = str(error)
+            screen = self.engine.screens.get(self.selected)
+        if screen and screen.error:
+            self.ui_error = screen.error
+        prompt = None
+        pending = next((message for message in queue if message["state"] == "pending"), None)
+        scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
+        if (session and not session.get("active") and (pending or not self._session_status(session))
+                and scroll["follow"] and (screen or not session.get("session"))):
+            key = (columns, pending["text"] if pending else "", self.state["root"],
+                   session.get("next_model") or "Mu/session default")
+            if key != self.prompt_key:
+                self.prompt_screen = Screen(columns, 2)
+                self.prompt_screen.feed(prompt_bytes(live_prompt(key[1], key[2], {
+                    "model": {"canonical": key[3]},
+                }), pending=True))
+                self.prompt_key = key
+            prompt = self.prompt_screen
+        return screen, prompt, queue, queued, visible
+
+    def _draw_conversation(self, session, x, y, width, height, output):
         if width <= 0 or height <= 0:
             return
+        screen, prompt, queue, queued, visible = output
         self.output_rect = (x, y, width, height)
         if session:
             title = f"S{session['id']} · {session['name']}"
@@ -302,44 +384,23 @@ class _UI:
                 title += f" · {status}"
             if self.state["workspace"]["owner"] == session["id"]:
                 title += " · ◆"
-            queue = self._pending(session["id"])
         else:
-            title, queue = "Scheduler", []
+            title = "Scheduler"
         scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
         hint = " · History · Ctrl-End for live" if not scroll["follow"] else ""
         row = y + 1
         if queue:
-            visible = min(len(queue), 3, max(0, y + height - row - 1))
-            if len(queue) > visible:
-                visible = max(0, visible - 1)
-            for message in queue[:visible]:
+            for message in queue[:queued]:
                 self._add(row, x + 1, f"{message['state']} · {message['text']}", width - 2, self.colors.get("warn", 0))
                 row += 1
-            if len(queue) > visible and row < y + height:
-                self._add(row, x + 1, f"… {len(queue) - visible} more queued", width - 2, curses.A_DIM)
+            if len(queue) > queued and row < y + height:
+                self._add(row, x + 1, f"… {len(queue) - queued} more queued", width - 2, curses.A_DIM)
                 row += 1
-        visible = max(0, y + height - row)
         columns = max(2, width - 2)
-        self.engine.terminal_size = (columns, max(2, visible))
-        try:
-            screen = self.engine.display(self.selected, columns, max(2, visible))
-        except (OSError, RuntimeError, ValueError) as error:
-            self.ui_error = str(error)
-            screen = self.engine.screens.get(self.selected)
-        prompt = None
-        pending = next((message for message in queue if message["state"] == "pending"), None)
-        if (session and not session.get("active") and (pending or not self._session_status(session))
-                and scroll["follow"] and (screen or not session.get("session"))):
-            prompt = Screen(columns, 2)
-            prompt.feed(prompt_bytes(live_prompt(pending["text"] if pending else "", self.state["root"], {
-                "model": {"canonical": session.get("next_model") or "Mu/session default"},
-            }), pending=True))
         prompt_height = min(visible, prompt.frame(0, 0)[1]) if prompt else 0
         output_height = visible - prompt_height
         used = 0
         if screen:
-            if screen.error:
-                self.ui_error = screen.error
             used = self._terminal_frame(screen, x + 1, row, columns, output_height, scroll)
             if screen.cols > columns:
                 hint += " · Shift-←/→ pan"
@@ -391,13 +452,36 @@ class _UI:
             return row, min(max(0, width - 1), 3 + cursor_col)
         return None
 
+    def _view_key(self, size, screen_stamp):
+        # Engine state contains mutable dictionaries shared with the scheduler.
+        # Serialize the snapshot rather than retaining aliases for comparison.
+        return (size, screen_stamp, json.dumps(self.state), self.selected, self.draft, self.cursor,
+                self.command_index, self.command_dismissed, self.sidebar_scroll,
+                tuple(self.scrolls.get(self.selected, {}).items()), self.ui_error)
+
     def _draw_main(self):
-        self.window.erase()
-        self.session_hits = []
-        self.output_rect = None
         height, width = self.window.getmaxyx()
         if height <= 0 or width <= 0:
             return
+        session = self._session()
+        output = None
+        geometry = None
+        if height >= 6:
+            geometry = self._composer_geometry(height, width)
+            label_y, composer_top, composer_rows, notice_y = geometry
+            body_y, body_height = 1, max(0, label_y - 1)
+            split = width >= 62 and body_height >= 4
+            sidebar_width = max(20, min(30, width // 3)) if split else -1
+            output = self._prepare_output(session, width - sidebar_width - 1, body_height)
+        screen = output[0] if output else None
+        screen_stamp = (screen, screen.revision) if screen else None
+        size = height, width, geometry
+        if self._view_key(size, screen_stamp) == self.drawn:
+            return
+        self.window.erase()
+        self.session_hits = []
+        self.output_rect = None
+        self.next_row_runs = {}
         title = f"Mu Board · {self.state['root']}"
         scheduler_text = self._scheduler_line()
         statistics = self._statistics_line()
@@ -421,22 +505,18 @@ class _UI:
                 self._add(height - 2, 1, self.draft, width - 2)
             if height > 1:
                 self._add(height - 1, 0, "Tab sessions · /scheduler · /quit", attr=curses.A_DIM)
-            self._cursor()
-            self.window.refresh()
+            self._refresh()
+            self.row_runs = {}
+            self.drawn = self._view_key(size, screen_stamp)
             return
 
-        label_y, composer_top, composer_rows, notice_y = self._composer_geometry(height, width)
-        body_y, body_height = 1, max(0, label_y - 1)
-        session = self._session()
-        split = width >= 62 and body_height >= 4
         if split:
-            sidebar_width = max(20, min(30, width // 3))
             self._draw_sidebar(body_y, sidebar_width, body_height)
             for row in range(body_y, body_y + body_height):
                 self._add(row, sidebar_width, "│", 1, curses.A_DIM)
-            self._draw_conversation(session, sidebar_width + 1, body_y, width - sidebar_width - 1, body_height)
+            self._draw_conversation(session, sidebar_width + 1, body_y, width - sidebar_width - 1, body_height, output)
         else:
-            self._draw_conversation(session, 0, body_y, width, body_height)
+            self._draw_conversation(session, 0, body_y, width, body_height, output)
 
         if label_y >= 0:
             self._add(label_y, 0, "─" * max(0, width - 1), attr=curses.A_DIM)
@@ -447,8 +527,9 @@ class _UI:
         if notice := self._notice():
             self._add(notice_y, 1, notice, width - 2, self.colors.get("warn", 0))
         self._add(height - 1, 1, "Tab/Shift-Tab sessions · PgUp/PgDn output · /scheduler · /help", attr=curses.A_DIM)
-        self._cursor((composer_top + cursor[0], cursor[1]) if cursor else None)
-        self.window.refresh()
+        self._refresh((composer_top + cursor[0], cursor[1]) if cursor else None)
+        self.row_runs = self.next_row_runs
+        self.drawn = self._view_key(size, screen_stamp)
 
     def _command_matches(self):
         if self.draft != self.command_query:
@@ -720,8 +801,7 @@ class _UI:
             height, width = self.window.getmaxyx()
             self._add(0, 1, "Stopping Mu…", width - 2, self.colors.get("title", 0))
             self._add(2, 1, "Waiting for owned agents to stop.", width - 2)
-            self._cursor()
-            self.window.refresh()
+            self._refresh()
             self._getch()
 
     def _pick(self, title, options, selected=0):
@@ -741,8 +821,7 @@ class _UI:
             if height >= 2:
                 self._add(height - 2, 1, self.ui_error, width - 2, self.colors.get("error", 0))
             self._add(height - 1, 0, "↑↓ select · Enter choose · Q/Esc cancel", attr=curses.A_DIM)
-            self._cursor()
-            self.window.refresh()
+            self._refresh()
             key = self._getch()
             if key in (3, 27, "q", "Q"):
                 return None
@@ -768,8 +847,7 @@ class _UI:
             for row, line in enumerate(lines[:max(0, height - 3)], 2):
                 self._add(row, 2, line, width - 4)
             self._add(height - 1, 0, "y confirm · n/Q/Esc/Enter cancel", attr=curses.A_DIM)
-            self._cursor()
-            self.window.refresh()
+            self._refresh()
             key = self._getch()
             if key in (3, 27, 10, 13, curses.KEY_ENTER, "n", "N", "q", "Q"):
                 return False
@@ -812,8 +890,7 @@ class _UI:
             for row, line in enumerate(wrapped[offset:offset + visible], 1):
                 self._add(row, 1, line, width - 2)
             self._add(height - 1, 0, "↑↓/PgUp/PgDn scroll · Q/Esc close", attr=curses.A_DIM)
-            self._cursor()
-            self.window.refresh()
+            self._refresh()
             key = self._getch()
             if key in (3, 27, "q", "Q", 10, 13, curses.KEY_ENTER):
                 return
@@ -829,6 +906,8 @@ class _UI:
     def _view_scroll(self, amount):
         scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
         visible = scroll.get("visible", 1)
+        if scroll["follow"]:
+            scroll["line"] = max(0, scroll.get("total", 0) - visible)
         scroll["line"] = max(0, scroll["line"] + amount)
         scroll["follow"] = False if amount < 0 else scroll["follow"]
         if amount > 0:
@@ -882,7 +961,8 @@ class _UI:
                         "27;5;8~": "ctrl-backspace", "27;5;127~": "ctrl-backspace"}.get(sequence)
             if key in (10, 13, curses.KEY_ENTER):
                 return 10
-            self.pending_key = key
+            if key is not None:
+                self.pending_keys.appendleft(key)
             return 27
         finally:
             self.window.timeout(50)
@@ -972,6 +1052,26 @@ class _UI:
         elif isinstance(key, str) and key.isprintable():
             self._insert(key)
 
+    def _scroll_key(self, key):
+        return bool(self._wheel(key)) or key in (
+            curses.KEY_PPAGE, curses.KEY_NPAGE, "shift-up", "shift-down",
+            "shift-left", "shift-right", "ctrl-home", "ctrl-end")
+
+    def _coalesce_scroll(self):
+        # Bound the batch so continuous wheel/key repeat cannot starve ticks.
+        try:
+            for _ in range(31):
+                self.window.timeout(0)
+                key = self._getch()
+                if key is None:
+                    break
+                if not self._scroll_key(key):
+                    self.pending_keys.appendleft(key)
+                    break
+                self._main_key(key)
+        finally:
+            self.window.timeout(50)
+
     def _main(self):
         self._draw_main()
         while not self.engine.done:
@@ -979,7 +1079,10 @@ class _UI:
             if self.engine.done:
                 break
             self._draw_main()
-            self._main_key(self._getch())
+            key = self._getch()
+            self._main_key(key)
+            if self._scroll_key(key):
+                self._coalesce_scroll()
 
 
 def run_ui(engine):
