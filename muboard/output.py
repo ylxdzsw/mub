@@ -49,11 +49,13 @@ def live_prompt(text, cwd, status):
                 model=status.get("model", {}).get("canonical") or "mu", context=context)
 
 
-def prompt_bytes(block):
+def prompt_bytes(block, *, pending=False):
     header = f"\x1b[94m{literal(block['model'])}\x1b[0m"
     if block.get("context"):
         header += f" \x1b[35m{literal(block['context'])}\x1b[0m"
     header += f" \x1b[36m{literal(block['cwd'])}\x1b[0m"
+    if pending:
+        return (header + "\nmu> ").replace("\n", "\r\n").encode()
     text = header + "\nmu> " + literal(block["text"])
     text += "\n" * max(0, 2 - (len(text) - len(text.rstrip("\n"))))
     return text.replace("\n", "\r\n").encode()

@@ -8,6 +8,8 @@ import time
 import unicodedata
 
 from .output import literal as _text
+from .output import live_prompt, prompt_bytes
+from .terminal import Screen
 
 
 def _width(text: str) -> int:
@@ -129,6 +131,7 @@ class _UI:
                     self.window.addstr(y, x + column - left, char, self._cell_style(screen, fg, bg, attrs))
                 except curses.error:
                     pass
+        return len(lines)
 
     def _add(self, y, x, text, width=None, attr=0):
         height, columns = self.window.getmaxyx()
@@ -306,14 +309,6 @@ class _UI:
         scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
         hint = " · History · Ctrl-End for live" if not scroll["follow"] else ""
         row = y + 1
-        if session and row < y + height:
-            model = session.get("next_model") or "Mu/session default"
-            active = session.get("active")
-            label = f"Model: {model} · /model session to change"
-            if active and active.get("model") != model:
-                label = f"Active: {active.get('model')} · Next: {model}"
-            self._add(row, x + 1, label, width - 2, curses.A_DIM)
-            row += 1
         if queue:
             visible = min(len(queue), 3, max(0, y + height - row - 1))
             if len(queue) > visible:
@@ -332,16 +327,29 @@ class _UI:
         except (OSError, RuntimeError, ValueError) as error:
             self.ui_error = str(error)
             screen = self.engine.screens.get(self.selected)
+        prompt = None
+        if (session and not session.get("active") and not queue and not self._session_status(session)
+                and scroll["follow"] and (screen or not session.get("session"))):
+            prompt = Screen(columns, 2)
+            prompt.feed(prompt_bytes(live_prompt("", self.state["root"], {
+                "model": {"canonical": session.get("next_model") or "Mu/session default"},
+            }), pending=True))
+        prompt_height = min(visible, prompt.frame(0, 0)[1]) if prompt else 0
+        output_height = visible - prompt_height
+        used = 0
         if screen:
             screen.attention = False
             if screen.error:
                 self.ui_error = screen.error
-            self._terminal_frame(screen, x + 1, row, columns, visible, scroll)
+            used = self._terminal_frame(screen, x + 1, row, columns, output_height, scroll)
             if screen.cols > columns:
                 hint += " · Shift-←/→ pan"
-        else:
+        elif not prompt:
             message = "Loading Mu history…" if (session and session.get("session")) or (not session and self.state["scheduler"].get("session")) else "No output yet."
             self._add(row, x + 1, message, columns, curses.A_DIM)
+        if prompt:
+            self._terminal_frame(prompt, x + 1, row + used, columns, prompt_height,
+                                 {"follow": True, "line": 0})
         self._add(y, x + 1, _clip(title, max(0, width - 2 - _width(hint))) + hint,
                   width - 2, self.colors.get("title", 0))
 
