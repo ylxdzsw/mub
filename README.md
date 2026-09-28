@@ -84,6 +84,13 @@ Scheduler status appears once in the top bar. Errors, holds, and blocking reason
 appear only when relevant; model defaults and active models are available through
 `/model`, and the full keyboard reference through `/help`.
 
+Session lists show only the ID, one status icon, and the title:
+`✎` writing, `≋` reading, `○` idle after writing, `●` idle after reading,
+`·` new/idle, `×` failed or trapped, `■` held/interrupted/stopping,
+`…` blocked, and `!` terminal attention. Idle icons reflect the last run's mode,
+not whether its output has been viewed. Active work and exceptional states take
+precedence over terminal attention. Queue details remain in the conversation pane.
+
 | Shortcut | Action |
 | --- | --- |
 | `Tab` / `Shift-Tab` | Next / previous session, wrapping around; skips scheduler output. Tab fills the selected command when the command panel is open |
@@ -135,7 +142,7 @@ list is closed; Shift-Tab always switches to the previous session.
 Use `//` to send a literal leading slash. Viewing output never sends keystrokes
 to a worker. Dialogs keep process supervision running.
 
-A workspace-owner marker (`◆`) can remain on an idle or held session. That
+A workspace-owner marker (`◆`) in the conversation header can remain on an idle or held session. That
 session still owns uncommitted changes and prevents another writer from starting.
 
 ## Scheduling

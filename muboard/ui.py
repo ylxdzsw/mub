@@ -266,16 +266,28 @@ class _UI:
             self.sidebar_scroll = index - capacity + 1
         for row, session in enumerate(sessions[self.sidebar_scroll:self.sidebar_scroll + capacity], y + 1):
             self.session_hits.append((row, width, session["id"]))
-            pending = len(self._pending(session["id"]))
-            owner = "◆" if self.state["workspace"]["owner"] == session["id"] else ""
-            suffix = f" +{pending}" if pending else ""
-            status = self._session_status(session)
-            suffix += f" {status}" if status else ""
-            attention = "!" if (screen := self.engine.screens.get(session["id"])) and screen.attention else ""
-            prefix = f"S{session['id']}{owner}{attention} "
-            name = _clip(session["name"], max(0, width - 2 - _width(prefix + suffix)))
-            self._add(row, 1, prefix + name + suffix, width - 2,
+            self._add(row, 1, self._session_label(session), width - 2,
                       curses.A_REVERSE if session["id"] == self.selected else 0)
+
+    def _session_icon(self, session):
+        active = session.get("active")
+        if active:
+            return "■" if active.get("stopping") else "≋" if active["mode"] == "readonly" else "✎"
+        if session.get("gate") in ("failed", "trapped"):
+            return "×"
+        if session.get("hold") or session.get("gate") == "interrupted":
+            return "■"
+        if session.get("blocked"):
+            return "…"
+        if (screen := self.engine.screens.get(session["id"])) and screen.attention:
+            return "!"
+        last = session.get("last")
+        if last:
+            return "●" if last["mode"] == "readonly" else "○"
+        return "·"
+
+    def _session_label(self, session):
+        return f"S{session['id']} {self._session_icon(session)} {session.get('name') or 'Session'}"
 
     def _draw_conversation(self, session, x, y, width, height):
         if width <= 0 or height <= 0:
@@ -741,13 +753,7 @@ class _UI:
     def _pick_session(self):
         sessions = self.state["sessions"]
         options = ["Scheduler · decisions and output"]
-        for session in sessions:
-            active = session.get("active")
-            status = f" · {active['kind']} active" if active else f" · {session.get('gate')}" if session.get("gate") else ""
-            pending = len(self._pending(session["id"]))
-            if pending:
-                status += f" · {pending} queued"
-            options.append(f"#{session['id']} {session.get('name') or 'Session'}{status}")
+        options.extend(self._session_label(session) for session in sessions)
         initial = self._selected_index() + 1 if self.selected is not None else 0
         choice = self._pick("Select session · Ctrl-P", options, initial)
         if choice is not None:
@@ -774,6 +780,8 @@ class _UI:
 
     def _help(self):
         lines = ["Commands:", *(f"  {name}  {description}" for name, description in self.COMMANDS.items()), "",
+                 "Session icons:", "  ✎ writing · ≋ reading · ○ idle after writing · ● idle after reading",
+                 "  · new/idle · × failed/trapped · ■ held/interrupted/stopping · … blocked · ! attention", "",
                  "Keyboard:", "  Ctrl-P         Pick a session or view scheduler output",
                  "  Tab/Shift-Tab  Next/previous session (Tab fills an open command panel)",
                  "  ↑/↓/←/→        Edit the prompt; typing always goes to the composer",
