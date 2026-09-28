@@ -8,6 +8,8 @@ input at any time—even while a session is working.
 session; the scheduler chooses between sessions. Sessions are conversations, not
 tasks with a completion lifecycle.
 
+![Per-session FIFO message queues feed an AI scheduler that coordinates one writer and multiple readers in a shared live checkout.](docs/scheduling.png)
+
 ## Run
 
 Requires Linux with pidfds, Python 3.12+, Git, and configured `mu` on PATH.
