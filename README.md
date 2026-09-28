@@ -148,16 +148,67 @@ session still owns uncommitted changes and prevents another writer from starting
 
 ## Scheduling
 
-A persistent Mu scheduler wakes on message submissions and worker exits. It can
+A bounded, persistent Mu scheduler wakes on message submissions and worker exits. It can
 run alongside workers, but only one scheduler invocation runs at a time. Events
 arriving during a scheduler turn are retained for another pass. Waiting does not
-poll the model.
+poll the model. A fixed 50 ms batching window combines nearby events without
+extending the delay on every arrival or skipping scheduling decisions.
 
 The scheduler sees pending messages, active workers, Git cleanliness, workspace
 ownership, latest worker responses, exit reasons, and complete trap evidence.
 It may dispatch several readers and at most one writer, or explain why nothing
 should run. It returns a small JSON decision as its final answer; runtime code
 validates it against current state before acting.
+
+### Scheduler context and usage
+
+Scheduler snapshots exclude UI/model-selection and process bookkeeping. Worker
+responses come from canonical Mu journal text, not PTY progress notices or screen
+redraws. Snapshots include each session's two latest materialized requests and
+final responses before any active invocation. Requests are excerpted at 2,000
+characters and responses at 3,000, with explicit omission markers and a count of
+older turns. Pending/inflight mailbox messages and trap evidence remain complete.
+Failure diagnostics are kept separately from assistant responses.
+
+Within one scheduler session, unchanged conversational evidence is referenced
+rather than resent. Scheduling policy is sent once; each pass still receives the
+current gates, holds, ownership, active workers, and FIFO mailboxes. The latest
+snapshot overrides older state, and previous decisions are not policy.
+
+Only clean scheduler sessions rotate: after 12 passes, at 32,000 context tokens
+(or half the model's context window, whichever is smaller), after compaction,
+or when scheduling policy changes. These are between-pass thresholds, not hard
+limits on a large message or tool result. A fresh session receives policy and all
+current context excerpts again. Older Mu journals are never changed or deleted;
+their IDs remain in `scheduler.previous_sessions`. Failed or interrupted turns
+still require explicit `/schedule` recovery, never automatic retry.
+
+History references point to a fixed journal byte prefix, so inspection cannot
+pull later worker output into an earlier decision. Use the read-only command:
+
+```sh
+mub context S1                           # exact requests and final responses
+mub context S1 --requests                # inspect scope and restrictions only
+mub context S1 --before 12345 --turn t3   # one turn from a snapshot's prefix
+```
+
+The scheduler must retrieve missing context before interpreting contextual
+approvals or dependencies, and inspect omitted user requests before authorizing
+writes or relaxing traps. Excerpts never imply that earlier restrictions expired.
+These checks remain model instructions, not a sandbox or a new approval system.
+
+`mub status` exposes `scheduler.last_usage`, the last 24 passes in `recent_usage`,
+and `usage_totals` accumulated from this version onward. They report provider
+requests, reported input/cached-input/output/reasoning tokens, compactions, and
+per-pass elapsed time, prompt characters, and Mu's context estimate/report.
+Reasoning tokens are included in output tokens; cached input is included in total
+input. Missing usage is unreported, not zero cost. Journals retain the detailed
+provider records. `/model` also shows the most recent scheduler pass's usage.
+
+Mu's normal system instructions, skills, and automatic compaction remain enabled;
+its current CLI has no scheduler-specific profile override.
+
+### Session names and dependencies
 
 Sessions created without a name start as `Session N`. During ordinary scheduling
 passes, the scheduler gives them short topic-based names and updates those names

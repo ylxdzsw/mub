@@ -9,7 +9,7 @@ import sys
 import time
 
 from .ipc import ControlServer, call
-from .output import replay
+from .output import conversation, journal_events, replay
 from .state import project_root, read_state
 
 
@@ -64,6 +64,11 @@ def parser():
         if name == "remove":
             command.add_argument("--discard", action="store_true", help="Discard queued/interrupted messages")
     sub.add_parser("status", help="Read board state, including when the owner is closed")
+    context = sub.add_parser("context", help="Read exact user turns and final responses from a worker journal")
+    context.add_argument("session_id", type=session_id)
+    context.add_argument("--before", type=int, help="Read only this byte prefix of the journal")
+    context.add_argument("--turn", help="Read one Mu turn ID instead of the full conversation")
+    context.add_argument("--requests", action="store_true", help="Omit responses when inspecting user scope and restrictions")
     sub.add_parser("schedule", help="Recheck scheduling; replace a failed scheduler session, never retry it")
     models = sub.add_parser("models", help="List models or save scheduler/worker choices")
     models.add_argument("--scheduler")
@@ -87,6 +92,18 @@ def main():
                 result = call(root, dict(op="status"))
             except RuntimeError:
                 result = dict(read_state(root), root=str(root), owner_running=False)
+        elif command == "context":
+            session = next((s for s in read_state(root)["sessions"] if s["id"] == args.session_id), None)
+            if not session:
+                raise ValueError("Unknown session")
+            result = conversation(journal_events(root, session["session"], before=args.before)) if session["session"] else dict(omitted_turns=0, turns=[])
+            if args.turn:
+                result["turns"] = [t for t in result["turns"] if t["turn_id"] == args.turn]
+                if not result["turns"]:
+                    raise ValueError("Unknown turn in this journal prefix")
+            if args.requests:
+                for turn in result["turns"]:
+                    del turn["response"]
         elif command == "logs":
             try:
                 result = call(root, dict(op="output", session_id=args.session_id))

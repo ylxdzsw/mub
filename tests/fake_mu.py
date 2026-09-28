@@ -127,13 +127,17 @@ def main():
     data["invocations"].append(dict(args=args, prompt=prompt, role=role, tty=sys.stdout.isatty()))
     if not retry:
         data["prompt"] = prompt
+        data["turn_id"] = f"t{len(data['invocations'])}"
         model = args[args.index("-m") + 1] if "-m" in args else "fake/model"
         data["transcript"] += f"\n{model} ~42% {ROOT}\nmu> " + prompt + "\n"
         with (JOURNALS / f"{key}.jsonl").open("a") as journal:
             prompt_id = f"p{len(data['invocations'])}"
             journal.write(json.dumps(dict(type="prompt_queued", prompt_id=prompt_id, cwd=str(ROOT),
                                           prompt=dict(kind="text", text=prompt))) + "\n")
-            journal.write(json.dumps(dict(type="prompt_materialized", prompt_id=prompt_id)) + "\n")
+            journal.write(json.dumps(dict(type="prompt_materialized", prompt_id=prompt_id, turn_id=data["turn_id"])) + "\n")
+    exchange_id = f"e{len(data['invocations'])}"
+    with (JOURNALS / f"{key}.jsonl").open("a") as journal:
+        journal.write(json.dumps(dict(type="provider_requested", turn_id=data["turn_id"], exchange_id=exchange_id)) + "\n")
     save(path, data)
     if role == "worker":
         print("LIVE: worker started", flush=True)
@@ -142,6 +146,10 @@ def main():
         data.update(clean=clean, active=dict(busy=False))
         data["transcript"] += "\nassistant: " + text + "\n"
         save(path, data)
+        with (JOURNALS / f"{key}.jsonl").open("a") as journal:
+            journal.write(json.dumps(dict(type="provider_completed", exchange_id=exchange_id,
+                usage=dict(input_tokens=100, cache_read_input_tokens=60, output_tokens=20, reasoning_output_tokens=5),
+                projection=dict(kind="assistant", items=[dict(type="text", text=text)] if clean else []))) + "\n")
         print(text, flush=True)
         return code
 

@@ -289,6 +289,16 @@ class _UI:
         status = "error" if scheduler.get("error") else "active" if scheduler["active"] else "idle"
         return f"Scheduler {status}"
 
+    def _scheduler_usage_lines(self):
+        usage = self.state["scheduler"].get("last_usage")
+        if not usage:
+            return []
+        return ["Scheduler last pass:",
+                f"  Input {usage.get('input_tokens', 'unreported')} · cached {usage.get('cache_read_input_tokens', 'unreported')}",
+                f"  Output {usage.get('output_tokens', 'unreported')} · reasoning {usage.get('reasoning_output_tokens', 'unreported')} (included in output)",
+                f"  {usage['seconds']:.2f}s · {usage.get('requests', '?')} requests · {usage.get('compactions', '?')} compactions",
+                f"  Context {usage.get('context_tokens')} / {usage.get('context_window')} ({usage.get('context_usage_source')})", ""]
+
     def _statistics_line(self):
         sessions = self.state["sessions"]
         running = sum(bool(session.get("active")) for session in sessions)
@@ -683,7 +693,8 @@ class _UI:
                     *(f"{label} active: {active.get('model') or 'Mu/session default'} · {active['mode']}"
                       for label, active in [("Scheduler", self.state["scheduler"]["active"]),
                                             *((f"S{s['id']}", s.get("active")) for s in self.state["sessions"])]
-                      if active), "",
+                    if active), "",
+                    *self._scheduler_usage_lines(),
                     "Use /model session to change only the selected session.",
                     "Use /model scheduler, /model worker, or /model both to change defaults.",
                     "Changes apply to later invocations; active workers keep their current model.",

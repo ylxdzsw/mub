@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 
 from muboard.engine import Engine, owned_members
 from muboard.ipc import ControlServer
-from muboard.output import live_prompt, plain_output, prompt_bytes
+from muboard.output import conversation, excerpt, journal_events, live_prompt, plain_output, prompt_bytes, scheduler_usage
 from muboard.terminal import Capture, Screen
 from muboard.state import read_state
 from muboard.ui import _UI
@@ -273,6 +273,91 @@ class SchedulerSmoke(unittest.TestCase):
     def journal(self, session):
         return json.loads((self.root / ".mu/fake" / (session["session"] + ".json")).read_text())
 
+    def test_batched_snapshots_rotation_and_usage(self):
+        board = self.board()
+        board.scheduler_turn_limit = 100
+        first = self.new(board, "read design; do not write")
+        board.tick()
+        self.assertIsNone(board._running(None))
+        second = self.new(board, "read independent")
+        self.until(board, lambda: board._running(None) is not None)
+        snapshot = board._running(None)["snapshot"]
+        self.assertEqual(len(snapshot["messages"]), 2)
+        self.assertNotIn("models", snapshot)
+        self.assertNotIn("next_model", snapshot["sessions"][0])
+        self.until(board, board.idle)
+        scheduler = board.data["scheduler"]
+        old = scheduler["session"]
+        prompts = self.journal(scheduler)["invocations"]
+        self.assertGreaterEqual(len(prompts), 2)
+        self.assertIn("You schedule messages", prompts[0]["prompt"])
+        self.assertTrue(all("You schedule messages" not in p["prompt"] for p in prompts[1:]))
+        self.assertEqual(first["last"]["summary"], "Handled: read design; do not write")
+        self.assertNotIn("LIVE:", first["last"]["summary"])
+        self.assertEqual(scheduler["usage_totals"]["input_tokens"], 100 * len(prompts))
+        self.assertEqual(scheduler["last_usage"]["cache_read_input_tokens"], 60)
+        self.assertEqual(scheduler["last_usage"]["reasoning_output_tokens"], 5)
+        self.assertGreater(scheduler["last_usage"]["seconds"], 0)
+        snapshot = board._scheduler_snapshot()
+        payload = json.loads(board._scheduler_prompt(snapshot, bootstrap=False).split("SNAPSHOT:\n", 1)[1])
+        self.assertTrue(payload["sessions"][0]["context"]["unchanged"])
+        payload = json.loads(board._scheduler_prompt(snapshot).split("SNAPSHOT:\n", 1)[1])
+        self.assertIn("turns", payload["sessions"][0]["context"])
+
+        board.scheduler_turn_limit = scheduler["turns"]
+        board.request(dict(op="send", session_id=first["id"], text="read follow-up"))
+        self.until(board, lambda: board._running(None) is not None)
+        snapshot = board._running(None)["snapshot"]
+        self.assertNotEqual(scheduler["session"], old)
+        self.assertIn(old, scheduler["previous_sessions"])
+        self.assertTrue((self.root / ".mu/sessions" / f"{old}.jsonl").exists())
+        context = snapshot["sessions"][0]["context"]
+        self.assertEqual(context["turns"][0]["request"], "read design; do not write")
+        self.assertEqual(context["turns"][0]["response"], first["last"]["summary"])
+        self.until(board, board.idle)
+        board.request(dict(op="send", session_id=first["id"], text="read third"))
+        self.until(board, board.idle)
+        snapshot = board._scheduler_snapshot()
+        context = snapshot["sessions"][0]["context"]
+        self.assertEqual(context["omitted_turns"], 1)
+        self.assertEqual([t["request"] for t in context["turns"]], ["read follow-up", "read third"])
+        result = subprocess.check_output([sys.executable, "-m", "muboard", "-C", str(self.root),
+            "context", f"S{first['id']}", "--before", context["read"].split()[-1], "--turn", "t1"],
+            env=dict(os.environ, PYTHONPATH=str(ROOT)))
+        self.assertEqual(json.loads(result)["turns"][0]["request"], "read design; do not write")
+        board.close()
+        reopened = self.board()
+        self.assertEqual(reopened._scheduler_snapshot()["sessions"][0]["context"], context)
+        self.assertEqual(len(self.journal(second)["invocations"]), 1)
+
+    def test_canonical_responses_and_compaction_accounting(self):
+        events = [dict(type="prompt_queued", prompt_id="q1", prompt=dict(text="Discuss only")),
+                  dict(type="prompt_materialized", prompt_id="q1", turn_id="t1"),
+                  dict(type="provider_requested", exchange_id="e1", turn_id="t1"),
+                  dict(type="provider_completed", exchange_id="e1", projection=dict(kind="assistant", items=[
+                      dict(type="text", text="Inspecting"), dict(type="bash_call", arguments="{}")])),
+                  dict(type="provider_requested", exchange_id="e2", turn_id="t1"),
+                  dict(type="provider_completed", exchange_id="e2", usage=dict(input_tokens=10, output_tokens=2),
+                       projection=dict(kind="assistant", items=[dict(type="text", text="The actual answer")])),
+                  dict(type="provider_requested", exchange_id="e3", turn_id="compact"),
+                  dict(type="provider_completed", exchange_id="e3", usage=dict(input_tokens=20, output_tokens=3),
+                       projection=dict(kind="assistant", items=[dict(type="text", text="Do not use this checkpoint")])),
+                  dict(type="compaction_applied")]
+        context = conversation(events)
+        self.assertEqual(context["turns"], [dict(turn_id="t1", request="Discuss only", response="The actual answer")])
+        usage = scheduler_usage(events)
+        self.assertEqual((usage["requests"], usage["input_tokens"], usage["output_tokens"], usage["compactions"]), (3, 30, 5, 1))
+        self.assertIn("omitted", excerpt("a" * 100, 20))
+        board = self.board()
+        session = board._mu("new")
+        path = self.root / ".mu/sessions" / f"{session}.jsonl"
+        end = path.stat().st_size
+        with path.open("a") as stream:
+            stream.write('{"type":')
+        self.assertEqual(len(list(journal_events(self.root, session, before=end))), 1)
+        with self.assertRaisesRegex(ValueError, "Incomplete"):
+            list(journal_events(self.root, session))
+
     def test_evolving_names_and_user_ownership(self):
         board = self.board()
         auto = self.new(board, "read naming design")
@@ -334,8 +419,7 @@ class SchedulerSmoke(unittest.TestCase):
         board = self.board()
         raw = "  read first\n<example>α & β</example>\n\n"
         first = self.new(board, raw)
-        board.tick()
-        self.assertIsNotNone(board._running(None))
+        self.until(board, lambda: board._running(None) is not None)
         second = self.new(board, "read independent")
         board.request(dict(op="send", session_id=first["id"], text="read second"))
         saved = read_state(self.root)

@@ -1,6 +1,7 @@
 """Mu owns durable conversation history; mub only buffers live output."""
 
 import json
+from collections import deque
 from pathlib import Path
 import re
 import subprocess
@@ -11,11 +12,74 @@ def journal_path(root, session):
     return Path(root) / ".mu" / "sessions" / f"{session}.jsonl"
 
 
+def journal_events(root, session, offset=0, before=None):
+    """Read a fixed journal prefix, never a concurrently appended partial event."""
+    with journal_path(root, session).open("rb") as stream:
+        size = stream.seek(0, 2)
+        end = size if before is None else before
+        if not 0 <= offset <= end <= size:
+            raise ValueError("Invalid Mu journal byte range")
+        stream.seek(offset)
+        while stream.tell() < end:
+            line = stream.readline(end - stream.tell())
+            if not line or not line.endswith(b"\n"):
+                raise ValueError("Incomplete Mu journal event in snapshot")
+            if line.strip():
+                yield json.loads(line)
+
+
+def excerpt(text, limit):
+    if len(text) <= limit:
+        return text
+    half = limit // 2
+    return text[:half] + "\n[… omitted; read the journal context before deciding …]\n" + text[-half:]
+
+
+def conversation(events, *, limit=None):
+    """Canonical user turns and final responses; no renderer noise or compaction prose."""
+    turns = deque(maxlen=limit)
+    queued, requests = {}, {}
+    current = None
+    count = 0
+    for event in events:
+        kind = event["type"]
+        if kind == "prompt_queued":
+            queued[event["prompt_id"]] = event["prompt"]["text"]
+        elif kind == "prompt_materialized":
+            current = dict(turn_id=event["turn_id"], request=queued.pop(event["prompt_id"]), response="")
+            turns.append(current)
+            count += 1
+        elif kind == "provider_requested":
+            # Synthetic compaction turns have no materialized user prompt.
+            requests[event["exchange_id"]] = current if current and event["turn_id"] == current["turn_id"] else None
+        elif kind == "provider_completed":
+            turn = requests.pop(event["exchange_id"], None)
+            projection = event.get("projection", {})
+            items = projection.get("items", [])
+            if turn is not None and projection.get("kind") == "assistant" and not any(i["type"] == "bash_call" for i in items):
+                text = "\n".join(i["text"] for i in items if i["type"] == "text")
+                if text:
+                    turn["response"] = text
+    return dict(omitted_turns=count - len(turns), turns=list(turns))
+
+
+def scheduler_usage(events):
+    totals = {}
+    requests = compactions = reports = 0
+    for event in events:
+        requests += event["type"] == "provider_requested"
+        compactions += event["type"] == "compaction_applied"
+        if event["type"] == "provider_completed" and event.get("usage"):
+            reports += 1
+            for key, value in event["usage"].items():
+                if isinstance(value, int):
+                    totals[key] = totals.get(key, 0) + value
+    return dict(requests=requests, usage_reports=reports, compactions=compactions, **totals)
+
+
 def delivery(root, session, offset, clean):
     """Read only the appended part of a Mu journal, never infer delivery from exit alone."""
-    with journal_path(root, session).open("rb") as stream:
-        stream.seek(offset)
-        events = [json.loads(line) for line in stream if line.strip()]
+    events = list(journal_events(root, session, offset))
     queued = {e["prompt_id"] for e in events if e["type"] == "prompt_queued"}
     materialized = {e["prompt_id"] for e in events if e["type"] == "prompt_materialized"}
     if not queued:
