@@ -265,6 +265,16 @@ start with `--trap destructive`; the scheduler can choose `off` when that broade
 permission is justified. A subsequent normal turn gets a fresh access/trap
 policy. Single-command approval is not implemented.
 
+Before a dirty handoff, the scheduler prefers the owner's next FIFO message when
+it directly continues the uncommitted work and both naturally fit in one coherent
+commit. Relatedness is inferred from messages and worker outcomes, not code review.
+This soft preference can outweigh global submission order, but not explicit user
+priorities or prerequisites. It is reassessed after each turn: the scheduler does
+not skip messages, drain unrelated work, indefinitely delay other writers, or wait
+for a possible future follow-up. Holds, recovery gates, and writer ownership still
+apply, and independent readers may still run. This avoids commit boundaries solely
+for session switching without requiring the worker to combine commits.
+
 For a dirty handoff, the scheduler may ask the owning session to commit only its
 completed, task-owned changes or explain why it cannot. This is a visibly
 scheduler-authored request, which may precede queued user messages. It is not an
