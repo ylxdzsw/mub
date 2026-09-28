@@ -46,7 +46,8 @@ Independent readers drain every worker PTY, including hidden/headless sessions.
 Scheduler JSON stays on a separate non-terminal path. CLI logs and trap evidence
 use complete captured output rather than a bounded screen snapshot.
 The composer is always active, sends to the selected session, and grows with its
-draft. There is no pane focus: typing edits the prompt, Tab switches sessions,
+draft. There is no pane focus: typing edits the prompt, Tab completes an open
+command panel or switches sessions otherwise,
 and output navigation leaves the prompt cursor alone. Dialogs and pickers
 temporarily take keyboard input.
 Mailbox entries are labeled
@@ -85,7 +86,7 @@ appear only when relevant; model defaults and active models are available throug
 
 | Shortcut | Action |
 | --- | --- |
-| `Tab` / `Shift-Tab` | Next / previous session, wrapping around; skips scheduler output |
+| `Tab` / `Shift-Tab` | Next / previous session, wrapping around; skips scheduler output. Tab fills the selected command when the command panel is open |
 | `↑` / `↓` / `←` / `→` | Move the prompt cursor (or select/fill a visible slash command) |
 | `Enter` | Queue a message |
 | `Shift-Enter`, `Alt-Enter`, or `Ctrl-J` | Insert a newline |
@@ -126,10 +127,10 @@ Local commands:
 - `/help`, `/quit`.
 
 Typing `/` in the composer opens a bounded command list, filtered as you type.
-Use `↑` / `↓` to select, `→` at the end of the draft to fill the command before
+Use `↑` / `↓` to select, `Tab` or `→` at the end of the draft to fill the command before
 adding arguments, `Enter` to run it, or `Esc` to hide the list. At most five commands are shown;
-the list scrolls with the selection. Tab and Shift-Tab always switch sessions,
-including while this list is visible.
+the list scrolls with the selection. Tab switches sessions only when the command
+list is closed; Shift-Tab always switches to the previous session.
 
 Use `//` to send a literal leading slash. Viewing output never sends keystrokes
 to a worker. Dialogs keep process supervision running.

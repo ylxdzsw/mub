@@ -443,7 +443,7 @@ class _UI:
         box_width = min(88, width - 2)
         top = bottom - visible - 2
         start = max(0, min(self.command_index - visible + 1, len(matches) - visible))
-        header = f" Commands {self.command_index + 1}/{len(matches)} · ↑↓ select · → fill · Enter run · Esc hide "
+        header = f" Commands {self.command_index + 1}/{len(matches)} · ↑↓ select · Tab/→ fill · Enter run · Esc hide "
         self._add(top, 1, "┌" + _clip(header, box_width - 2).ljust(box_width - 2, "─") + "┐", box_width, curses.A_DIM)
         for row, index in enumerate(range(start, start + visible), top + 1):
             name, description = matches[index]
@@ -458,10 +458,11 @@ class _UI:
             return False
         if key in (curses.KEY_UP, curses.KEY_DOWN):
             self.command_index = max(0, min(len(matches) - 1, self.command_index + (-1 if key == curses.KEY_UP else 1)))
-        elif key in (curses.KEY_RIGHT, 13, curses.KEY_ENTER):
+        elif key in (9, curses.KEY_RIGHT, 13, curses.KEY_ENTER):
             name = matches[self.command_index][0].split()[0]
-            self._set_draft(name + (" " if key == curses.KEY_RIGHT else ""))
-            if key != curses.KEY_RIGHT:
+            fill = key in (9, curses.KEY_RIGHT)
+            self._set_draft(name + (" " if fill else ""))
+            if not fill:
                 self._submit()
         else:
             return False
@@ -786,7 +787,7 @@ class _UI:
     def _help(self):
         lines = ["Commands:", *(f"  {name}  {description}" for name, description in self.COMMANDS.items()), "",
                  "Keyboard:", "  Ctrl-P         Pick a session or view scheduler output",
-                 "  Tab/Shift-Tab  Next/previous session (wraps; skips scheduler)",
+                 "  Tab/Shift-Tab  Next/previous session (Tab fills an open command panel)",
                  "  ↑/↓/←/→        Edit the prompt; typing always goes to the composer",
                  "  Shift-↑/↓      Scroll output one line", "  Shift-←/→      Pan wider output after resize",
                  "  Ctrl-Home/End  Oldest retained output / follow live output",
@@ -796,7 +797,7 @@ class _UI:
                  "  Shift-drag     Native terminal selection in terminals supporting this bypass",
                  "  Ctrl-C         Clear the draft only; /interrupt stops and holds the session",
                  "  Ctrl-Q         Quit; confirms before stopping active agents",
-                 "  /              List commands; ↑/↓ select, → fill, Enter run, Esc hide",
+                 "  /              List commands; ↑/↓ select, Tab/→ fill, Enter run, Esc hide",
                  "  Q/Esc          Close information screens or cancel pickers",
                  "  Home/End       Start/end of line", "  Ctrl-←/→       Jump between words",
                  "  Ctrl-Backspace Delete previous word"]
@@ -905,13 +906,13 @@ class _UI:
         if key == 16:
             self._pick_session()
             return
+        if self._command_key(key):
+            return
         if key == 9:
             self._cycle_session(1)
             return
         if key == curses.KEY_BTAB:
             self._cycle_session(-1)
-            return
-        if self._command_key(key):
             return
         if key == 27:
             self.command_dismissed = True
