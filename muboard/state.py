@@ -7,9 +7,14 @@ from pathlib import Path
 import subprocess
 
 
-def project_root(directory):
+def project_root(directory, *, initialize=False):
     result = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=directory,
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, env=dict(os.environ, LC_ALL="C"))
+    if result.returncode and initialize and "not a git repository" in result.stderr:
+        result = subprocess.run(["git", "init", "--initial-branch=master"], cwd=directory,
+                                capture_output=True, text=True)
+        if not result.returncode:
+            return project_root(directory)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "mub requires a Git worktree")
     return Path(result.stdout.strip()).resolve()

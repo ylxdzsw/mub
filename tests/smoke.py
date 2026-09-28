@@ -542,7 +542,8 @@ class SchedulerSmoke(unittest.TestCase):
     def test_tui_session_composer_interrupt_and_quit(self):
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
-        process = subprocess.Popen([sys.executable, str(ROOT / "mub"), "-C", str(self.root), "--mu", str(FAKE)],
+        process = subprocess.Popen([sys.executable, "-m", "muboard", "-C", str(self.root), "--mu", str(FAKE)],
+                                   cwd=ROOT,
                                    stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, TERM="xterm-256color"),
                                    start_new_session=True)
         os.close(slave)

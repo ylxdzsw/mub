@@ -37,7 +37,7 @@ def run_options(parser, suppressed=False):
 
 def parser():
     p = argparse.ArgumentParser(prog="mub", description="Mu sessions with scheduled message delivery")
-    p.add_argument("-C", "--project", help="Directory in the Git worktree (default: current directory)")
+    p.add_argument("-C", "--project", help="Project directory (default: current directory; run initializes Git if needed)")
     run_options(p)
     sub = p.add_subparsers(dest="command")
     run_options(sub.add_parser("run", help="Open the session TUI (default)"), True)
@@ -76,11 +76,12 @@ def parser():
 def main():
     args = parser().parse_args()
     try:
-        root = project_root(Path(args.project or Path.cwd()).resolve())
         command = args.command or "run"
+        directory = Path(args.project or Path.cwd()).resolve()
         if command == "run":
-            run(root, args)
+            run(directory, args)
             return
+        root = project_root(directory)
         if command == "status":
             try:
                 result = call(root, dict(op="status"))
@@ -149,6 +150,7 @@ def run(root, args):
     if not mu:
         raise ValueError(f"Mu executable not found: {args.mu}")
     from .engine import Engine
+    root = project_root(root, initialize=True)
     engine = Engine(root, mu=mu, scheduler_model=args.scheduler_model or args.model,
                     worker_model=args.worker_model or args.model)
     previous = {}

@@ -18,12 +18,18 @@ terminal server, or system terminal library is needed.
 ```sh
 uv tool install .
 mub -C /path/to/worktree
-# From the checkout, with dependencies managed by uv:
-uv run ./mub -C /path/to/worktree
+# From the checkout (requires uv; manages dependencies automatically):
+./mub -C /path/to/worktree
+# Refresh an existing tool installation after updating the checkout:
+uv tool install --force .
 ```
 
 All directories in a Git worktree resolve to the same board at its root. Only
 one mub owner may run in that worktree. Mu invocations run at the worktree root.
+Existing branches (including an unborn branch) and detached HEADs are left
+unchanged. When starting a board outside a Git repository, mub initializes the
+selected directory on `master`; read-only commands such as `status` never
+initialize Git. mub does not switch branches or choose a remote's default branch.
 Do not run another editing agent against the same checkout outside mub.
 
 ## UI
