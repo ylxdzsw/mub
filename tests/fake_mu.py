@@ -91,7 +91,7 @@ def main():
         return 0
     if args[0] == "new":
         key = "fake-" + uuid.uuid4().hex[:12]
-        save(STORE / f"{key}.json", dict(clean=True, active=dict(busy=False), transcript="", invocations=[]))
+        save(STORE / f"{key}.json", dict(clean=True, active=dict(busy=False), transcript="", invocations=[], new_args=args))
         (JOURNALS / f"{key}.jsonl").write_text(json.dumps(dict(type="meta", session_id=key)) + "\n")
         print(key)
         return 0

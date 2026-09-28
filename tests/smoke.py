@@ -3,6 +3,7 @@
 import fcntl
 import curses
 from concurrent.futures import Future
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -289,6 +290,11 @@ class SchedulerSmoke(unittest.TestCase):
         scheduler = board.data["scheduler"]
         old = scheduler["session"]
         prompts = self.journal(scheduler)["invocations"]
+        self.assertEqual(self.journal(scheduler)["new_args"], ["new", "--no-context"])
+        self.assertTrue(all("--no-context" in p["args"] for p in prompts))
+        for worker in (first, second):
+            self.assertEqual(self.journal(worker)["new_args"], ["new"])
+            self.assertTrue(all("--no-context" not in p["args"] for p in self.journal(worker)["invocations"]))
         self.assertGreaterEqual(len(prompts), 2)
         self.assertIn("You schedule messages", prompts[0]["prompt"])
         self.assertTrue(all("You schedule messages" not in p["prompt"] for p in prompts[1:]))
@@ -309,6 +315,7 @@ class SchedulerSmoke(unittest.TestCase):
         self.until(board, lambda: board._running(None) is not None)
         snapshot = board._running(None)["snapshot"]
         self.assertNotEqual(scheduler["session"], old)
+        self.assertEqual(self.journal(scheduler)["new_args"], ["new", "--no-context"])
         self.assertIn(old, scheduler["previous_sessions"])
         self.assertTrue((self.root / ".mu/sessions" / f"{old}.jsonl").exists())
         context = snapshot["sessions"][0]["context"]
@@ -357,6 +364,18 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(len(list(journal_events(self.root, session, before=end))), 1)
         with self.assertRaisesRegex(ValueError, "Incomplete"):
             list(journal_events(self.root, session))
+
+    def test_existing_scheduler_keeps_its_session(self):
+        board = self.board()
+        old = board._mu("new")
+        scheduler = board.data["scheduler"]
+        scheduler.update(session=old, policy_hash=hashlib.sha256(board._scheduler_policy().encode()).hexdigest())
+        board.request(dict(op="schedule"))
+        self.until(board, board.idle)
+        self.assertIsNone(scheduler["error"])
+        self.assertEqual(scheduler["session"], old)
+        self.assertEqual(self.journal(scheduler)["new_args"], ["new"])
+        self.assertIn("--no-context", self.journal(scheduler)["invocations"][0]["args"])
 
     def test_evolving_names_and_user_ownership(self):
         board = self.board()
@@ -474,6 +493,7 @@ class SchedulerSmoke(unittest.TestCase):
             self.assertEqual(turns[0]["prompt"], "write one" if session is writer1 else "write two")
             self.assertTrue(turns[1]["prompt"].startswith("<system-request>\n"))
             self.assertTrue(turns[1]["prompt"].endswith("\n</system-request>"))
+            self.assertTrue(all("--no-context" not in t["args"] for t in turns))
 
     def test_interrupt_holds_and_new_message_is_not_retry_permission(self):
         board = self.board()
@@ -513,6 +533,7 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(turns[0]["args"][turns[0]["args"].index("--trap") + 1], "reversible")
         self.assertIn("retry", turns[1]["args"])
         self.assertEqual(turns[1]["args"][turns[1]["args"].index("--trap") + 1], "off")
+        self.assertTrue(all("--no-context" not in t["args"] for t in turns))
         self.assertEqual(board.output(session["id"])["text"].count("mu> "), 1)
         snapshots = [json.loads(p.read_text()) for p in (self.root / ".mu/fake").glob("snapshot-*")]
         trapped = next(s for snap in snapshots for s in snap["sessions"] if s["gate"] == "trapped")

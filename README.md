@@ -205,8 +205,15 @@ Reasoning tokens are included in output tokens; cached input is included in tota
 input. Missing usage is unreported, not zero cost. Journals retain the detailed
 provider records. `/model` also shows the most recent scheduler pass's usage.
 
-Mu's normal system instructions, skills, and automatic compaction remain enabled;
-its current CLI has no scheduler-specific profile override.
+Scheduler creation and every scheduler invocation use Mu's `--no-context`,
+omitting skills and global/project `AGENTS.md` while retaining the system preamble,
+runtime, tools, and configuration. Passing it on every invocation also keeps
+automatic compaction's new system prompt lean. Workers retain normal context,
+including retries and commit handoffs. This requires a Mu version supporting
+`--no-context`.
+
+Existing schedulers are not rotated just to apply this option: their persisted
+system prompt remains until compaction or the normal rotation rules take effect.
 
 ### Session names and dependencies
 

@@ -471,13 +471,13 @@ SNAPSHOT:
                          or (old_status.get("context_tokens") or 0) >= limit
                          or target.get("last_usage", {}).get("compactions", 0) > 0)
             if bootstrap:
-                replacement = self._mu("new")
+                replacement = self._mu("new", "--no-context")
                 self._archive_scheduler()
                 target.update(session=replacement, turns=0)
                 status = None
                 self.store.save()
         if not target["session"]:
-            target["session"] = self._mu("new")
+            target["session"] = self._mu("new", *(["--no-context"] if kind == "scheduler" else []))
             if kind == "scheduler":
                 target["turns"] = 0
             self.store.save()
@@ -568,6 +568,8 @@ Commit only this session's completed, task-owned changes so another writer can p
             env["MUB_SOCKET"] = str(self.server.path)
         args = [self.mu, *(["retry"] if action == "retry" else []), "-s", mu_session,
                 "-o", "final" if kind == "scheduler" else "concise", "--trap", record["trap"]]
+        if kind == "scheduler":
+            args.append("--no-context")
         if model:
             args += ["-m", model]
         ready, release = os.pipe()
