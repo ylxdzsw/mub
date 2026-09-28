@@ -247,6 +247,14 @@ class _UI:
         status = "error" if scheduler.get("error") else "active" if scheduler["active"] else "idle"
         return f"Scheduler {status}"
 
+    def _statistics_line(self):
+        sessions = self.state["sessions"]
+        running = sum(bool(session.get("active")) for session in sessions)
+        queued = sum(message["state"] == "pending" for message in self.state["messages"])
+        ready = sum(not any(session.get(key) for key in ("active", "hold", "gate", "blocked"))
+                    for session in sessions)
+        return f"{running} running · {queued} queued · {ready} ready"
+
     def _session_status(self, session):
         active = session.get("active")
         if session.get("hold"):
@@ -397,9 +405,14 @@ class _UI:
         height, width = self.window.getmaxyx()
         if height <= 0 or width <= 0:
             return
+        title = f"Mu Board · {self.state['root']}"
         scheduler_text = self._scheduler_line()
-        scheduler_x = max(1, width - len(scheduler_text) - 1)
-        self._add(0, 1, f"Mu Board · {self.state['root']}", max(0, scheduler_x - 2), curses.A_DIM)
+        statistics = self._statistics_line()
+        summary = f"{statistics} · {scheduler_text}"
+        if _width(title) + _width(summary) + 4 <= width:
+            scheduler_text = summary
+        scheduler_x = max(1, width - _width(scheduler_text) - 1)
+        self._add(0, 1, title, max(0, scheduler_x - 2), curses.A_DIM)
         if width > 1:
             self._add(0, scheduler_x, scheduler_text, attr=curses.A_DIM)
 
