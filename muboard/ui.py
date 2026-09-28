@@ -414,7 +414,7 @@ class _UI:
 
         if label_y >= 0:
             self._add(label_y, 0, "─" * max(0, width - 1), attr=curses.A_DIM)
-            recipient = f"To S{session['id']} · {session['name']}" if session else "Scheduler · commands only · /new to create a session"
+            recipient = f"To S{session['id']} · {session['name']}" if session else "New session · type a message to start"
             self._add(label_y, 1, f" {recipient} ", width - 3, self.colors.get("title", 0))
         cursor = self._draw_composer(label_y, composer_top, composer_rows, width)
         self._draw_commands(label_y, width)
@@ -518,11 +518,13 @@ class _UI:
         if text.startswith("/") and not text.startswith("//"):
             self._command(text)
             return
-        if self.selected is None:
-            self.ui_error = "No session selected. Create one with /new [name]."
-            return
         message = text[1:] if text.startswith("//") else self.draft
-        if self._request({"op": "send", "session_id": self.selected, "text": message}) is not None:
+        if self.selected is None:
+            result = self._request({"op": "new", "text": message})
+            if result is not None:
+                self._set_draft("")
+                self._select(result["session_id"])
+        elif self._request({"op": "send", "session_id": self.selected, "text": message}) is not None:
             self._set_draft("")
 
     def _command(self, text):

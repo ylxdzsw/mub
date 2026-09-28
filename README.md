@@ -73,7 +73,8 @@ requests, terminal replies, graphics and external notifications are not forwarde
 The engine interprets alternate screens and cursor controls, but mub does not
 forward keyboard/mouse input or claim to host arbitrary interactive applications.
 
-Create a session with `/new [name]`, then type its first message. Use `Ctrl-P` to
+Type your first message to automatically create a session, or use `/new [name]`
+to create one explicitly. Use `Ctrl-P` to
 pick a session or inspect the scheduler's decisions and output.
 The conversation pane shows the session's model even before its first message.
 Use `/model session` to choose a model and reasoning effort for that session only,
