@@ -661,11 +661,6 @@ class _UI:
         if session is None:
             self.ui_error = "Select a session to resume."
             return
-        if session.get("gate"):
-            name = session.get("name") or f"Session {session['id']}"
-            if not self._confirm("Retry interrupted turn?",
-                                 f"Resuming {name} explicitly authorizes retrying its interrupted turn. Continue?"):
-                return
         self._request({"op": "resume", "session_id": session["id"]})
 
     def _models(self, role):
