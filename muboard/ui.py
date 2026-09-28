@@ -604,6 +604,9 @@ class _UI:
         if session is None:
             self.ui_error = "Select a session to close."
             return
+        if session.get("active"):
+            self.ui_error = "Session is not idle; wait for it to finish or use /interrupt before closing."
+            return
         session_id = session["id"]
         messages = self._pending(session_id)
         discard = bool(messages)
@@ -796,6 +799,7 @@ class _UI:
                  "  Mouse wheel    Scroll output under the pointer; click a sidebar session to select it",
                  "  Shift-drag     Native terminal selection in terminals supporting this bypass",
                  "  Ctrl-C         Clear the draft only; /interrupt stops and holds the session",
+                 "  Ctrl-D         Close the selected idle session; quit if no sessions remain",
                  "  Ctrl-Q         Quit; confirms before stopping active agents",
                  "  /              List commands; ↑/↓ select, Tab/→ fill, Enter run, Esc hide",
                  "  Q/Esc          Close information screens or cancel pickers",
@@ -899,6 +903,12 @@ class _UI:
             return
         if key == 3:
             self._set_draft("")
+            return
+        if key == 4:
+            if self.state["sessions"]:
+                self._close()
+            else:
+                self._quit()
             return
         if key == 17:
             self._quit()

@@ -98,6 +98,7 @@ appear only when relevant; model defaults and active models are available throug
 | Click a sidebar session | Select it, keeping input in the composer |
 | `Ctrl-P` | Session picker, including scheduler output |
 | `Ctrl-C` | Clear the draft only, even if already empty; use `/interrupt` to stop work |
+| `Ctrl-D` (EOF) | Close the selected session (warn if not idle); quit if no sessions are open |
 | `Q` / `Esc` in dialogs | Close information screens or cancel a picker |
 | `Ctrl-Q` | Quit; confirm before stopping active agents |
 | `Home` / `End` in composer | Start / end of line |
