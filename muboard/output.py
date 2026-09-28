@@ -54,10 +54,9 @@ def prompt_bytes(block, *, pending=False):
     if block.get("context"):
         header += f" \x1b[35m{literal(block['context'])}\x1b[0m"
     header += f" \x1b[36m{literal(block['cwd'])}\x1b[0m"
-    if pending:
-        return (header + "\nmu> ").replace("\n", "\r\n").encode()
     text = header + "\nmu> " + literal(block["text"])
-    text += "\n" * max(0, 2 - (len(text) - len(text.rstrip("\n"))))
+    if not pending:
+        text += "\n" * max(0, 2 - (len(text) - len(text.rstrip("\n"))))
     return text.replace("\n", "\r\n").encode()
 
 

@@ -326,10 +326,11 @@ class _UI:
             self.ui_error = str(error)
             screen = self.engine.screens.get(self.selected)
         prompt = None
-        if (session and not session.get("active") and not queue and not self._session_status(session)
+        pending = next((message for message in queue if message["state"] == "pending"), None)
+        if (session and not session.get("active") and (pending or not self._session_status(session))
                 and scroll["follow"] and (screen or not session.get("session"))):
             prompt = Screen(columns, 2)
-            prompt.feed(prompt_bytes(live_prompt("", self.state["root"], {
+            prompt.feed(prompt_bytes(live_prompt(pending["text"] if pending else "", self.state["root"], {
                 "model": {"canonical": session.get("next_model") or "Mu/session default"},
             }), pending=True))
         prompt_height = min(visible, prompt.frame(0, 0)[1]) if prompt else 0
