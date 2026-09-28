@@ -394,7 +394,7 @@ class _UI:
             if height == 5:
                 self._add(height - 2, 1, self.draft, width - 2)
             if height > 1:
-                self._add(height - 1, 0, "Ctrl-P sessions · Ctrl-Q quit", attr=curses.A_DIM)
+                self._add(height - 1, 0, "Ctrl-P sessions · /quit quit", attr=curses.A_DIM)
             self._cursor()
             self.window.refresh()
             return
@@ -688,8 +688,7 @@ class _UI:
         if active_sessions or scheduler_active:
             count = len(active_sessions) + int(scheduler_active)
             if not self._confirm("Stop work and quit?",
-                                 f"{count} agent(s) are active, including the scheduler if running. Stop them and quit?",
-                                 quit_shortcut=False):
+                                 f"{count} agent(s) are active, including the scheduler if running. Stop them and quit?"):
                 return
             confirmed = True
         self._request({"op": "shutdown", "confirmed": confirmed})
@@ -704,12 +703,6 @@ class _UI:
             self._cursor()
             self.window.refresh()
             self._getch()
-
-    def _dialog_global(self, key):
-        if key == 17:
-            self._quit()
-            return True
-        return False
 
     def _pick(self, title, options, selected=0):
         if not options:
@@ -731,8 +724,6 @@ class _UI:
             self._cursor()
             self.window.refresh()
             key = self._getch()
-            if self._dialog_global(key):
-                continue
             if key in (3, 27, "q", "Q"):
                 return None
             if key in (10, 13, curses.KEY_ENTER):
@@ -762,7 +753,7 @@ class _UI:
         if choice is not None:
             self._select(sessions[choice - 1]["id"] if choice else None)
 
-    def _confirm(self, title, message, *, quit_shortcut=True):
+    def _confirm(self, title, message):
         while not self.engine.done:
             self._tick()
             self.window.erase()
@@ -775,12 +766,6 @@ class _UI:
             self._cursor()
             self.window.refresh()
             key = self._getch()
-            if key == 17:
-                if quit_shortcut:
-                    self._quit()
-                else:
-                    return False
-                continue
             if key in (3, 27, 10, 13, curses.KEY_ENTER, "n", "N", "q", "Q"):
                 return False
             if key in ("y", "Y"):
@@ -800,7 +785,6 @@ class _UI:
                  "  Shift-drag     Native terminal selection in terminals supporting this bypass",
                  "  Ctrl-C         Clear the draft only; /interrupt stops and holds the session",
                  "  Ctrl-D         Close the selected idle session; quit if no sessions remain",
-                 "  Ctrl-Q         Quit; confirms before stopping active agents",
                  "  /              List commands; ↑/↓ select, Tab/→ fill, Enter run, Esc hide",
                  "  Q/Esc          Close information screens or cancel pickers",
                  "  Home/End       Start/end of line", "  Ctrl-←/→       Jump between words",
@@ -823,8 +807,6 @@ class _UI:
             self._cursor()
             self.window.refresh()
             key = self._getch()
-            if self._dialog_global(key):
-                continue
             if key in (3, 27, "q", "Q", 10, 13, curses.KEY_ENTER):
                 return
             if key in (curses.KEY_UP,):
@@ -909,9 +891,6 @@ class _UI:
                 self._close()
             else:
                 self._quit()
-            return
-        if key == 17:
-            self._quit()
             return
         if key == 16:
             self._pick_session()
