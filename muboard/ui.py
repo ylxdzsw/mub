@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import curses
 import sys
-import time
 import unicodedata
 
 from .output import literal as _text
@@ -52,7 +51,6 @@ class _UI:
         "/interrupt": "Interrupt and hold the selected session",
         "/resume [selected]": "Resume the selected session",
         "/schedule": "Explicitly recheck or recover the scheduler",
-        "/bell": "Toggle audible live bells (background sessions also get a ! marker)",
         "/links": "Show hyperlink targets from the selected terminal",
         "/help": "Show commands and keyboard controls",
         "/quit": "Stop work and quit",
@@ -60,8 +58,6 @@ class _UI:
 
     def __init__(self, window, engine):
         self.window, self.engine = window, engine
-        self.bell_muted = False
-        self.bell_next = 0.0
         self.terminal_colors = {}
         self.state = engine.state()
         sessions = self.state["sessions"]
@@ -190,10 +186,6 @@ class _UI:
         ids = [session["id"] for session in self.state["sessions"]]
         if self.selected is not None and self.selected not in ids:
             self._select(ids[0] if ids else None)
-        bells = sum(screen.take_bells() for screen in self.engine.screens.values())
-        if bells and not self.bell_muted and time.monotonic() >= self.bell_next:
-            curses.beep()
-            self.bell_next = time.monotonic() + 1
 
     def _request(self, request, *, clear_error=True):
         try:
@@ -290,8 +282,6 @@ class _UI:
             return "■"
         if session.get("blocked"):
             return "…"
-        if (screen := self.engine.screens.get(session["id"])) and screen.attention:
-            return "!"
         last = session.get("last")
         if last:
             return "●" if last["mode"] == "readonly" else "○"
@@ -346,7 +336,6 @@ class _UI:
         output_height = visible - prompt_height
         used = 0
         if screen:
-            screen.attention = False
             if screen.error:
                 self.ui_error = screen.error
             used = self._terminal_frame(screen, x + 1, row, columns, output_height, scroll)
@@ -620,9 +609,6 @@ class _UI:
             self._resume()
         elif command == "/schedule":
             self._request({"op": "schedule"})
-        elif command == "/bell":
-            self.bell_muted = not self.bell_muted
-            self._info("Terminal bell", ["Muted" if self.bell_muted else "Enabled (outer terminal controls sound/flash)"])
         elif command == "/links":
             screen = self.engine.screens.get(self.selected)
             self._info("Terminal links · targets only; nothing opens automatically",
@@ -797,7 +783,7 @@ class _UI:
     def _help(self):
         lines = ["Commands:", *(f"  {name}  {description}" for name, description in self.COMMANDS.items()), "",
                  "Session icons:", "  ✎ writing · ≋ reading · ○ idle after writing · ● idle after reading",
-                 "  · new/idle · × failed/trapped · ■ held/interrupted/stopping · … blocked · ! attention", "",
+                 "  · new/idle · × failed/trapped · ■ held/interrupted/stopping · … blocked", "",
                  "Keyboard:", "  Ctrl-P         Pick a session or view scheduler output",
                  "  Ctrl-N         Create and select a session, preserving the current draft",
                  "  Tab/Shift-Tab  Next/previous session (Tab fills an open command panel)",

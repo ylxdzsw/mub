@@ -35,20 +35,14 @@ class Screen:
         # get_line_cells resolves indexed colors to standard ANSI RGB, not the
         # engine's screenshot theme palette. Map these back to host palette slots.
         self.palette = {rgb: i for i, rgb in enumerate(_ANSI_COLORS)}
-        self.bells = 0
-        self.attention = False
         self.error = None
         self.finished = False
         self.session = None
 
-    def feed(self, data, *, live=False):
+    def feed(self, data):
         with self.lock:
             self.core.process(data)
-            events = self.core.poll_events()
-            bells = sum(event['type'] == 'bell' for event in events)
-            if live and bells:
-                self.bells += bells
-                self.attention = True
+            self.core.poll_events()
             # No terminal-generated input, clipboard actions, graphics, or host
             # notifications escape this read-only view. OSC 8 links remain data.
             self.core.drain_bell_events()
@@ -56,11 +50,6 @@ class Screen:
             self.core.drain_notifications()
             self.core.clear_notification_events()
             self.core.clear_graphics()
-
-    def take_bells(self):
-        with self.lock:
-            bells, self.bells = self.bells, 0
-            return bells
 
     def links(self):
         with self.lock:
@@ -88,8 +77,8 @@ class Screen:
 
 class Capture:
     """Drain a PTY even while the owner is busy or its UI is not viewing it."""
-    def __init__(self, screen, *, live=True):
-        self.screen, self.live = screen, live
+    def __init__(self, screen):
+        self.screen = screen
         self.master, self.slave = pty.openpty()
         try:
             termios.tcsetwinsize(self.slave, (screen.rows, screen.cols))
@@ -131,7 +120,7 @@ class Capture:
                     remaining = remaining[self.raw.write(remaining):]
                 if not self.screen.error:
                     try:
-                        self.screen.feed(chunk, live=self.live)
+                        self.screen.feed(chunk)
                     except Exception as error:
                         # A display failure must not lose evidence or fill the PTY.
                         self.screen.error = f"Terminal display: {error}"
@@ -155,7 +144,7 @@ def replay_screen(root, session, cols, rows, mu="mu", stop=None):
     """Replay before dispatch, or in a UI background job while the session is idle."""
     screen = Screen(cols, rows)
     screen.session = session
-    capture = Capture(screen, live=False)
+    capture = Capture(screen)
     process = None
     try:
         with tempfile.TemporaryFile() as errors:

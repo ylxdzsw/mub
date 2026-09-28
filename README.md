@@ -65,9 +65,7 @@ to the outer terminal's available palette (RGB colors to the nearest ANSI color)
 The display retains 10,000 scrollback rows; Mu journals remain the durable history.
 Headless workers use an 80-column, 24-row terminal.
 
-Live bells ring through the outer terminal and mark background sessions with `!`.
-`/bell` toggles audible bells for this UI; rapid bells are coalesced. Replay and
-resize never replay notifications. OSC 8 hyperlinks remain in the terminal model,
+Terminal bells are ignored. OSC 8 hyperlinks remain in the terminal model,
 are underlined, and their targets are available with `/links`; nothing opens
 automatically. Worker title changes never rename the host terminal. Clipboard
 requests, terminal replies, graphics and external notifications are not forwarded.
@@ -87,9 +85,8 @@ appear only when relevant; model defaults and active models are available throug
 Session lists show only the ID, one status icon, and the title:
 `✎` writing, `≋` reading, `○` idle after writing, `●` idle after reading,
 `·` new/idle, `×` failed or trapped, `■` held/interrupted/stopping,
-`…` blocked, and `!` terminal attention. Idle icons reflect the last run's mode,
-not whether its output has been viewed. Active work and exceptional states take
-precedence over terminal attention. Queue details remain in the conversation pane.
+and `…` blocked. Idle icons reflect the last run's mode,
+not whether its output has been viewed. Queue details remain in the conversation pane.
 
 | Shortcut | Action |
 | --- | --- |
@@ -125,7 +122,6 @@ Local commands:
 - `/model`: show the selected scheduler/worker defaults and active invocation models.
 - `/model scheduler|worker|both`: select models and reasoning effort.
 - `/model session`: select the current session's model and effort, or remove its override.
-- `/bell`: toggle audible live terminal bells (background attention markers remain).
 - `/links`: show hyperlink targets from the selected terminal without opening them.
 - `/interrupt`: interrupt and hold the selected session.
 - `/resume`: release a session hold and explicitly authorize continuation of its
@@ -311,5 +307,5 @@ Smoke checks use temporary Git worktrees and fake Mu processes, with no provider
 calls. They exercise mailbox delivery, reader/writer concurrency, clean handoffs,
 traps, failures, interruption holds, stale decisions, persistence, and a real
 PTY-driven UI workflow. Terminal checks cover cursor/erase updates, color,
-split UTF-8, wide cells, alternate screens, hyperlinks, bell/replay separation,
+split UTF-8, wide cells, alternate screens, hyperlinks, ignored bells,
 and draining large output while preserving complete trap evidence.

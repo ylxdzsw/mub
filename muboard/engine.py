@@ -332,9 +332,6 @@ class Engine:
         if pending and pending[1].done():
             if pending[0] == key:
                 result = pending[1].result()
-                if screen:
-                    result.bells += screen.take_bells()
-                    result.attention = screen.attention
                 self.screens[session_id] = result
                 del self.replays[session_id]
                 return result
@@ -415,9 +412,6 @@ Commit only this session's completed, task-owned changes so another writer can p
         if action != "retry":
             prefix += prompt_bytes(live_prompt(prompt, self.root, status))
         screen.feed(prefix)
-        if previous and previous is not screen:
-            screen.bells += previous.take_bells()
-            screen.attention = previous.attention
         screen.finished = False
         self.screens[key] = screen
         record = dict(id=uuid.uuid4().hex[:12], kind=kind, session_id=session["id"] if session else None,
@@ -523,9 +517,6 @@ Commit only this session's completed, task-owned changes so another writer can p
             screen = future.result()
             screen.feed(active["prefix"])
             screen.finished = False
-            previous = active["screen"]
-            screen.bells += previous.take_bells()
-            screen.attention = previous.attention
             active["screen"] = screen
             self.screens[active["record"]["session_id"]] = screen
             if active["capture"]:
@@ -743,7 +734,7 @@ Commit only this session's completed, task-owned changes so another writer can p
         offset = active["screen_offset"]
         chunk = os.pread(stream.fileno(), max(0, os.fstat(stream.fileno()).st_size - offset), offset)
         active["screen_offset"] += len(chunk)
-        active["screen"].feed(chunk.replace(b"\n", b"\r\n"), live=True)
+        active["screen"].feed(chunk.replace(b"\n", b"\r\n"))
 
     def tick(self):
         if self.server:
