@@ -791,6 +791,7 @@ class _UI:
                  "Session icons:", "  ✎ writing · ≋ reading · ○ idle after writing · ● idle after reading",
                  "  · new/idle · × failed/trapped · ■ held/interrupted/stopping · … blocked · ! attention", "",
                  "Keyboard:", "  Ctrl-P         Pick a session or view scheduler output",
+                 "  Ctrl-N         Create and select a session, preserving the current draft",
                  "  Tab/Shift-Tab  Next/previous session (Tab fills an open command panel)",
                  "  ↑/↓/←/→        Edit the prompt; typing always goes to the composer",
                  "  Shift-↑/↓      Scroll output one line", "  Shift-←/→      Pan wider output after resize",
@@ -907,6 +908,11 @@ class _UI:
                 self._close()
             else:
                 self._quit()
+            return
+        if key == 14:
+            result = self._request({"op": "new"})
+            if result is not None:
+                self._select(result["session_id"])
             return
         if key == 16:
             self._pick_session()

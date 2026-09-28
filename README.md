@@ -104,6 +104,7 @@ precedence over terminal attention. Queue details remain in the conversation pan
 | Mouse wheel over output | Scroll output without moving the prompt cursor |
 | Click a sidebar session | Select it, keeping input in the composer |
 | `Ctrl-P` | Session picker, including scheduler output |
+| `Ctrl-N` | Create and select a new session, preserving the previous session's draft |
 | `Ctrl-C` | Clear the draft only, even if already empty; use `/interrupt` to stop work |
 | `Ctrl-D` (EOF) | Close the selected session (warn if not idle); quit if no sessions are open |
 | `Q` / `Esc` in dialogs | Close information screens or cancel a picker |
