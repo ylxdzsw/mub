@@ -346,10 +346,11 @@ class SchedulerSmoke(unittest.TestCase):
                   dict(type="provider_requested", exchange_id="e2", turn_id="t1"),
                   dict(type="provider_completed", exchange_id="e2", usage=dict(input_tokens=10, output_tokens=2),
                        projection=dict(kind="assistant", items=[dict(type="text", text="The actual answer")])),
+                  dict(type="compaction_started", turn_id="compact", mode="await_user"),
                   dict(type="provider_requested", exchange_id="e3", turn_id="compact"),
                   dict(type="provider_completed", exchange_id="e3", usage=dict(input_tokens=20, output_tokens=3),
                        projection=dict(kind="assistant", items=[dict(type="text", text="Do not use this checkpoint")])),
-                  dict(type="compaction_applied")]
+                  dict(type="compaction_applied", seq=10)]
         context = conversation(events)
         self.assertEqual(context["turns"], [dict(turn_id="t1", request="Discuss only", response="The actual answer")])
         usage = scheduler_usage(events)
@@ -364,6 +365,30 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(len(list(journal_events(self.root, session, before=end))), 1)
         with self.assertRaisesRegex(ValueError, "Incomplete"):
             list(journal_events(self.root, session))
+
+    def test_final_response_follows_compaction_continuations(self):
+        events = [dict(type="prompt_queued", prompt_id="q1", prompt=dict(text="Implement the change")),
+                  dict(type="prompt_materialized", prompt_id="q1", turn_id="t1")]
+        active_turn = "t1"
+        for index, flags in enumerate((dict(resumable=True), dict(incomplete=True)), 1):
+            events += [dict(type="provider_requested", exchange_id=f"partial{index}", turn_id=active_turn),
+                       dict(type="provider_completed", exchange_id=f"partial{index}", projection=dict(
+                           kind="assistant", items=[dict(type="text", text="Partial answer")], **flags)),
+                       dict(type="compaction_started", turn_id=f"compact{index}", mode="continue_turn"),
+                       dict(type="provider_requested", exchange_id=f"checkpoint{index}", turn_id=f"compact{index}"),
+                       dict(type="provider_completed", exchange_id=f"checkpoint{index}", projection=dict(
+                           kind="assistant", items=[dict(type="text", text="Checkpoint prose")]))]
+            sequence = len(events) + 1
+            events.append(dict(type="compaction_applied", seq=sequence))
+            active_turn = f"t{sequence}"
+            self.assertEqual(conversation(events)["turns"][0]["response"], "")
+        prefix = len(events)
+        events += [dict(type="provider_requested", exchange_id="final", turn_id=active_turn),
+                   dict(type="provider_completed", exchange_id="final", projection=dict(
+                       kind="assistant", items=[dict(type="text", text="Implemented and verified")]))]
+        self.assertEqual(conversation(events, limit=1), dict(omitted_turns=0, turns=[
+            dict(turn_id="t1", request="Implement the change", response="Implemented and verified")]))
+        self.assertEqual(conversation(events[:prefix])["turns"][0]["response"], "")
 
     def test_existing_scheduler_keeps_its_session(self):
         board = self.board()

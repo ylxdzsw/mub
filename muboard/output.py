@@ -40,6 +40,7 @@ def conversation(events, *, limit=None):
     turns = deque(maxlen=limit)
     queued, requests = {}, {}
     current = None
+    active_turn = compaction_mode = None
     count = 0
     for event in events:
         kind = event["type"]
@@ -47,16 +48,25 @@ def conversation(events, *, limit=None):
             queued[event["prompt_id"]] = event["prompt"]["text"]
         elif kind == "prompt_materialized":
             current = dict(turn_id=event["turn_id"], request=queued.pop(event["prompt_id"]), response="")
+            active_turn = event["turn_id"]
             turns.append(current)
             count += 1
+        elif kind == "compaction_started":
+            compaction_mode = event["mode"]
+        elif kind == "compaction_applied":
+            # Mu gives a continued request a new physical turn ID, but it still
+            # answers the original materialized prompt. Checkpoints do not.
+            active_turn = f"t{event['seq']}" if compaction_mode == "continue_turn" else None
         elif kind == "provider_requested":
             # Synthetic compaction turns have no materialized user prompt.
-            requests[event["exchange_id"]] = current if current and event["turn_id"] == current["turn_id"] else None
+            requests[event["exchange_id"]] = current if current and event["turn_id"] == active_turn else None
         elif kind == "provider_completed":
             turn = requests.pop(event["exchange_id"], None)
             projection = event.get("projection", {})
             items = projection.get("items", [])
-            if turn is not None and projection.get("kind") == "assistant" and not any(i["type"] == "bash_call" for i in items):
+            if (turn is not None and projection.get("kind") == "assistant"
+                    and not projection.get("resumable") and not projection.get("incomplete")
+                    and not any(i["type"] == "bash_call" for i in items)):
                 text = "\n".join(i["text"] for i in items if i["type"] == "text")
                 if text:
                     turn["response"] = text
