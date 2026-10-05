@@ -32,6 +32,22 @@ from muboard.ui import _UI
 
 
 class InputSmoke(unittest.TestCase):
+    def test_resume_notice_distinguishes_authorization_block_and_retry(self):
+        ui = _UI.__new__(_UI)
+        session = dict(id=1, gate="interrupted", retry_authorized=True,
+                       reason="Resume authorized; awaiting scheduler decision.")
+        ui.state = dict(sessions=[session], scheduler={})
+        ui.selected, ui.ui_error = 1, ""
+        self.assertEqual(ui._session_status(session), "resume authorized")
+        self.assertEqual(ui._notice(), session["reason"])
+        session["blocked"] = "Inspection scope conflict"
+        self.assertEqual(ui._session_status(session), "blocked")
+        self.assertEqual(ui._notice(), "Blocked: Inspection scope conflict")
+        session.update(blocked=None, retry_authorized=False,
+                       active=dict(action="retry", mode="readwrite"))
+        self.assertEqual(ui._session_status(session), "writing")
+        self.assertEqual(ui._notice(), "Retry running…")
+
     def test_dirty_close_requires_currently_displayed_warning(self):
         sessions = [dict(id=1, name="Dirty", active=None), dict(id=2, name="Other", active=None)]
         engine = MagicMock(done=False)
@@ -660,6 +676,33 @@ class SchedulerSmoke(unittest.TestCase):
         args = self.journal(session)["invocations"][-1]["args"]
         self.assertNotIn("retry", args)
         self.assertEqual(args[args.index("--trap") + 1], "reversible")
+
+    def test_resume_preserves_trap_evidence_and_defers_execution(self):
+        board = self.board()
+        session = self.new(board, "trap write")
+        self.until(board, lambda: board._running(session["id"]) is not None)
+        self.config(plan=dict(reason="Inspection scope conflict", actions=[
+            dict(type="label", session_id=session["id"], status="blocked", reason="Needs reconsideration")]))
+        self.until(board, board.idle)
+        self.assertEqual(session["gate"], "trapped")
+        evidence = board._scheduler_snapshot()["sessions"][0]["last"]["trap_output"]
+        for gate in ("trapped", "interrupted"):
+            session["gate"] = gate
+            result = board.request(dict(op="resume", session_id=session["id"]))
+            self.assertEqual(result, dict(eligible=True, retry=True))
+            self.assertEqual(session["gate"], "trapped")
+            self.assertTrue(session["retry_authorized"])
+            self.assertIsNone(session["blocked"])
+            self.assertIsNone(board._running(session["id"]))
+            self.assertEqual(board._scheduler_snapshot()["sessions"][0]["last"]["trap_output"], evidence)
+        self.until(board, board.idle)
+        self.assertEqual(session["blocked"], "Needs reconsideration")
+        self.assertEqual(len(self.journal(session)["invocations"]), 1)
+        self.config()
+        board.request(dict(op="resume", session_id=session["id"]))
+        self.until(board, board.idle)
+        self.assertEqual(session["last"]["exit"], "clean")
+        self.assertIn("retry", self.journal(session)["invocations"][1]["args"])
 
     def test_failures_block_dependents_without_repairs(self):
         board = self.board()

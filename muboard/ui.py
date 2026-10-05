@@ -57,7 +57,7 @@ class _UI:
         "/close": "Close the selected session",
         "/model [session|scheduler|worker|both]": "Show models, or choose a session/role model and effort",
         "/interrupt": "Interrupt and hold the selected session",
-        "/resume [selected]": "Resume the selected session",
+        "/resume [selected]": "Authorize continuation and ask the scheduler to reconsider",
         "/schedule": "Explicitly recheck or recover the scheduler",
         "/scheduler": "Select the scheduler's decisions and output",
         "/links": "Show hyperlink targets from the selected terminal",
@@ -328,7 +328,11 @@ class _UI:
             return "held"
         if active:
             return "stopping" if active.get("stopping") else "reading" if active["mode"] == "readonly" else "writing"
-        return session.get("gate") or ("blocked" if session.get("blocked") else "")
+        if session.get("blocked"):
+            return "blocked"
+        if session.get("retry_authorized"):
+            return "resume authorized"
+        return session.get("gate") or ""
 
     def _draw_sidebar(self, y, width, height):
         if width <= 0 or height <= 0:
@@ -449,11 +453,15 @@ class _UI:
         if session:
             if "close_messages" in (session.get("active") or {}):
                 return "Committing before close…"
-            if session.get("gate") == "trapped" and not session.get("hold") and session.get("blocked"):
-                return session["blocked"]
-            if session.get("hold") or session.get("gate"):
+            if session.get("hold"):
                 return session.get("reason") or "Session held · /resume to continue"
-            return session.get("blocked") or ""
+            if active := session.get("active"):
+                return "Retry running…" if active.get("action") == "retry" and not active.get("stopping") else ""
+            if session.get("blocked"):
+                return "Blocked: " + session["blocked"]
+            if session.get("retry_authorized"):
+                return "Resume authorized; awaiting scheduler decision."
+            return session.get("reason", "") if session.get("gate") else ""
         return self.state["scheduler"].get("reason") or ""
 
     def _composer_geometry(self, height, width):

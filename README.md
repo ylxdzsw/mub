@@ -141,7 +141,9 @@ Local commands:
 - `/links`: show hyperlink targets from the selected terminal without opening them.
 - `/interrupt`: interrupt and hold the selected session.
 - `/resume`: release a session hold and explicitly authorize continuation of its
-  interrupted turn, if any.
+  unfinished turn, if any. This asks the scheduler to reconsider; it does not
+  immediately launch a retry or grant permission for out-of-scope work. The UI
+  distinguishes authorization, a running retry, and a renewed blocking reason.
 - `/schedule`: recheck the workspace and scheduling. After a scheduler error,
   explicitly start a fresh scheduler session instead of retrying its old turn.
 - `/scheduler`: select the scheduler's decisions and output without triggering a
@@ -271,15 +273,22 @@ writer slot and workspace ownership permit it.
 The scheduler resolves ordinary task-related traps automatically, without
 requiring `/resume`. Its initial readonly classification is provisional, not a
 user prohibition on writes. It interprets conversational change requests in
-context, but blocks writes when the user clearly requested only discussion or
-inspection, the worker departs from the task, or broader permission is needed.
-The blocking reason explains the conflict.
+context. Discussion or inspection scope prohibits implementation changes, not
+necessary reversible inspection setup: opening an isolated browser's Edit view
+to inspect controls can be approved without authorizing implementation. The
+scheduler judges actual effects rather than treating a risk label or button name
+as a scope conflict. Writer promotion and trap relaxation do not change the
+worker's original user scope. Actual out-of-scope changes, effects on unrelated
+or shared user data, and operations needing broader permission remain blocked
+with a concrete explanation.
 
 A trap is not a failure. A session waiting for the writer slot or workspace stays
 trapped and can be retried automatically when available. Scheduler failure labels
 on trapped sessions are treated as blocking explanations, not as changes to the
 invocation's outcome. Explicit continuation permission is still required for
 genuine failures and interrupted turns; user holds always prohibit execution.
+Resuming a trapped turn preserves its trap classification and full command
+evidence for the scheduler, separately from explicit continuation permission.
 
 Trap relaxation applies to the **rest of that turn**, not one command. Ordinary writes
 start with `--trap destructive`; the scheduler can choose `off` when that broader
