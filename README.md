@@ -49,7 +49,10 @@ in the scheduler pane and live CLI logs; the latest scheduler stderr is also
 available in CLI logs after exit while the owner remains open. CLI logs and trap
 evidence use complete captured output rather than a bounded screen snapshot.
 The composer is always active, sends to the selected session, and grows with its
-draft. There is no pane focus: typing edits the prompt, Tab completes an open
+draft up to four visible rows. When text is hidden, its divider shows `↑ N more`
+and/or `↓ N more`, counting wrapped rows above and below the visible prompt.
+The whole draft is sent, including hidden text.
+There is no pane focus: typing edits the prompt, Tab completes an open
 command panel or switches sessions otherwise,
 and output navigation leaves the prompt cursor alone. Dialogs and pickers
 temporarily take keyboard input.

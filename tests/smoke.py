@@ -32,6 +32,37 @@ from muboard.ui import _UI
 
 
 class InputSmoke(unittest.TestCase):
+    def test_composer_overflow_counts(self):
+        ui = _UI.__new__(_UI)
+        ui.window = MagicMock()
+        ui.state = {"sessions": [{"id": 1, "name": "Long session name " * 10}]}
+        ui.selected = 1
+        ui.colors = {}
+        draft = "\n".join(str(i) for i in range(10))
+        cases = [
+            ("a\nb\nc\nd", 7, 4, 80, "", (3, 4)),
+            (draft, 0, 4, 80, "↓ 6 more", (0, 3)),
+            (draft, 10, 4, 80, "↑ 2 more · ↓ 4 more", (3, 3)),
+            (draft, len(draft), 4, 80, "↑ 6 more", (3, 4)),
+            ("a\nb\nc", 5, 1, 80, "↑ 2 more", (0, 4)),
+            ("x" * 175, 175, 4, 40, "↑ 1 more", (3, 38)),
+            ("x" * 175, 0, 4, 40, "↓ 1 more", (0, 3)),
+            ("界" * 85, 85, 4, 40, "↑ 1 more", (3, 37)),
+        ]
+        for text, cursor, rows, width, overflow, position in cases:
+            with self.subTest(rows=rows, width=width, overflow=overflow, cursor=cursor):
+                ui.window.getmaxyx.return_value = (30, width)
+                ui.window.addstr.reset_mock()
+                ui.draft, ui.cursor = text, cursor
+                self.assertEqual(ui._draw_composer(0, 1, rows, width), position)
+                divider = [call.args for call in ui.window.addstr.call_args_list if call.args[0] == 0]
+                badges = [call for call in divider if "more" in call[2]]
+                self.assertEqual([call[2].strip() for call in badges], [overflow] if overflow else [])
+                if badges:
+                    label = divider[-1]
+                    self.assertLessEqual(label[1] + len(label[2]), badges[0][1])
+                self.assertEqual(ui.draft, text)
+
     def test_composer_sessions_and_output_are_independent(self):
         engine = MagicMock()
         engine.state.return_value = {"sessions": [{"id": 1}, {"id": 2}]}

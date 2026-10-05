@@ -453,6 +453,18 @@ class _UI:
         cursor_row = len(before) - 1
         cursor_col = _width(before[-1])
         start = max(0, cursor_row - rows + 1)
+        hidden = (("↑", start), ("↓", max(0, len(lines) - start - rows)))
+        overflow = " · ".join(f"{arrow} {count} more" for arrow, count in hidden if count)
+        if label_y >= 0:
+            self._add(label_y, 0, "─" * max(0, width - 1), attr=curses.A_DIM)
+            session = self._session()
+            recipient = f"To S{session['id']} · {session['name']}" if session else "New session · type a message to start"
+            label_width = width - 3
+            if overflow:
+                overflow_x = max(1, width - _width(overflow) - 3)
+                label_width = overflow_x - 2
+                self._add(label_y, overflow_x, f" {overflow} ", width - overflow_x - 1, curses.A_DIM)
+            self._add(label_y, 1, f" {recipient} ", label_width, self.colors.get("title", 0))
         for offset, line in enumerate(lines[start:start + rows]):
             row = top + offset
             self._add(row, 1, ">" if offset == 0 else "·", attr=self.colors.get("title", 0))
@@ -528,10 +540,6 @@ class _UI:
         else:
             self._draw_conversation(session, 0, body_y, width, body_height, output)
 
-        if label_y >= 0:
-            self._add(label_y, 0, "─" * max(0, width - 1), attr=curses.A_DIM)
-            recipient = f"To S{session['id']} · {session['name']}" if session else "New session · type a message to start"
-            self._add(label_y, 1, f" {recipient} ", width - 3, self.colors.get("title", 0))
         cursor = self._draw_composer(label_y, composer_top, composer_rows, width)
         self._draw_commands(label_y, width)
         if notice := self._notice():
