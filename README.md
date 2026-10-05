@@ -108,7 +108,7 @@ not whether its output has been viewed. Queue details remain in the conversation
 | Click a sidebar session | Select it, keeping input in the composer |
 | `Ctrl-N` | Create and select a new session, preserving the previous session's draft |
 | `Ctrl-C` | Clear the draft only, even if already empty; use `/interrupt` to stop work |
-| `Ctrl-D` (EOF) | Close the selected session (warn if not idle); quit if no sessions are open |
+| `Ctrl-D` (EOF) | Close the selected idle session; repeat while its dirty-workspace warning is displayed to commit and close; quit if no sessions are open |
 | `Q` / `Esc` in dialogs | Close information screens or cancel a picker |
 | `Home` / `End` in composer | Start / end of line |
 | `Ctrl-←` / `Ctrl-→` in composer | Jump between words |
@@ -124,6 +124,15 @@ Local commands:
 - `/rename <name>`: name the selected session and protect its name from automatic changes.
 - `/rename --auto`: let the scheduler name and rename the selected session again.
 - `/close`: detach an idle session; confirm discarding any queued messages.
+  If it owns a dirty workspace, show a warning first. Repeat `/close` or `Ctrl-D`
+  while that warning is displayed to ask the session to commit its completed,
+  task-owned changes and close automatically once the commit succeeds and the
+  workspace is clean. Switching sessions, opening a dialog, or otherwise hiding
+  or replacing the warning cancels that confirmation; the next close only shows
+  the warning again. Held sessions and interrupted turns require `/resume` first.
+  Refusal, failure, or remaining changes keep the session open, without repeated
+  commit attempts. Queued messages are discarded only on successful close after
+  confirmation; new messages arriving during the commit prevent automatic close.
 - `/model`: show the selected scheduler/worker defaults and active invocation models.
 - `/model scheduler|worker|both`: select models and reasoning effort.
 - `/model session`: select the current session's model and effort, or remove its override.

@@ -32,6 +32,67 @@ from muboard.ui import _UI
 
 
 class InputSmoke(unittest.TestCase):
+    def test_dirty_close_requires_currently_displayed_warning(self):
+        sessions = [dict(id=1, name="Dirty", active=None), dict(id=2, name="Other", active=None)]
+        engine = MagicMock(done=False)
+        engine.state.return_value = dict(root="/work", sessions=sessions, messages=[],
+                                         workspace=dict(owner=1, clean=False), scheduler=dict(active=None))
+        engine.display.return_value = None
+        window = MagicMock()
+        window.getmaxyx.return_value = (30, 110)
+        with patch.multiple("muboard.ui.curses", raw=DEFAULT, nonl=DEFAULT, set_escdelay=DEFAULT,
+                            typeahead=DEFAULT, mousemask=DEFAULT, mouseinterval=DEFAULT,
+                            has_colors=DEFAULT, curs_set=DEFAULT) as mocks, patch("muboard.ui.os.write"):
+            mocks["has_colors"].return_value = False
+            ui = _UI(window, engine)
+            ui._command("/close")
+            warning = ui.close_warning
+            ui._main_key(4)  # A warning not yet painted cannot confirm.
+            engine.request.assert_not_called()
+            ui._draw_main()
+            self.assertEqual(ui.displayed_notice, warning)
+            ui._select(2)
+            ui._select(1)
+            ui._draw_main()
+            self.assertIsNone(ui.close_warning)
+
+            for hide in ("error", "dialog", "resize"):
+                with self.subTest(hide=hide):
+                    ui._main_key(4)
+                    engine.request.assert_not_called()
+                    ui._draw_main()
+                    self.assertEqual(ui.displayed_notice, warning)
+                    if hide == "error":
+                        ui.ui_error = "Other notice"
+                        ui._draw_main()
+                    elif hide == "dialog":
+                        with patch.object(ui, "_getch", return_value=27):
+                            ui._info("Information", ["Example"])
+                    else:
+                        window.getmaxyx.return_value = (5, 110)
+                        ui._draw_main()
+                        window.getmaxyx.return_value = (30, 110)
+                    ui._draw_main()
+                    self.assertIsNone(ui.close_warning)
+
+            ui._main_key(4)
+            engine.request.assert_not_called()
+            ui._draw_main()
+            def commit(request):
+                sessions[0]["active"] = dict(mode="readwrite", close_messages=[])
+                return dict(committing=True)
+            engine.request.side_effect = commit
+            ui._command("/close")
+            engine.request.assert_called_once_with(dict(op="commit_close", session_id=1, discard=False))
+            ui._main_key(4)
+            self.assertEqual(engine.request.call_count, 1)
+            self.assertEqual(ui._notice(), "Committing before close…")
+            sessions.pop(0)
+            ui._tick()
+            self.assertEqual(ui.selected, 2)
+            self.assertNotIn(1, ui.drafts)
+            self.assertNotIn(1, ui.scrolls)
+
     def test_composer_overflow_counts(self):
         ui = _UI.__new__(_UI)
         ui.window = MagicMock()
@@ -621,6 +682,65 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(len(self.journal(session)["invocations"]), 2)
         self.assertEqual(board.data["owner"], session["id"])
         self.assertIsNone(other["session"])
+
+    def test_commit_and_close_preserves_mailbox_until_success(self):
+        self.config(commit_refused=True)
+        board = self.board()
+        session = self.new(board, "write unfinished")
+        self.until(board, board.idle)
+        key = session["id"]
+        board.data["scheduler"]["error"] = "Paused for explicit close"
+        message = board.request(dict(op="send", session_id=key, text="read queued"))["message_id"]
+        with self.assertRaisesRegex(ValueError, "confirm discarding"):
+            board.request(dict(op="commit_close", session_id=key))
+        board.request(dict(op="commit_close", session_id=key, discard=True))
+        active = board._running(key)
+        self.assertEqual(active["record"]["close_messages"], [message])
+        self.assertEqual(read_state(self.root)["inflight"][0]["close_messages"], [message])
+        with self.assertRaisesRegex(ValueError, "finish"):
+            board.request(dict(op="commit_close", session_id=key, discard=True))
+        self.until(board, board.idle)
+        self.assertIn(session, board.data["sessions"])
+        self.assertEqual(board.data["owner"], key)
+        self.assertEqual([m["id"] for m in board.data["messages"]], [message])
+        self.assertIn("remains open", session["blocked"])
+        self.assertEqual(len(self.journal(session)["invocations"]), 3)
+        self.config()
+        board.request(dict(op="commit_close", session_id=key, discard=True))
+        self.until(board, board.idle)
+        self.assertNotIn(session, board.data["sessions"])
+        self.assertTrue(board.workspace["clean"])
+        self.assertEqual(board.data["messages"], [])
+        self.assertTrue((self.root / ".mu/sessions" / f"{session['session']}.jsonl").exists())
+
+    def test_commit_close_keeps_new_messages_and_failed_turns(self):
+        self.config(commit_refused=True)
+        board = self.board()
+        session = self.new(board, "write unfinished")
+        self.until(board, board.idle)
+        key = session["id"]
+        board.data["scheduler"]["error"] = "Paused for explicit close"
+        for field, value in (("hold", True), ("gate", "interrupted")):
+            session[field] = value
+            with self.assertRaisesRegex(ValueError, "recovery"):
+                board.request(dict(op="commit_close", session_id=key))
+            session[field] = False if field == "hold" else None
+        self.config(early_fail=True)
+        board.request(dict(op="commit_close", session_id=key))
+        self.until(board, board.idle)
+        self.assertIn(session, board.data["sessions"])
+        self.assertTrue(session["hold"])
+        self.assertEqual(session["gate"], "failed")
+        self.assertFalse(board.workspace["clean"])
+        self.config(before_prompt_delay=0.2)
+        board.request(dict(op="resume", session_id=key))
+        board.request(dict(op="commit_close", session_id=key))
+        message = board.request(dict(op="send", session_id=key, text="read new request"))["message_id"]
+        self.until(board, board.idle)
+        self.assertTrue(board.workspace["clean"])
+        self.assertIn(session, board.data["sessions"])
+        self.assertEqual([m["id"] for m in board.data["messages"]], [message])
+        self.assertIn("New messages", session["blocked"])
 
     def test_stale_dispatch_and_invalid_fifo(self):
         self.config(scheduler_delay=0.3)

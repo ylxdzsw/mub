@@ -253,6 +253,22 @@ class Engine:
                            retry_authorized=retry, revision=session["revision"] + 1)
             self.store.event("resumed", session["id"])
             result = dict(eligible=True, retry=retry)
+        elif op == "commit_close":
+            session = self.store.session(int(req["session_id"]))
+            self._workspace()
+            if self._running(session["id"]):
+                raise ValueError("Wait for the session to finish before committing to close")
+            if session["hold"] or session["gate"]:
+                raise ValueError("Session is held or requires recovery; use /resume before committing to close")
+            if self.data["owner"] != session["id"] or self.workspace["clean"]:
+                raise ValueError("Session no longer owns a dirty workspace; close it again")
+            if any(a["record"]["kind"] == "worker" and a["record"]["mode"] == "readwrite" for a in self.active.values()):
+                raise ValueError("Wait for the current writer to finish before committing to close")
+            pending = [m["id"] for m in self.data["messages"] if m["session_id"] == session["id"]]
+            if pending and not req.get("discard"):
+                raise ValueError("Session has queued/interrupted messages; confirm discarding them")
+            self._spawn(session=session, action="commit", mode="readwrite", close_messages=pending)
+            result = dict(committing=True)
         elif op == "remove":
             session = self.store.session(int(req["session_id"]))
             self._workspace()
@@ -261,14 +277,7 @@ class Engine:
             pending = [m for m in self.data["messages"] if m["session_id"] == session["id"]]
             if pending and not req.get("discard"):
                 raise ValueError("Session has queued/interrupted messages; confirm discarding them")
-            self.data["sessions"].remove(session)
-            self.screens.pop(session["id"], None)
-            self.context_cache.pop(session["session"], None)
-            pending_replay = self.replays.pop(session["id"], None)
-            if pending_replay:
-                pending_replay[1].cancel()
-            self.data["messages"] = [m for m in self.data["messages"] if m["session_id"] != session["id"]]
-            self.store.event("removed", session["id"])
+            self._remove_session(session)
             result = dict(removed=True)
         elif op == "set_session_model":
             session = self.store.session(int(req["session_id"]))
@@ -309,6 +318,16 @@ class Engine:
             raise ValueError(f"Unknown operation: {op}")
         self.store.save()
         return result
+
+    def _remove_session(self, session):
+        self.data["sessions"].remove(session)
+        self.screens.pop(session["id"], None)
+        self.context_cache.pop(session["session"], None)
+        pending_replay = self.replays.pop(session["id"], None)
+        if pending_replay:
+            pending_replay[1].cancel()
+        self.data["messages"] = [m for m in self.data["messages"] if m["session_id"] != session["id"]]
+        self.store.event("removed", session["id"])
 
     def output(self, session_id):
         target = self.data["scheduler"] if session_id is None else self.store.session(int(session_id))
@@ -454,7 +473,8 @@ SNAPSHOT:
 {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}
 """
 
-    def _spawn(self, *, session=None, message=None, action="schedule", mode="readonly", trap=None, snapshot=None):
+    def _spawn(self, *, session=None, message=None, action="schedule", mode="readonly", trap=None, snapshot=None,
+               close_messages=None):
         started_at = time.monotonic()
         kind = "worker" if session else "scheduler"
         target = session if session else self.data["scheduler"]
@@ -511,8 +531,9 @@ SNAPSHOT:
         if kind == "scheduler":
             prompt = self._scheduler_prompt(snapshot, bootstrap=bootstrap)
         elif action == "commit":
-            prompt = """<system-request>
-Commit only this session's completed, task-owned changes so another writer can proceed. Do not blindly stage everything, commit incomplete work, or implement additional work. If a safe handoff is not possible, explain why and return.
+            purpose = "before closing this session at the user's request" if close_messages is not None else "so another writer can proceed"
+            prompt = f"""<system-request>
+Commit only this session's completed, task-owned changes {purpose}. Do not blindly stage everything, commit incomplete work, or implement additional work. If a safe handoff is not possible, explain why and return.
 </system-request>"""
         elif action == "retry":
             prompt = ""
@@ -531,6 +552,8 @@ Commit only this session's completed, task-owned changes so another writer can p
                       model=model or status.get("model", {}).get("canonical"), message_id=message["id"] if message else
                       (session["last"].get("message_id") if action == "retry" and session["last"] else None),
                       pid=None, stamp=None, stopping=False)
+        if close_messages is not None:
+            record["close_messages"] = close_messages
         if session:
             session.update(revision=session["revision"] + 1, retry_authorized=False, blocked=None)
             if mode == "readwrite":
@@ -878,13 +901,25 @@ Commit only this session's completed, task-owned changes so another writer can p
                 for message in self.data["messages"]:
                     if message["id"] == run["message_id"]:
                         message["state"] = "interrupted"
-            if exit_reason == "interrupted":
+            if exit_reason == "interrupted" or ("close_messages" in run and exit_reason != "clean"):
                 session["hold"] = True
             self.store.event("worker_exit", session["id"], exit=exit_reason)
         try:
             self._workspace()
         except (RuntimeError, OSError) as error:
             self.data["scheduler"]["error"] = f"Cannot inspect workspace: {error}"
+        else:
+            if "close_messages" in run:
+                pending = [m["id"] for m in self.data["messages"] if m["session_id"] == session["id"]]
+                if exit_reason == "clean" and not session["gate"] and not session["hold"] and not self.stopping:
+                    if not self.workspace["clean"]:
+                        session["blocked"] = "Commit did not release the dirty workspace; session remains open."
+                    elif set(pending) - set(run["close_messages"]):
+                        session["blocked"] = "New messages arrived during the commit; session remains open."
+                    else:
+                        self._remove_session(session)
+                else:
+                    session["hold"] = True
         self.store.save()
 
     def _scheduler_display(self, active):

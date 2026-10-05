@@ -87,6 +87,7 @@ class _UI:
         self.output_rect = None
         self.pending_keys = deque()
         self.ui_error = ""
+        self.close_warning = self.displayed_notice = None
         self.request_ok = False
         self.colors = {}
         curses.raw()
@@ -189,7 +190,16 @@ class _UI:
         except curses.error:
             pass
 
-    def _refresh(self, cursor=None):
+    def _clear_close_warning(self):
+        if self.close_warning and self.ui_error == self.close_warning:
+            self.ui_error = ""
+        self.close_warning = None
+        self.displayed_notice = None
+
+    def _refresh(self, cursor=None, *, notice=None):
+        if notice != self.close_warning:
+            self._clear_close_warning()
+        self.displayed_notice = notice
         self.drawn = None
         # Unsupported terminals ignore this private mode. Keep the transaction
         # around physical output only, never engine work or a blocking input read.
@@ -236,8 +246,12 @@ class _UI:
         ids = [session["id"] for session in self.state["sessions"]]
         if self.selected is not None and self.selected not in ids:
             self._select(ids[0] if ids else None)
+        for key in (self.drafts.keys() | self.scrolls.keys()) - set(ids) - {None}:
+            self.drafts.pop(key, None)
+            self.scrolls.pop(key, None)
 
     def _request(self, request, *, clear_error=True):
+        self._clear_close_warning()
         try:
             result = self.engine.request(request)
             self.request_ok = True
@@ -260,6 +274,7 @@ class _UI:
     def _select(self, session_id):
         if session_id == self.selected:
             return
+        self._clear_close_warning()
         self._save_draft()
         self.selected = session_id
         self.draft, self.cursor = self.drafts.get(session_id, ("", 0))
@@ -430,6 +445,8 @@ class _UI:
             return error
         session = self._session()
         if session:
+            if "close_messages" in (session.get("active") or {}):
+                return "Committing before close…"
             if session.get("gate") == "trapped" and not session.get("hold") and session.get("blocked"):
                 return session["blocked"]
             if session.get("hold") or session.get("gate"):
@@ -484,6 +501,8 @@ class _UI:
     def _draw_main(self):
         height, width = self.window.getmaxyx()
         if height <= 0 or width <= 0:
+            self._clear_close_warning()
+            self.displayed_notice = None
             return
         session = self._session()
         output = None
@@ -545,7 +564,8 @@ class _UI:
         if notice := self._notice():
             self._add(notice_y, 1, notice, width - 2, self.colors.get("warn", 0))
         self._add(height - 1, 1, "Tab/Shift-Tab sessions · PgUp/PgDn output · /scheduler · /help", attr=curses.A_DIM)
-        self._refresh((composer_top + cursor[0], cursor[1]) if cursor else None)
+        self._refresh((composer_top + cursor[0], cursor[1]) if cursor else None,
+                      notice=notice if width > 2 else None)
         self.row_runs = self.next_row_runs
         self.drawn = self._view_key(size, screen_stamp)
 
@@ -730,17 +750,26 @@ class _UI:
             self.ui_error = "Select a session to close."
             return
         if session.get("active"):
-            self.ui_error = "Session is not idle; wait for it to finish or use /interrupt before closing."
+            self._clear_close_warning()
+            self.ui_error = "" if "close_messages" in session["active"] else "Session is not idle; wait for it to finish or use /interrupt before closing."
             return
         session_id = session["id"]
+        commit = (self.state["workspace"]["owner"] == session_id and not self.state["workspace"]["clean"])
+        if commit:
+            warning = f"S{session_id} owns uncommitted changes. Repeat /close or Ctrl-D to commit and close."
+            if not (self.close_warning == self.ui_error == self.displayed_notice == warning):
+                self.close_warning = self.ui_error = warning
+                return
         messages = self._pending(session_id)
         discard = bool(messages)
         if discard and not self._confirm("Discard pending messages?",
                                          f"Closing {session.get('name') or f'Session {session_id}'} will discard {len(messages)} pending/inflight/interrupted message(s). Continue?"):
             return
         index = self._selected_index()
-        self._request({"op": "remove", "session_id": session_id, "discard": discard})
+        self._request({"op": "commit_close" if commit else "remove", "session_id": session_id, "discard": discard})
         if not self.request_ok:
+            return
+        if commit:
             return
         remaining = self.state["sessions"]
         target = remaining[min(index, len(remaining) - 1)]["id"] if remaining else None
@@ -889,7 +918,8 @@ class _UI:
                  "  Mouse wheel    Scroll output under the pointer; click a sidebar session to select it",
                  "  Shift-drag     Native terminal selection in terminals supporting this bypass",
                  "  Ctrl-C         Clear the draft only; /interrupt stops and holds the session",
-                 "  Ctrl-D         Close the selected idle session; quit if no sessions remain",
+                 "  Ctrl-D         Close the selected idle session; repeat on its dirty warning to commit and close",
+                 "                 Quit if no sessions remain",
                  "  /              List commands; ↑/↓ select, Tab/→ fill, Enter run, Esc hide",
                  "  Q/Esc          Close information screens or cancel pickers",
                  "  Home/End       Start/end of line", "  Ctrl-←/→       Jump between words",
