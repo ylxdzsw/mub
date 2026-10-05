@@ -65,7 +65,9 @@ live output again.
 
 An active invocation keeps its launch-time terminal dimensions. After narrowing
 the pane, use `Shift-←` / `Shift-→` to pan horizontally. Idle history
-replays at the new size; failed/interrupted screens stay available so transient
+replays when the pane width changes. Height-only changes reveal or hide rows
+without rebuilding history; task completion and subsequent turns reuse the live
+screen at the same width. Failed/interrupted screens stay available so transient
 errors are not lost. Unused cells are not rewrapped by curses. Colors are mapped
 to the outer terminal's available palette (RGB colors to the nearest ANSI color).
 The display retains 10,000 scrollback rows; Mu journals remain the durable history.

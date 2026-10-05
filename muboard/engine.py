@@ -362,9 +362,11 @@ class Engine:
         # Keep failed/interrupted live output visible, including transient errors
         # absent from Mu's journal. It remains horizontally scrollable on resize.
         failed = target.get("error") if session_id is None else (target.get("last") or {}).get("exit") not in (None, "clean")
-        if screen and (failed or (screen.cols, screen.rows) == (cols, rows)):
+        # Width changes require Mu to reformat history. Height only changes the
+        # viewport; keep the captured screen and its scrollback row identities.
+        if screen and (failed or screen.cols == cols):
             return screen
-        key = (target["session"], cols, rows)
+        key = (target["session"], cols)
         pending = self.replays.get(session_id)
         if pending and pending[1].done():
             if pending[0] == key:
@@ -375,7 +377,7 @@ class Engine:
             del self.replays[session_id]
             pending = None
         if pending is None:
-            self.replays[session_id] = (key, self.replay_pool.submit(replay_screen, self.root, *key, self.mu, self.replay_stop))
+            self.replays[session_id] = (key, self.replay_pool.submit(replay_screen, self.root, *key, rows, self.mu, self.replay_stop))
         return screen
 
     def _worker_context(self, session):
@@ -519,7 +521,8 @@ SNAPSHOT:
             pending[1].cancel()
         if (previous and previous.finished and not previous.error and previous.session == mu_session
                 and not previous.core.is_alt_screen_active()
-                and (previous.cols, previous.rows) == self.terminal_size):
+                and previous.cols == self.terminal_size[0]):
+            # The new PTY inherits this screen's geometry, not the UI viewport.
             screen = previous
         else:
             screen = Screen(*self.terminal_size)

@@ -373,7 +373,9 @@ class _UI:
         queue_rows = queued + (len(queue) > queued and queued < height - 1)
         visible = max(0, height - 1 - queue_rows)
         columns = max(2, width - 2)
-        self.engine.terminal_size = (columns, max(2, visible))
+        # Size new terminals independently of mailbox/prompt rows. Existing
+        # screens keep their geometry when only the viewport height changes.
+        self.engine.terminal_size = (columns, max(2, height - 1))
         try:
             screen = self.engine.display(self.selected, *self.engine.terminal_size)
         except (OSError, RuntimeError, ValueError) as error:
