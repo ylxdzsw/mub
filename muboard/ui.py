@@ -392,13 +392,14 @@ class _UI:
         scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
         if (session and not session.get("active") and (pending or not self._session_status(session))
                 and scroll["follow"] and (screen or not session.get("session"))):
-            key = (columns, pending["text"] if pending else "", self.state["root"],
-                   session.get("next_model") or "Mu/session default")
+            block = live_prompt(pending["text"] if pending else "", self.state["root"], {
+                "model": {"canonical": session.get("next_model") or "Mu/session default"},
+                **session.get("next_context", {}),
+            })
+            key = (columns, block)
             if key != self.prompt_key:
                 self.prompt_screen = Screen(columns, 2)
-                self.prompt_screen.feed(prompt_bytes(live_prompt(key[1], key[2], {
-                    "model": {"canonical": key[3]},
-                }), pending=True))
+                self.prompt_screen.feed(prompt_bytes(block, pending=True))
                 self.prompt_key = key
             prompt = self.prompt_screen
         return screen, prompt, queue, queued, visible

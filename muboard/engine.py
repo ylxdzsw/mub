@@ -87,7 +87,7 @@ class Engine:
         self.replay_stop = threading.Event()
         self.replay_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mub-history")
         self.terminal_size = (80, 24)
-        self.model_cache = {}
+        self.status_cache = {}
         self.traps = {}
         self.scheduler_diagnostics = None
         self.context_cache = {}
@@ -150,9 +150,14 @@ class Engine:
         return next((a for a in self.active.values() if a["record"]["session_id"] == session_id), None)
 
     def state(self):
-        sessions = [dict(s, next_model=self._next_model(s),
-                         active=(a["record"] if (a := self._running(s["id"])) else None))
-                    for s in self.data["sessions"]]
+        sessions = []
+        for session in self.data["sessions"]:
+            status = self._next_status(session)
+            context = {key: status.get(key) for key in
+                       ("context_tokens", "context_window", "context_usage_source")} if session["session"] else {}
+            active = self._running(session["id"])
+            sessions.append(dict(session, next_model=self._next_model(session), next_context=context,
+                                 active=active["record"] if active else None))
         scheduler = self._running(None)
         return dict(root=str(self.root), sessions=sessions, messages=self.data["messages"],
                     scheduler=dict(self.data["scheduler"], active=scheduler["record"] if scheduler else None),
@@ -160,17 +165,22 @@ class Engine:
 
     def _next_model(self, session):
         override = session.get("model") or self.models["worker"]
-        if override:
-            return override
+        return override or self._next_status(session).get("model", {}).get("canonical") or "Mu/session default"
+
+    def _next_status(self, session):
+        override = session.get("model") or self.models["worker"]
         key = session["session"]
-        if key not in self.model_cache:
+        if not key and override:
+            return dict(model=dict(canonical=override))
+        cached = self.status_cache.get(key)
+        if cached is None or cached[0] != override:
             try:
-                status = (self._session_status(session["session"]) if session["session"] else
+                status = (self._session_status(key, override) if key else
                           json.loads(self._mu("status", "--json")))
-                self.model_cache[key] = status.get("model", {}).get("canonical") or "Mu/session default"
-            except (RuntimeError, ValueError):
-                self.model_cache[key] = "Mu/session default (unavailable)"
-        return self.model_cache[key]
+            except (OSError, RuntimeError, ValueError):
+                status = dict(model=dict(canonical="Mu/session default (unavailable)"))
+            self.status_cache[key] = (override, status)
+        return self.status_cache[key][1]
 
     @staticmethod
     def _model_reference(value):
@@ -323,6 +333,7 @@ class Engine:
     def _remove_session(self, session):
         self.data["sessions"].remove(session)
         self.screens.pop(session["id"], None)
+        self.status_cache.pop(session["session"], None)
         self.context_cache.pop(session["session"], None)
         pending_replay = self.replays.pop(session["id"], None)
         if pending_replay:
@@ -817,7 +828,7 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
         else:
             self._scheduler_display(active)
         active["screen"].finished = True
-        self.model_cache.pop(run["session"], None)
+        self.status_cache.pop(run["session"], None)
         self.data["inflight"].remove(run)
         self.history.pop(run["session"], None)
         stream = active["output"]
