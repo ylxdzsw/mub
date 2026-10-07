@@ -78,9 +78,10 @@ def schedule(snapshot, config):
         mode = "readwrite" if message["text"].startswith("write") else "readonly"
         if mode == "readwrite" and not writable:
             continue
-        actions.append(dict(type="dispatch", message_id=message["id"], mode=mode))
+        actions.append(dict(type="dispatch", message_id=message["id"], mode=mode,
+                            trap="reversible" if mode == "readonly" else "destructive"))
         writer |= mode == "readwrite"
-    return dict(reason="Scripted scheduling decision", actions=actions)
+    return dict(reason="Scripted scheduling decision", names=[], actions=actions)
 
 
 def main():

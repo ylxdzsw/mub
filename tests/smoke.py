@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FAKE = ROOT / "tests/fake_mu.py"
 sys.path.insert(0, str(ROOT))
 
-from muboard.engine import Engine, owned_members
+from muboard.engine import Engine, SCHEDULER_SCHEMA, owned_members
 from muboard.ipc import ControlServer
 from muboard.output import conversation, excerpt, journal_events, live_prompt, plain_output, prompt_bytes, scheduler_usage
 from muboard.terminal import Capture, Screen
@@ -400,9 +400,19 @@ class SchedulerSmoke(unittest.TestCase):
         prompts = self.journal(scheduler)["invocations"]
         self.assertEqual(self.journal(scheduler)["new_args"], ["new", "--no-context"])
         self.assertTrue(all("--no-context" in p["args"] for p in prompts))
+        for invocation in prompts:
+            args = invocation["args"]
+            self.assertEqual(json.loads(args[args.index("--output-schema") + 1]), SCHEDULER_SCHEMA)
+        variants = SCHEDULER_SCHEMA["properties"]["actions"]["items"]["anyOf"]
+        self.assertEqual([v["properties"]["type"]["enum"] for v in variants],
+                         [["dispatch"], ["retry"], ["commit"], ["label"]])
+        for schema in [SCHEDULER_SCHEMA, SCHEDULER_SCHEMA["properties"]["names"]["items"], *variants]:
+            self.assertFalse(schema["additionalProperties"])
+            self.assertEqual(set(schema["required"]), set(schema["properties"]))
         for worker in (first, second):
             self.assertEqual(self.journal(worker)["new_args"], ["new"])
             self.assertTrue(all("--no-context" not in p["args"] for p in self.journal(worker)["invocations"]))
+            self.assertTrue(all("--output-schema" not in p["args"] for p in self.journal(worker)["invocations"]))
         self.assertGreaterEqual(len(prompts), 2)
         self.assertIn("You schedule messages", prompts[0]["prompt"])
         self.assertTrue(all("You schedule messages" not in p["prompt"] for p in prompts[1:]))

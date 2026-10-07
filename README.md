@@ -12,7 +12,9 @@ tasks with a completion lifecycle.
 
 ## Run
 
-Requires Linux with pidfds, Python 3.12+, Git, and configured `mu` on PATH.
+Requires Linux with pidfds, Python 3.12+, Git, and configured `mu` on PATH
+supporting `--no-context` and `--output-schema`. The scheduler's model/provider
+must support native structured output.
 Installation includes the embedded Rust terminal engine
 `par-term-emu-core-rust` (and its Pillow dependency); no shell, GUI toolkit,
 terminal server, or system terminal library is needed.
@@ -175,6 +177,15 @@ ownership, latest worker responses, exit reasons, and complete trap evidence.
 It may dispatch several readers and at most one writer, or explain why nothing
 should run. It returns a small JSON decision as its final answer; runtime code
 validates it against current state before acting.
+
+Every scheduler turn passes a fixed JSON Schema through Mu's `--output-schema`,
+alongside `-o final`. The schema constrains decision fields and the dispatch,
+retry, commit, and label action variants; names and execution trap policies are
+explicit. Worker turns, retries, and commit handoffs retain ordinary output.
+Structured output does not replace runtime checks for FIFO, holds, retry
+authorization, stale decisions, or writer ownership. Invalid decisions and
+provider/schema errors still stop scheduling for explicit `/schedule` recovery;
+there is no fallback to unconstrained output.
 
 ### Scheduler context and usage
 
