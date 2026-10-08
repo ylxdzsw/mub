@@ -348,7 +348,10 @@ class _UI:
             self.sidebar_scroll = index - capacity + 1
         for row, session in enumerate(sessions[self.sidebar_scroll:self.sidebar_scroll + capacity], y + 1):
             self.session_hits.append((row, width, session["id"]))
-            self._add(row, 1, self._session_label(session), width - 2,
+            label = _text(self._session_label(session)).replace("\n", " ")
+            if _width(label) > width - 2:
+                label = _clip(label, width - 3) + "…"
+            self._add(row, 1, label, width - 2,
                       curses.A_REVERSE if session["id"] == self.selected else 0)
 
     def _session_icon(self, session):
@@ -523,7 +526,7 @@ class _UI:
             label_y, composer_top, composer_rows, notice_y = geometry
             body_y, body_height = 1, max(0, label_y - 1)
             split = width >= 62 and body_height >= 4
-            sidebar_width = max(20, min(30, width // 3)) if split else -1
+            sidebar_width = max(20, min(35, width // 3)) if split else -1
             output = self._prepare_output(session, width - sidebar_width - 1, body_height)
         screen = output[0] if output else None
         screen_stamp = (screen, screen.revision) if screen else None
