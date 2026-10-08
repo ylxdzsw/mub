@@ -382,6 +382,57 @@ class SchedulerSmoke(unittest.TestCase):
     def journal(self, session):
         return json.loads((self.root / ".mu/fake" / (session["session"] + ".json")).read_text())
 
+    def test_empty_exit_retires_scheduler_without_deleting_history(self):
+        board = self.board()
+        worker = self.new(board, "read design")
+        self.until(board, board.idle)
+        board.request(dict(op="set_models", models=dict(scheduler="fake/scheduler", worker="fake/worker")))
+        board.request(dict(op="remove", session_id=worker["id"]))
+        scheduler = board.data["scheduler"]
+        scheduler["error"] = "Old scheduling failure"
+        old = scheduler["session"]
+        journals = {path: path.read_bytes() for path in (self.root / ".mu/sessions").glob("*.jsonl")}
+        saved = {key: board.data[key] for key in ("models", "next_session", "next_message", "next_event")}
+        board.close()
+        state = read_state(self.root)
+        self.assertEqual({key: state[key] for key in saved}, saved)
+        self.assertEqual(state["scheduler"], dict(session=None, error=None, reason="",
+            previous_sessions=[old], **{key: scheduler[key] for key in
+                                       ("last_usage", "recent_usage", "usage_totals")}))
+        self.assertEqual(state["events"], [])
+        self.assertEqual({path: path.read_bytes() for path in journals}, journals)
+        reopened = self.board()
+        reopened.tick()
+        self.assertTrue(reopened.idle())
+        self.assertIsNone(reopened.data["scheduler"]["session"])
+        self.new(reopened, "read fresh work")
+        self.until(reopened, reopened.idle)
+        self.assertNotEqual(reopened.data["scheduler"]["session"], old)
+        prompt = self.journal(reopened.data["scheduler"])["invocations"][0]["prompt"]
+        self.assertIn("You schedule messages", prompt)
+        self.assertNotIn("read design", prompt)
+
+    def test_exit_preserves_scheduler_with_remaining_state(self):
+        for remaining in ("sessions", "messages", "inflight", "owner"):
+            with self.subTest(remaining=remaining):
+                directory = self.root / remaining
+                subprocess.run(["git", "init", "-q", str(directory)], check=True)
+                board = self.board(directory)
+                board.data["scheduler"].update(reason="Keep this decision", error="Needs recovery", turns=3)
+                board.store.event("recheck")
+                if remaining == "sessions":
+                    board.store.new_session()
+                elif remaining == "owner":
+                    board.data[remaining] = 1
+                else:
+                    board.data[remaining] = [dict(id=1)]
+                board.close()
+                state = read_state(directory)
+                self.assertEqual(state["scheduler"]["reason"], "Keep this decision")
+                self.assertEqual(state["scheduler"]["error"], "Needs recovery")
+                self.assertEqual(state["scheduler"]["turns"], 3)
+                self.assertTrue(state["events"])
+
     def test_batched_snapshots_rotation_and_usage(self):
         board = self.board()
         board.scheduler_turn_limit = 100

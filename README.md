@@ -410,6 +410,14 @@ messages are not blindly resubmitted. Live processes from a previous
 owner prevent a replacement owner from starting. Removing a session only detaches
 it from mub; it never deletes the Mu journal or undoes edits.
 
+Exiting with all worker sessions removed retires the active scheduler session and
+clears pending scheduling events, provided no queued/in-flight work or workspace
+ownership remains. The next board starts with fresh scheduler context, without
+the previous reason, error, pass count, or context hashes. Model preferences,
+identifier counters, usage history, and archived scheduler IDs are retained;
+Mu journals are untouched. Merely having no running workers does not reset a
+board that still has sessions open.
+
 Old task-board snapshots are **not automatically converted**. Opening one fails
 without overwriting it. Archive the old `.mu/mub.json` explicitly before starting
 a new board; Mu journals remain untouched.

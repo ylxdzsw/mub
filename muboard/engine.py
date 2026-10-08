@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-from .state import Store, session_name
+from .state import Store, fresh_state, session_name
 from .output import (conversation, delivery, excerpt, journal_events, journal_path, live_prompt,
                      plain_output, prompt_bytes, replay, scheduler_usage)
 from .terminal import Capture, Screen, replay_screen, terminal_env
@@ -1025,6 +1025,13 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
         if self.server:
             self.server.close()
         self.replay_pool.shutdown(wait=True, cancel_futures=True)
+        if (not self.data["sessions"] and not self.data["messages"]
+                and not self.data["inflight"] and self.data["owner"] is None):
+            self._archive_scheduler()
+            history = {key: value for key, value in self.data["scheduler"].items()
+                       if key in ("previous_sessions", "last_usage", "recent_usage", "usage_totals")}
+            self.data["scheduler"] = dict(fresh_state()["scheduler"], **history)
+            self.data["events"] = []
         self.store.save()
         self.store.close()
         self.closed = True
