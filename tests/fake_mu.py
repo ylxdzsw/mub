@@ -17,11 +17,17 @@ JOURNALS = ROOT / ".mu" / "sessions"
 JOURNALS.mkdir(exist_ok=True)
 (JOURNALS / ".gitignore").write_text("*\n")
 STOPPED = False
+SOFT_STOPPED = False
 
 
 def interrupt(signum, frame):
     global STOPPED
     STOPPED = True
+
+
+def soft_interrupt(signum, frame):
+    global SOFT_STOPPED
+    SOFT_STOPPED = True
 
 
 signal.signal(signal.SIGINT, interrupt)
@@ -32,6 +38,27 @@ def save(path, data):
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data))
     tmp.replace(path)
+
+
+def recover_incomplete(journal, turn_id):
+    events = [json.loads(line) for line in journal.read_text().splitlines()]
+    queued = set()
+    compacting = False
+    for event in events:
+        if event["type"] == "prompt_queued":
+            queued.add(event["prompt_id"])
+        elif event["type"] == "prompt_materialized":
+            queued.discard(event["prompt_id"])
+        elif event["type"] == "compaction_started":
+            compacting = True
+        elif event["type"] == "compaction_applied":
+            compacting = False
+    with journal.open("a") as stream:
+        for prompt_id in queued:
+            stream.write(json.dumps(dict(type="prompt_materialized", prompt_id=prompt_id,
+                                         turn_id=turn_id)) + "\n")
+        if compacting:
+            stream.write(json.dumps(dict(type="compaction_applied", seq=len(events) + 1)) + "\n")
 
 
 def delay(seconds):
@@ -52,9 +79,40 @@ def schedule(snapshot, config):
     sessions = sorted(sessions, key=lambda s: order.index(s["id"]) if s["id"] in order else len(order) + s["id"])
     for session in sessions:
         key = session["id"]
-        if session["active"] or session["hold"]:
+        if session["hold"]:
             continue
         writable = not writer and (not dirty or owner == key)
+        steering = session.get("steering")
+        if steering:
+            if session["active"] or steering["phase"] in ("stopping", "held", "delivering"):
+                continue
+            if steering["phase"] == "ready":
+                message = next((m for m in snapshot["messages"] if m["id"] == steering["message_id"]), None)
+                if message and message["state"] == "pending":
+                    mode = "readwrite" if message["text"].startswith("write") else "readonly"
+                    if mode == "readonly" or writable:
+                        actions.append(dict(type="dispatch", message_id=message["id"], mode=mode,
+                                            trap="reversible" if mode == "readonly" else "destructive"))
+                        writer |= mode == "readwrite"
+                continue
+            if steering["phase"] == "recovery":
+                if session["user_retry_authorized"]:
+                    mode = (session.get("last") or {}).get("mode", "readwrite")
+                    if mode == "readonly" or writable:
+                        actions.append(dict(type="retry", session_id=key, mode=mode,
+                                            trap="reversible" if mode == "readonly" else "off",
+                                            reason="Explicitly recover Mu before applying the pending redirect"))
+                        writer |= mode == "readwrite"
+                continue
+            continue
+        if session["active"]:
+            message = next((m for m in snapshot["messages"]
+                            if m["session_id"] == key and m["state"] == "pending"), None)
+            if (config.get("auto_steer", False) and message and message["text"].startswith("steer ")
+                    and session["active"].get("steer_available")):
+                actions.append(dict(type="steer", message_id=message["id"], run_id=session["active"]["id"],
+                                    reason="The oldest pending message redirects the active work"))
+            continue
         if session["gate"] == "trapped" or session["user_retry_authorized"]:
             if writable:
                 actions.append(dict(type="retry", session_id=key, mode="readwrite", trap="off", reason="Scripted trap approval for this turn"))
@@ -115,6 +173,8 @@ def main():
         return 0
     config_path = STORE / "config.json"
     config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    if config.get("soft_interrupt", True):
+        signal.signal(signal.SIGQUIT, soft_interrupt)
     retry = args[0] == "retry"
     prompt = sys.stdin.read() if not retry else ""
     role = os.environ["MUB_ROLE"]
@@ -137,6 +197,9 @@ def main():
                                           prompt=dict(kind="text", text=prompt))) + "\n")
             journal.write(json.dumps(dict(type="prompt_materialized", prompt_id=prompt_id, turn_id=data["turn_id"])) + "\n")
     exchange_id = f"e{len(data['invocations'])}"
+    journal_path = JOURNALS / f"{key}.jsonl"
+    if retry:
+        recover_incomplete(journal_path, data["turn_id"])
     with (JOURNALS / f"{key}.jsonl").open("a") as journal:
         journal.write(json.dumps(dict(type="provider_requested", turn_id=data["turn_id"], exchange_id=exchange_id)) + "\n")
     save(path, data)
@@ -183,10 +246,12 @@ def main():
         own_file.write_text(task + "\n")
     delay(config.get("worker_delay", 0.08))
     if "hold" in task and not config.get("release_hold"):
-        while not STOPPED:
+        while not STOPPED and not SOFT_STOPPED:
             time.sleep(0.01)
     if STOPPED:
         return finish(130, "worker interrupted", False)
+    if SOFT_STOPPED and not config.get("natural_completion"):
+        return finish(0, "Stopped at the next safe boundary", False)
     return finish(0, "Handled: " + task, True)
 
 

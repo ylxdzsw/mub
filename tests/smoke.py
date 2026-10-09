@@ -32,6 +32,38 @@ from muboard.ui import _UI
 
 
 class InputSmoke(unittest.TestCase):
+    def test_steer_command_retains_draft_until_confirmed_and_accepted(self):
+        ui = _UI.__new__(_UI)
+        session = dict(id=1, gate="interrupted", active=None)
+        ui.selected, ui.ui_error = 1, ""
+        ui.state = dict(sessions=[session], messages=[], scheduler={})
+        ui.drafts = {}
+        ui.engine = MagicMock()
+        ui.engine.state.return_value = ui.state
+        ui._clear_close_warning = MagicMock()
+        ui._confirm = MagicMock(return_value=False)
+        draft = "/steer Use the existing schema instead."
+        ui._set_draft(draft)
+        ui._submit()
+        ui.engine.request.assert_not_called()
+        self.assertEqual(ui.draft, draft)
+        ui._confirm.return_value = True
+        ui.engine.request.side_effect = ValueError("Steering is unavailable")
+        ui._submit()
+        self.assertEqual(ui.draft, draft)
+        self.assertEqual(ui.ui_error, "Steering is unavailable")
+        ui.engine.request.side_effect = None
+        ui.engine.request.return_value = dict(message_id=2, steering="ready")
+        ui._submit()
+        ui.engine.request.assert_called_with(dict(op="steer", session_id=1,
+                                                 text="Use the existing schema instead."))
+        self.assertEqual(ui.draft, "")
+        ui._set_draft("/steer")
+        ui.engine.request.reset_mock()
+        ui._submit()
+        ui.engine.request.assert_not_called()
+        self.assertEqual(ui.draft, "/steer")
+
     def test_resume_notice_distinguishes_authorization_block_and_retry(self):
         ui = _UI.__new__(_UI)
         session = dict(id=1, gate="interrupted", retry_authorized=True,
@@ -382,6 +414,10 @@ class SchedulerSmoke(unittest.TestCase):
     def journal(self, session):
         return json.loads((self.root / ".mu/fake" / (session["session"] + ".json")).read_text())
 
+    def steerable(self, board, session):
+        active = board._running(session["id"])
+        return bool(active and self.journal(session)["active"]["busy"] and board._steer_available(active))
+
     def test_empty_exit_retires_scheduler_without_deleting_history(self):
         board = self.board()
         worker = self.new(board, "read design")
@@ -456,7 +492,7 @@ class SchedulerSmoke(unittest.TestCase):
             self.assertEqual(json.loads(args[args.index("--output-schema") + 1]), SCHEDULER_SCHEMA)
         variants = SCHEDULER_SCHEMA["properties"]["actions"]["items"]["anyOf"]
         self.assertEqual([v["properties"]["type"]["enum"] for v in variants],
-                         [["dispatch"], ["retry"], ["commit"], ["label"]])
+                         [["dispatch"], ["steer"], ["retry"], ["commit"], ["label"]])
         for schema in [SCHEDULER_SCHEMA, SCHEDULER_SCHEMA["properties"]["names"]["items"], *variants]:
             self.assertFalse(schema["additionalProperties"])
             self.assertEqual(set(schema["required"]), set(schema["properties"]))
@@ -688,6 +724,183 @@ class SchedulerSmoke(unittest.TestCase):
             self.assertTrue(turns[1]["prompt"].startswith("<system-request>\n"))
             self.assertTrue(turns[1]["prompt"].endswith("\n</system-request>"))
             self.assertTrue(all("--no-context" not in t["args"] for t in turns))
+
+    def test_explicit_steer_bypasses_pending_fifo_and_preserves_owner(self):
+        board = self.board()
+        original_text = "write hold original"
+        session = self.new(board, original_text)
+        self.until(board, lambda: self.steerable(board, session))
+        run = board._running(session["id"])["record"]
+        self.assertEqual(board.data["owner"], session["id"])
+        self.assertEqual(sum(a["record"]["kind"] == "worker" for a in board.active.values()), 1)
+
+        older_texts = ["read queued one\nkeep exactly", "read queued two & keep spaces  "]
+        older_ids = [board.request(dict(op="send", session_id=session["id"], text=text))["message_id"]
+                     for text in older_texts]
+        replacement = "read steer correction\nkeep exact whitespace  "
+        steer_id = board.request(dict(op="steer", session_id=session["id"], text=replacement))["message_id"]
+        self.assertEqual(session["steering"]["message_id"], steer_id)
+        self.assertEqual([m["id"] for m in board.data["messages"]],
+                         [run["message_id"], *older_ids, steer_id])
+        self.until(board, lambda: session.get("steering", {}).get("phase") == "ready")
+        self.assertEqual(session["last"]["exit"], "redirected")
+        self.assertEqual(session["last"]["code"], 0)
+        self.assertFalse(session["last"]["clean"])
+        self.assertFalse(run["stopping"])
+        self.assertEqual(board.data["owner"], session["id"])
+        self.assertFalse(board.workspace["clean"])
+
+        self.until(board, board.idle)
+        turns = self.journal(session)["invocations"]
+        prompts = [turn["prompt"] for turn in turns
+                   if turn["prompt"] and not turn["prompt"].startswith("<system-request>\n")]
+        self.assertEqual(prompts, [original_text, replacement, *older_texts])
+        self.assertEqual([m["id"] for m in board.data["messages"]], [])
+        self.assertTrue(all(turn["args"][0] != "retry" for turn in turns))
+        self.assertIsNone(board.data["owner"])
+
+    def test_automatic_steer_uses_pending_head_and_exact_run_id(self):
+        self.config(auto_steer=True, scheduler_delay=0.35)
+        board = self.board()
+        session = self.new(board, "read hold current work")
+        self.until(board, lambda: self.steerable(board, session))
+        run_id = board._running(session["id"])["record"]["id"]
+        first_text, second_text = "steer narrow the task", "steer another correction"
+        first = board.request(dict(op="send", session_id=session["id"], text=first_text))["message_id"]
+        second = board.request(dict(op="send", session_id=session["id"], text=second_text))["message_id"]
+
+        self.until(board, lambda: board._running(None) is not None)
+        scheduler = board._running(None)
+        snap_session = next(s for s in scheduler["snapshot"]["sessions"] if s["id"] == session["id"])
+        self.assertEqual(snap_session["active"]["id"], run_id)
+        self.assertTrue(snap_session["active"]["steer_available"])
+        with self.assertRaisesRegex(ValueError, "eligible active snapshot invocation"):
+            board._validate_plan(dict(reason="Stale active id", actions=[dict(
+                type="steer", message_id=first, run_id="stale-run", reason="Redirect work")]), scheduler)
+        with self.assertRaisesRegex(ValueError, "FIFO"):
+            board._validate_plan(dict(reason="Not the oldest", actions=[dict(
+                type="steer", message_id=second, run_id=run_id, reason="Skip the head")]), scheduler)
+
+        self.until(board, lambda: session.get("steering") is not None)
+        self.assertEqual(session["steering"]["message_id"], first)
+        self.assertEqual(session["steering"]["run_id"], run_id)
+        self.assertEqual([m["id"] for m in board.data["messages"] if m["state"] == "pending"], [first, second])
+        self.until(board, board.idle)
+        prompts = [turn["prompt"] for turn in self.journal(session)["invocations"] if turn["prompt"]]
+        self.assertEqual(prompts, ["read hold current work", first_text, second_text])
+
+    def test_interrupt_holds_redirect_until_resume(self):
+        board = self.board()
+        session = self.new(board, "read hold before interrupt")
+        self.until(board, lambda: self.steerable(board, session))
+        replacement = "read replacement after interrupt"
+        redirect_id = board.request(dict(op="steer", session_id=session["id"], text=replacement))["message_id"]
+        board.request(dict(op="interrupt", session_id=session["id"]))
+        self.assertTrue(session["hold"])
+        self.assertEqual(session["steering"]["phase"], "held")
+        self.until(board, lambda: board._running(session["id"]) is None)
+        self.until(board, board.idle)
+        self.assertTrue(session["hold"])
+        self.assertEqual(session["steering"]["phase"], "held")
+        self.assertEqual(len(self.journal(session)["invocations"]), 1)
+        redirect = next(m for m in board.data["messages"] if m["id"] == redirect_id)
+        self.assertEqual((redirect["text"], redirect["state"]), (replacement, "pending"))
+
+        result = board.request(dict(op="resume", session_id=session["id"]))
+        self.assertEqual(result, dict(eligible=True, retry=False, steering="ready"))
+        self.until(board, board.idle)
+        turns = self.journal(session)["invocations"]
+        self.assertEqual([turn["prompt"] for turn in turns], ["read hold before interrupt", replacement])
+        self.assertTrue(all(turn["args"][0] != "retry" for turn in turns))
+
+    def test_owner_restart_holds_redirect_until_resume(self):
+        board = self.board()
+        session = self.new(board, "read hold before restart")
+        self.until(board, lambda: self.steerable(board, session))
+        replacement = "read replacement after restart"
+        redirect_id = board.request(dict(op="steer", session_id=session["id"], text=replacement))["message_id"]
+        board.close()
+
+        reopened = self.board()
+        current = reopened.store.session(session["id"])
+        self.assertTrue(current["hold"])
+        self.assertEqual(current["steering"]["phase"], "held")
+        self.assertEqual(len(self.journal(current)["invocations"]), 1)
+        redirect = next(m for m in reopened.data["messages"] if m["id"] == redirect_id)
+        self.assertEqual((redirect["text"], redirect["state"]), (replacement, "pending"))
+        self.until(reopened, reopened.idle)
+        self.assertEqual(len(self.journal(current)["invocations"]), 1)
+
+        reopened.request(dict(op="resume", session_id=current["id"]))
+        self.until(reopened, reopened.idle)
+        turns = self.journal(current)["invocations"]
+        self.assertEqual([turn["prompt"] for turn in turns], ["read hold before restart", replacement])
+        self.assertTrue(all(turn["args"][0] != "retry" for turn in turns))
+
+    def test_steer_is_rejected_when_mu_has_no_sigquit_handler(self):
+        self.config(soft_interrupt=False)
+        board = self.board()
+        session = self.new(board, "read hold without soft handler")
+        self.until(board, lambda: board._running(session["id"]) is not None
+                   and self.journal(session)["active"]["busy"])
+        self.assertFalse(board._steer_available(board._running(session["id"])))
+        with self.assertRaisesRegex(ValueError, "Soft steering unavailable"):
+            board.request(dict(op="steer", session_id=session["id"], text="read must not signal"))
+        self.assertIsNone(session.get("steering"))
+        self.assertEqual([m["text"] for m in board.data["messages"]], ["read hold without soft handler"])
+        self.assertIsNotNone(board._running(session["id"]))
+
+    def test_early_redirect_delivery_failure_retains_text_without_retry(self):
+        board = self.board()
+        original = "read hold original request"
+        session = self.new(board, original)
+        self.until(board, lambda: self.steerable(board, session))
+        self.config(early_fail=True)
+        replacement = "read exact redirect to retain"
+        redirect_id = board.request(dict(op="steer", session_id=session["id"], text=replacement))["message_id"]
+        self.until(board, lambda: session.get("steering", {}).get("phase") == "held"
+                   and board._running(session["id"]) is None)
+        self.assertEqual(sum(m["id"] == redirect_id and m["text"] == replacement
+                             for m in board.data["messages"]), 1)
+        self.assertEqual(next(m["state"] for m in board.data["messages"] if m["id"] == redirect_id), "pending")
+        self.assertEqual(len(self.journal(session)["invocations"]), 1)
+
+        self.config()
+        board.request(dict(op="resume", session_id=session["id"]))
+        self.until(board, board.idle)
+        turns = self.journal(session)["invocations"]
+        self.assertEqual([turn["prompt"] for turn in turns], [original, replacement])
+        self.assertTrue(all(turn["args"][0] != "retry" for turn in turns))
+        self.assertFalse(any(m["text"] == replacement for m in board.data["messages"]))
+
+    def test_redirect_blockers_wait_for_explicit_recovery(self):
+        board = self.board()
+        session = self.new(board, "read hold while Mu is compacting")
+        self.until(board, lambda: self.steerable(board, session))
+        journal = self.root / ".mu/sessions" / f"{session['session']}.jsonl"
+        with journal.open("a") as stream:
+            stream.write(json.dumps(dict(type="prompt_queued", prompt_id="unmaterialized",
+                                        prompt=dict(kind="text", text="older Mu input"))) + "\n")
+            stream.write(json.dumps(dict(type="compaction_started", turn_id="compact", mode="await_user")) + "\n")
+        replacement = "read after explicit compaction recovery"
+        redirect_id = board.request(dict(op="steer", session_id=session["id"], text=replacement))["message_id"]
+        self.until(board, lambda: session.get("steering", {}).get("phase") == "held"
+                   and board._running(session["id"]) is None)
+        self.assertIn("unfinished compaction or unmaterialized input", session["reason"])
+        self.assertEqual(len(self.journal(session)["invocations"]), 1)
+        self.assertTrue(any(m["id"] == redirect_id and m["text"] == replacement and m["state"] == "pending"
+                            for m in board.data["messages"]))
+
+        self.config(release_hold=True)
+        result = board.request(dict(op="resume", session_id=session["id"]))
+        self.assertEqual(result, dict(eligible=True, retry=True))
+        self.assertEqual(session["steering"]["phase"], "recovery")
+        self.until(board, board.idle)
+        turns = self.journal(session)["invocations"]
+        self.assertEqual(turns[0]["prompt"], "read hold while Mu is compacting")
+        self.assertEqual(turns[1]["args"][0], "retry")
+        self.assertEqual(turns[2]["prompt"], replacement)
+        self.assertFalse(any(m["id"] == redirect_id for m in board.data["messages"]))
 
     def test_interrupt_holds_and_new_message_is_not_retry_permission(self):
         board = self.board()

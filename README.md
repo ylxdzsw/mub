@@ -4,11 +4,12 @@ A terminal UI for [Mu](https://github.com/ylxdzsw/mu) sessions with scheduled
 message delivery. Navigate conversations like a terminal multiplexer, but queue
 input at any time—even while a session is working.
 
-**Every message goes through the scheduler.** Messages remain FIFO within each
-session; the scheduler chooses between sessions. Sessions are conversations, not
-tasks with a completion lifecycle.
+**Ordinary messages go through the scheduler.** They remain FIFO within each
+session; the scheduler chooses between sessions. Explicit steering can supersede
+an unfinished turn without reordering those messages. Sessions are conversations,
+not tasks with a completion lifecycle.
 
-![Per-session FIFO message queues feed an AI scheduler that coordinates one writer and multiple readers in a shared live checkout.](docs/scheduling.png)
+![Ordinary per-session FIFO messages feed an AI scheduler coordinating one writer and multiple readers in a shared live checkout; explicit steering can supersede an unfinished turn without reordering those queues.](docs/scheduling.png)
 
 ## Run
 
@@ -60,6 +61,7 @@ and output navigation leaves the prompt cursor alone. Dialogs and pickers
 temporarily take keyboard input.
 Mailbox entries are labeled
 pending, in-flight, or interrupted; they are not mistaken for delivered history.
+Steering is labeled separately from ordinary queued messages.
 Drafts, prompt cursors, and output positions are kept separately for each session
 while the UI is open. Scrolling up pauses live following; typing and new output
 do not jump back to the bottom. Scroll to the bottom or use Ctrl-End to follow
@@ -95,7 +97,7 @@ appear only when relevant; model defaults and active models are available throug
 Session lists show only the ID, one status icon, and the title:
 `✎` writing, `≋` reading, `○` idle after writing, `●` idle after reading,
 `⇥` committing to close,
-`·` new/idle, `×` failed or trapped, `■` held/interrupted/stopping,
+`⇢` steering, `·` new/idle, `×` failed or trapped, `■` held/interrupted/stopping,
 and `…` blocked. Idle icons reflect the last run's mode,
 not whether its output has been viewed. Queue details remain in the conversation pane.
 
@@ -147,6 +149,15 @@ Local commands:
   unfinished turn, if any. This asks the scheduler to reconsider; it does not
   immediately launch a retry or grant permission for out-of-scope work. The UI
   distinguishes authorization, a running retry, and a renewed blocking reason.
+- `/steer <text>`: supersede the selected session's unfinished turn with a new
+  prompt, or submit a new turn if it is already idle and clean. If work is active,
+  the current provider request and running Bash calls finish,
+  then the old turn does no further work; the scheduler chooses the replacement's
+  mode and trap. Old pending tool calls are superseded, not retried, but this does
+  not imply task success. Ordinary queued messages keep their order and remain
+  behind explicit steering. For an inactive interrupted, trapped, or failed
+  session, the UI confirms that old pending calls will not be retried. In the CLI,
+  `mub steer` itself is explicit authorization; no extra flag is needed.
 - `/schedule`: recheck the workspace and scheduling. After a scheduler error,
   explicitly start a fresh scheduler session instead of retrying its old turn.
 - `/scheduler`: select the scheduler's decisions and output without triggering a
@@ -167,8 +178,9 @@ session still owns uncommitted changes and prevents another writer from starting
 
 ## Scheduling
 
-A bounded, persistent Mu scheduler wakes on message submissions and worker exits. It can
-run alongside workers, but only one scheduler invocation runs at a time. Events
+A bounded, persistent Mu scheduler wakes on message submissions, worker exits,
+and steering readiness when messages are pending. It can run alongside workers,
+but only one scheduler invocation runs at a time. Events
 arriving during a scheduler turn are retained for another pass. Waiting does not
 poll the model. A fixed 50 ms batching window combines nearby events without
 extending the delay on every arrival or skipping scheduling decisions.
@@ -184,12 +196,17 @@ It may dispatch several readers and at most one writer, or explain why nothing
 should run. It returns a small JSON decision as its final answer; runtime code
 validates it against current state before acting.
 
+Ordinary messages share one per-session FIFO pool; explicit steering bypasses
+those pending messages without reordering them. The scheduler may steer only the
+oldest pending ordinary message into its exact active run when it clearly corrects
+or redirects current work. Follow-ups and ambiguous messages stay pending.
+
 Every scheduler turn passes a fixed JSON Schema through Mu's `--output-schema`,
 alongside `-o final`. The schema constrains decision fields and the dispatch,
-retry, commit, and label action variants; names and execution trap policies are
-explicit. Worker turns, retries, and commit handoffs retain ordinary output.
-Structured output does not replace runtime checks for FIFO, holds, retry
-authorization, stale decisions, or writer ownership. Invalid decisions and
+steer, retry, commit, and label action variants; names and execution trap policies
+are explicit. Worker turns, retries, and commit handoffs retain ordinary output.
+Structured output does not replace runtime checks for FIFO, exact-run steering,
+holds, retry authorization, stale decisions, or writer ownership. Invalid decisions and
 provider/schema errors still stop scheduling for explicit `/schedule` recovery;
 there is no fallback to unconstrained output.
 
@@ -312,9 +329,10 @@ start with `--trap destructive`; the scheduler can choose `off` when that broade
 permission is justified. A subsequent normal turn gets a fresh access/trap
 policy. Single-command approval is not implemented.
 
-Before a dirty handoff, the scheduler prefers the owner's next FIFO message when
-it directly continues the uncommitted work and both naturally fit in one coherent
-commit. Relatedness is inferred from messages and worker outcomes, not code review.
+Before a dirty handoff, when there is no explicit steering request, the scheduler
+prefers the owner's oldest ordinary FIFO message when it directly continues the
+uncommitted work and both naturally fit in one coherent commit. Relatedness is
+inferred from messages and worker outcomes, not code review.
 This soft preference can outweigh global submission order, but not explicit user
 priorities or prerequisites. It is reassessed after each turn: the scheduler does
 not skip messages, drain unrelated work, indefinitely delay other writers, or wait
@@ -339,10 +357,29 @@ Interrupting a session records a user hold before signaling its processes. The
 hold blocks all automatic work, including queued messages, retries, and commit
 requests. Selecting a session, scrolling, or changing models does not release it.
 
-A new message releases the user hold for scheduling, but **does not authorize
-retrying an interrupted turn**. `mu retry` continues the old turn and cannot
-accept changed instructions. Use `/resume` explicitly after inspecting it; new
-messages remain queued behind the interrupted work.
+A new ordinary message releases the user hold for scheduling, but **does not
+authorize retrying an interrupted turn**. `mu retry` continues the old turn and
+cannot accept changed instructions. Use `/resume` explicitly after inspecting it;
+ordinary messages remain queued behind the interrupted work. To replace that
+unfinished work instead, use `/steer <text>`; old pending tool calls are
+superseded, not retried, and task success is not implied. For inactive interrupted,
+trapped, or failed sessions, the UI asks for confirmation. An explicit CLI
+`mub steer` is itself authorization.
+
+Steering an active turn is soft: the current provider request and running Bash
+calls finish before the old turn stops, with no further old-turn work. Mu must
+have `soft_interrupt` enabled (the default); mub checks that its signal handler
+is installed before sending SIGQUIT to Mu alone, never its Bash children. A running
+write may finish before the correction takes effect; steering does not undo it.
+The scheduler admits the replacement and chooses its mode and trap. Steering has
+no timeout or escalation; use `/interrupt` to stop and hold it. `/resume` authorizes its
+continuation. Mu cannot accept a new prompt during unfinished compaction or while
+existing input has not been materialized. mub keeps the redirect pending; inspect
+and use `/resume` to explicitly recover the blocking turn before steering continues.
+That recovery uses Mu retry and may continue old work before the redirect is delivered.
+Uncertain delivery and crashes require explicit recovery, never silent retry or
+discard. If the targeted invocation finishes naturally before steering takes effect,
+the explicit redirect still gets delivered, without interrupting a successor.
 
 Quitting with active workers or a scheduler asks for confirmation, defaulting to
 Cancel. Confirmation stops every owned invocation and records interruptions
@@ -365,6 +402,7 @@ mub new --name Review --model provider/model:high 'Review the API'
 mub model S1 provider/model:high # change only S1, starting with its next invocation
 mub model S1 default             # remove S1's override
 mub send S1 'Use cursor-based pagination'
+mub steer S1 'Stop the old approach and use cursor-based pagination'
 mub rename S1 'API pagination'
 mub rename S1 --auto            # allow the name to evolve on later scheduler passes
 mub new --name Investigation 'Read the existing authentication flow'
@@ -383,7 +421,8 @@ mub run --headless
 mub run --headless --until-idle
 ```
 
-`send` also reads text from stdin. `status` and `logs` work without an open owner.
+`send` and `steer` also read text from stdin. `status` and `logs` work without an
+open owner.
 `--until-idle` exits when no invocation or actionable scheduling event remains;
 held, blocked, or failed sessions may still have pending messages.
 
@@ -399,8 +438,8 @@ a hold or trigger work.
 ## Persistence
 
 **`.mu/mub.json` is the only mub-owned durable state file.** It contains session
-references, mailboxes, in-flight invocation records, holds and outcomes, workspace
-ownership, pending scheduling events, and model choices. It is atomically replaced
+references, mailboxes, steering records, in-flight invocation records, holds and
+outcomes, workspace ownership, pending scheduling events, and model choices. It is atomically replaced
 and locally Git-ignored via Git's `info/exclude` without editing tracked ignore
 configuration.
 

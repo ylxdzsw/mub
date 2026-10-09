@@ -97,6 +97,25 @@ def delivery(root, session, offset, clean):
     return "complete" if clean and queued <= materialized else "interrupted"
 
 
+def redirect_blocker(root, session):
+    """A new prompt cannot replace Mu's queued input or unfinished compaction."""
+    queued = set()
+    compacting = False
+    for event in journal_events(root, session):
+        match event["type"]:
+            case "prompt_queued":
+                queued.add(event["prompt_id"])
+            case "prompt_materialized":
+                queued.discard(event["prompt_id"])
+            case "compaction_started":
+                compacting = True
+            case "compaction_applied":
+                compacting = False
+    if compacting or queued:
+        return "Mu has unfinished compaction or unmaterialized input; /resume must recover the old turn before steering."
+    return None
+
+
 def replay(root, session, mu="mu", *, full=False):
     result = subprocess.run([mu, "transcript", "-s", session, "-o", "full" if full else "concise"],
                             cwd=root, capture_output=True, text=True)

@@ -58,6 +58,7 @@ class _UI:
         "/model [session|scheduler|worker|both]": "Show models, or choose a session/role model and effort",
         "/interrupt": "Interrupt and hold the selected session",
         "/resume [selected]": "Authorize continuation and ask the scheduler to reconsider",
+        "/steer <text>": "Supersede the selected session's unfinished turn with a new prompt",
         "/schedule": "Explicitly recheck or recover the scheduler",
         "/scheduler": "Select the scheduler's decisions and output",
         "/links": "Show hyperlink targets from the selected terminal",
@@ -299,6 +300,20 @@ class _UI:
     def _pending(self, session_id):
         return [message for message in self.state["messages"] if message["session_id"] == session_id]
 
+    def _steering_info(self, session):
+        steering = session.get("steering") if session else None
+        if not steering:
+            return None, None
+        message = next((item for item in self.state["messages"]
+                        if item["id"] == steering["message_id"]), None)
+        return steering, message
+
+    def _ordinary_pending(self, session_id):
+        session = self._session(session_id)
+        steering, _ = self._steering_info(session)
+        steering_id = steering.get("message_id") if steering else None
+        return [message for message in self._pending(session_id) if message["id"] != steering_id]
+
     def _scheduler_line(self):
         scheduler = self.state["scheduler"]
         status = "error" if scheduler.get("error") else "active" if scheduler["active"] else "idle"
@@ -317,12 +332,20 @@ class _UI:
     def _statistics_line(self):
         sessions = self.state["sessions"]
         running = sum(bool(session.get("active")) for session in sessions)
-        queued = sum(message["state"] == "pending" for message in self.state["messages"])
+        steering_ids = set()
+        for session in sessions:
+            if steering := self._steering_info(session)[0]:
+                steering_ids.add(steering["message_id"])
+        queued = sum(message["state"] == "pending" and message["id"] not in steering_ids
+                     for message in self.state["messages"])
+        steering = len(steering_ids)
         ready = sum(not any(session.get(key) for key in ("active", "hold", "gate", "blocked"))
                     for session in sessions)
-        return f"{running} running · {queued} queued · {ready} ready"
+        return f"{running} running · {queued} queued · {steering} steering · {ready} ready"
 
     def _session_status(self, session):
+        if steering := self._steering_info(session)[0]:
+            return f"steering · {steering.get('phase', 'ready')}"
         active = session.get("active")
         if session.get("hold"):
             return "held"
@@ -359,6 +382,8 @@ class _UI:
                       curses.A_REVERSE if session["id"] == self.selected else 0)
 
     def _session_icon(self, session):
+        if self._steering_info(session)[0]:
+            return "⇢"
         active = session.get("active")
         if active:
             if active.get("stopping"):
@@ -381,11 +406,12 @@ class _UI:
         return f"S{session['id']} {self._session_icon(session)} {session.get('name') or 'Session'}"
 
     def _prepare_output(self, session, width, height):
-        queue = self._pending(session["id"]) if session else []
-        queued = min(len(queue), 3, max(0, height - 2))
+        steering, steering_message = self._steering_info(session)
+        queue = self._ordinary_pending(session["id"]) if session else []
+        queued = min(len(queue), 3, max(0, height - 2 - bool(steering)))
         if len(queue) > queued:
             queued = max(0, queued - 1)
-        queue_rows = queued + (len(queue) > queued and queued < height - 1)
+        queue_rows = bool(steering) + queued + (len(queue) > queued and queued < height - 1)
         visible = max(0, height - 1 - queue_rows)
         columns = max(2, width - 2)
         # Size new terminals independently of mailbox/prompt rows. Existing
@@ -399,7 +425,7 @@ class _UI:
         if screen and screen.error:
             self.ui_error = screen.error
         prompt = None
-        pending = next((message for message in queue if message["state"] == "pending"), None)
+        pending = steering_message or next((message for message in queue if message["state"] == "pending"), None)
         scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
         if (session and not session.get("active") and (pending or not self._session_status(session))
                 and scroll["follow"] and (screen or not session.get("session"))):
@@ -413,12 +439,12 @@ class _UI:
                 self.prompt_screen.feed(prompt_bytes(block, pending=True))
                 self.prompt_key = key
             prompt = self.prompt_screen
-        return screen, prompt, queue, queued, visible
+        return screen, prompt, queue, queued, visible, steering, steering_message
 
     def _draw_conversation(self, session, x, y, width, height, output):
         if width <= 0 or height <= 0:
             return
-        screen, prompt, queue, queued, visible = output
+        screen, prompt, queue, queued, visible, steering, steering_message = output
         self.output_rect = (x, y, width, height)
         if session:
             title = f"S{session['id']} · {session['name']}"
@@ -432,6 +458,12 @@ class _UI:
         scroll = self.scrolls.setdefault(self.selected, {"follow": True, "line": 0})
         hint = " · History · Ctrl-End for live" if not scroll["follow"] else ""
         row = y + 1
+        if steering:
+            label = f"steering · {steering.get('phase', 'ready')}"
+            if steering_message:
+                label += f" · {steering_message['state']} · {steering_message['text']}"
+            self._add(row, x + 1, label, width - 2, self.colors.get("title", 0))
+            row += 1
         if queue:
             for message in queue[:queued]:
                 self._add(row, x + 1, f"{message['state']} · {message['text']}", width - 2, self.colors.get("warn", 0))
@@ -467,6 +499,8 @@ class _UI:
                 return "Committing before close…"
             if session.get("hold"):
                 return session.get("reason") or "Session held · /resume to continue"
+            if session.get("steering", {}).get("phase") == "stopping":
+                return session["reason"]
             if active := session.get("active"):
                 return "Retry running…" if active.get("action") == "retry" and not active.get("stopping") else ""
             if session.get("blocked"):
@@ -702,7 +736,7 @@ class _UI:
         if command not in {item.split()[0] for item in self.COMMANDS}:
             self.ui_error = "Unknown command. Use /help for local commands."
             return
-        if command not in ("/new", "/rename", "/model", "/resume") and argument:
+        if command not in ("/new", "/rename", "/model", "/resume", "/steer") and argument:
             self.ui_error = f"Usage: {command}"
             return
         if command == "/model" and argument not in ("", "session", "scheduler", "worker", "both"):
@@ -713,6 +747,22 @@ class _UI:
             return
         if command == "/rename" and not argument:
             self.ui_error = "Usage: /rename <name>|--auto"
+            return
+        if command == "/steer":
+            if not argument:
+                self.ui_error = "Usage: /steer <text>"
+                return
+            session = self._session()
+            if session is None:
+                self.ui_error = "Select a session to steer."
+                return
+            if (not session.get("active") and session.get("gate") in ("interrupted", "trapped", "failed")
+                    and not self._confirm("Supersede the unfinished turn?",
+                                          "The new prompt supersedes old pending tool calls; they will not be retried. Continue?")):
+                return
+            self._request({"op": "steer", "session_id": session["id"], "text": argument})
+            if self.request_ok:
+                self._set_draft("")
             return
         self._set_draft("")
         if command == "/new":
@@ -928,8 +978,8 @@ class _UI:
     def _help(self):
         lines = ["Commands:", *(f"  {name}  {description}" for name, description in self.COMMANDS.items()), "",
                  "Session icons:", "  ✎ writing · ≋ reading · ○ idle after writing · ● idle after reading",
-                 "  ⇥ committing to close",
-                 "  · new/idle · × failed/trapped · ■ held/interrupted/stopping · … blocked", "",
+                 "  ⇥ committing to close · ⇢ steering",
+                 "  × failed/trapped · ■ held/interrupted/stopping · … blocked; '·' new/idle", "",
                  "Keyboard:",
                  "  Ctrl-N         Create and select a session, preserving the current draft",
                  "  Tab/Shift-Tab  Next/previous session (Tab fills an open command panel)",

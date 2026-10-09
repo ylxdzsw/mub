@@ -55,6 +55,9 @@ def parser():
     send = sub.add_parser("send", help="Queue a message for a session")
     send.add_argument("session_id", type=session_id)
     send.add_argument("text", nargs="?")
+    steer = sub.add_parser("steer", help="Supersede a session's unfinished turn with a new prompt")
+    steer.add_argument("session_id", type=session_id)
+    steer.add_argument("text", nargs="?")
     for name, help_text in (("interrupt", "Stop a session and hold all automatic work"),
                             ("resume", "Release a hold; explicitly authorize continuation of the old turn"),
                             ("remove", "Detach an idle session; never delete its Mu journal"),
@@ -129,8 +132,11 @@ def main():
                         request["text"] = text
             elif command == "model":
                 request.update(op="set_session_model", model=None if args.reference == "default" else args.reference)
-            elif command == "send":
-                request["text"] = text_arg(args.text)
+            elif command in ("send", "steer"):
+                text = text_arg(args.text)
+                if command == "steer" and not text.strip():
+                    raise ValueError("Steering text cannot be empty")
+                request["text"] = text
             elif command == "rename":
                 if args.auto == (args.name is not None):
                     raise ValueError("Supply a name or --auto, not both")
@@ -186,7 +192,8 @@ def run(root, args):
                 engine.tick()
                 state = engine.state()
                 summary = dict(sessions=[dict(id=s["id"], name=s["name"], hold=s["hold"], gate=s["gate"],
-                                               active=s["active"], blocked=s["blocked"]) for s in state["sessions"]],
+                                               active=s["active"], blocked=s["blocked"], steering=s.get("steering"))
+                                         for s in state["sessions"]],
                                queued=len(state["messages"]), scheduler=state["scheduler"], workspace=state["workspace"])
                 encoded = json.dumps(summary, ensure_ascii=False)
                 if encoded != last:
