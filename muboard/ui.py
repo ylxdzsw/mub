@@ -327,7 +327,11 @@ class _UI:
         if session.get("hold"):
             return "held"
         if active:
-            return "stopping" if active.get("stopping") else "reading" if active["mode"] == "readonly" else "writing"
+            if active.get("stopping"):
+                return "stopping"
+            if "close_messages" in active:
+                return "committing to close"
+            return "reading" if active["mode"] == "readonly" else "writing"
         if session.get("blocked"):
             return "blocked"
         if session.get("retry_authorized"):
@@ -357,7 +361,11 @@ class _UI:
     def _session_icon(self, session):
         active = session.get("active")
         if active:
-            return "■" if active.get("stopping") else "≋" if active["mode"] == "readonly" else "✎"
+            if active.get("stopping"):
+                return "■"
+            if "close_messages" in active:
+                return "⇥"
+            return "≋" if active["mode"] == "readonly" else "✎"
         if session.get("gate") in ("failed", "trapped"):
             return "×"
         if session.get("hold") or session.get("gate") == "interrupted":
@@ -920,6 +928,7 @@ class _UI:
     def _help(self):
         lines = ["Commands:", *(f"  {name}  {description}" for name, description in self.COMMANDS.items()), "",
                  "Session icons:", "  ✎ writing · ≋ reading · ○ idle after writing · ● idle after reading",
+                 "  ⇥ committing to close",
                  "  · new/idle · × failed/trapped · ■ held/interrupted/stopping · … blocked", "",
                  "Keyboard:",
                  "  Ctrl-N         Create and select a session, preserving the current draft",

@@ -94,6 +94,7 @@ appear only when relevant; model defaults and active models are available throug
 
 Session lists show only the ID, one status icon, and the title:
 `✎` writing, `≋` reading, `○` idle after writing, `●` idle after reading,
+`⇥` committing to close,
 `·` new/idle, `×` failed or trapped, `■` held/interrupted/stopping,
 and `…` blocked. Idle icons reflect the last run's mode,
 not whether its output has been viewed. Queue details remain in the conversation pane.
