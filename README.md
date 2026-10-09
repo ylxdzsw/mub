@@ -173,6 +173,11 @@ arriving during a scheduler turn are retained for another pass. Waiting does not
 poll the model. A fixed 50 ms batching window combines nearby events without
 extending the delay on every arrival or skipping scheduling decisions.
 
+Closing a session only requests reconsideration when messages remain or another
+unheld session is blocked, trapped, or authorized to retry. Other pending events
+are preserved. With no sessions left, automatic events are consumed without a
+scheduler pass; an explicit `/schedule` still requests one.
+
 The scheduler sees pending messages, active workers, Git cleanliness, workspace
 ownership, latest worker responses, exit reasons, and complete trap evidence.
 It may dispatch several readers and at most one writer, or explain why nothing

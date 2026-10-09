@@ -371,7 +371,11 @@ class Engine:
         if pending_replay:
             pending_replay[1].cancel()
         self.data["messages"] = [m for m in self.data["messages"] if m["session_id"] != session["id"]]
-        self.store.event("removed", session["id"])
+        if self.data["messages"] or any(
+            not s["hold"] and (s["retry_authorized"] or s["gate"] == "trapped" or s["blocked"])
+            for s in self.data["sessions"]
+        ):
+            self.store.event("removed", session["id"])
 
     def output(self, session_id):
         target = self.data["scheduler"] if session_id is None else self.store.session(int(session_id))
@@ -999,6 +1003,11 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
             return
         if self._running(None) or not self.data["events"] or self.data["scheduler"]["error"]:
             self.schedule_at = None
+            return
+        if not self.data["sessions"] and not any(e["kind"] == "recheck" for e in self.data["events"]):
+            self.data["events"] = []
+            self.schedule_at = None
+            self.store.save()
             return
         if self.schedule_at is None:
             self.schedule_at = time.monotonic() + self.scheduler_batch_seconds
