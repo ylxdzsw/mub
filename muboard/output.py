@@ -132,6 +132,21 @@ def literal(value):
     )
 
 
+def scheduling_note(result):
+    action = result["action"]
+    label = action["type"]
+    if policy := action.get("policy"):
+        label += f" ({policy})"
+    if action["type"] == "rename":
+        label += f" to {action['name']}"
+    if not result["applied"]:
+        # A declined action is normal runtime arbitration, not a failure.
+        label += " — skipped: " + result["detail"]
+    if reason := action.get("reason"):
+        label += " — " + reason
+    return label
+
+
 def live_prompt(text, cwd, status):
     tokens, window = status.get("context_tokens"), status.get("context_window")
     context = None

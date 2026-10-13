@@ -10,7 +10,7 @@ import unicodedata
 from collections import deque
 
 from .output import literal as _text
-from .output import live_prompt, prompt_bytes
+from .output import live_prompt, prompt_bytes, scheduling_note
 from .terminal import Screen
 
 
@@ -316,7 +316,7 @@ class _UI:
 
     def _scheduler_line(self):
         scheduler = self.state["scheduler"]
-        status = "error" if scheduler.get("error") else "active" if scheduler["active"] else "idle"
+        status = "held: failed" if scheduler.get("error") else "active" if scheduler["active"] else "idle"
         return f"Scheduler {status}"
 
     def _scheduler_usage_lines(self):
@@ -492,9 +492,11 @@ class _UI:
         if self.ui_error:
             return self.ui_error
         if error := self.state["scheduler"].get("error"):
-            return error
+            return f"Scheduler held: {error} · /schedule to recover"
         session = self._session()
         if session:
+            scheduling = session.get("scheduling")
+            annotation = "Last scheduler action: " + scheduling_note(scheduling) if scheduling else ""
             if "close_messages" in (session.get("active") or {}):
                 return "Committing before close…"
             if session.get("hold"):
@@ -502,12 +504,14 @@ class _UI:
             if session.get("steering", {}).get("phase") == "stopping":
                 return session["reason"]
             if active := session.get("active"):
-                return "Retry running…" if active.get("action") == "retry" and not active.get("stopping") else ""
+                if active.get("action") == "redirect":
+                    return "Explicit redirect running…"
+                return annotation or ("Retry running…" if active.get("action") == "retry" and not active.get("stopping") else "")
             if session.get("blocked"):
                 return "Blocked: " + session["blocked"]
             if session.get("retry_authorized"):
                 return "Resume authorized; awaiting scheduler decision."
-            return session.get("reason", "") if session.get("gate") else ""
+            return session.get("reason", "") if session.get("gate") else annotation
         return self.state["scheduler"].get("reason") or ""
 
     def _composer_geometry(self, height, width):

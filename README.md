@@ -5,11 +5,12 @@ message delivery. Navigate conversations like a terminal multiplexer, but queue
 input at any time—even while a session is working.
 
 **Ordinary messages go through the scheduler.** They remain FIFO within each
-session; the scheduler chooses between sessions. Explicit steering can supersede
-an unfinished turn without reordering those messages. Sessions are conversations,
-not tasks with a completion lifecycle.
+session; the scheduler chooses between sessions and never interrupts a current
+invocation. Explicit `/steer` redirects are admitted directly at Mu's safe
+boundary without reordering ordinary messages. Sessions are conversations, not
+tasks with a completion lifecycle.
 
-![Ordinary per-session FIFO messages feed an AI scheduler coordinating one writer and multiple readers in a shared live checkout; explicit steering can supersede an unfinished turn without reordering those queues.](docs/scheduling.png)
+![Ordinary per-session FIFO messages feed an AI scheduler coordinating one writer and multiple readers in a shared live checkout; explicit redirects do not reorder those queues.](docs/scheduling.png)
 
 ## Run
 
@@ -149,15 +150,19 @@ Local commands:
   unfinished turn, if any. This asks the scheduler to reconsider; it does not
   immediately launch a retry or grant permission for out-of-scope work. The UI
   distinguishes authorization, a running retry, and a renewed blocking reason.
-- `/steer <text>`: supersede the selected session's unfinished turn with a new
-  prompt, or submit a new turn if it is already idle and clean. If work is active,
-  the current provider request and running Bash calls finish,
-  then the old turn does no further work; the scheduler chooses the replacement's
-  mode and trap. Old pending tool calls are superseded, not retried, but this does
-  not imply task success. Ordinary queued messages keep their order and remain
-  behind explicit steering. For an inactive interrupted, trapped, or failed
-  session, the UI confirms that old pending calls will not be retried. In the CLI,
-  `mub steer` itself is explicit authorization; no extra flag is needed.
+- `/steer <text>`: directly admit a redirect at Mu's next safe boundary, or submit
+  a turn if the selected session is idle and clean. It needs no scheduler decision
+  when no policy promotion or dirty handoff is needed, and works while the
+  scheduler is held. A redirect inherits the prior access mode (readonly if there
+  is none) but gets fresh normal traps: reversible for readonly, destructive for
+  readwrite; `off` is never inherited. It remains within the one-invocation limit
+  and obeys writer and dirty-owner restrictions. Ordinary messages stay FIFO and
+  never interrupt the current invocation; they remain queued behind the redirect.
+  Old pending tool calls are superseded, not retried, and the redirect remains in
+  Mu history; neither implies task success. Holds and recovery gates still apply.
+  For an inactive interrupted, trapped, or failed session, the UI confirms that
+  old pending calls will not be retried. In the CLI, `mub steer` itself is explicit
+  authorization; no extra flag is needed.
 - `/schedule`: recheck the workspace and scheduling. After a scheduler error,
   explicitly start a fresh scheduler session instead of retrying its old turn.
 - `/scheduler`: select the scheduler's decisions and output without triggering a
@@ -178,12 +183,12 @@ session still owns uncommitted changes and prevents another writer from starting
 
 ## Scheduling
 
-A bounded, persistent Mu scheduler wakes on message submissions, worker exits,
-and steering readiness when messages are pending. It can run alongside workers,
-but only one scheduler invocation runs at a time. Events
-arriving during a scheduler turn are retained for another pass. Waiting does not
-poll the model. A fixed 50 ms batching window combines nearby events without
-extending the delay on every arrival or skipping scheduling decisions.
+A bounded, persistent Mu scheduler wakes on message submissions and worker
+exits. It can run alongside workers, but only one scheduler invocation runs at
+a time. Events arriving during a scheduler turn are retained for another pass.
+Waiting does not poll the model. A fixed 50 ms batching window combines nearby
+events without extending the delay on every arrival or skipping scheduling
+decisions.
 
 Closing a session only requests reconsideration when messages remain or another
 unheld session is blocked, trapped, or authorized to retry. Other pending events
@@ -193,22 +198,42 @@ scheduler pass; an explicit `/schedule` still requests one.
 The scheduler sees pending messages, active workers, Git cleanliness, workspace
 ownership, latest worker responses, exit reasons, and complete trap evidence.
 It may dispatch several readers and at most one writer, or explain why nothing
-should run. It returns a small JSON decision as its final answer; runtime code
-validates it against current state before acting.
-
-Ordinary messages share one per-session FIFO pool; explicit steering bypasses
-those pending messages without reordering them. The scheduler may steer only the
-oldest pending ordinary message into its exact active run when it clearly corrects
-or redirects current work. Follow-ups and ambiguous messages stay pending.
+should run. Ordinary messages stay in per-session FIFO and never interrupt a
+current invocation; the scheduler does not automatically steer them. Explicit
+`/steer` redirects are admitted directly by runtime at Mu's safe boundary, without
+a scheduler decision.
 
 Every scheduler turn passes a fixed JSON Schema through Mu's `--output-schema`,
-alongside `-o final`. The schema constrains decision fields and the dispatch,
-steer, retry, commit, and label action variants; names and execution trap policies
-are explicit. Worker turns, retries, and commit handoffs retain ordinary output.
-Structured output does not replace runtime checks for FIFO, exact-run steering,
-holds, retry authorization, stale decisions, or writer ownership. Invalid decisions and
-provider/schema errors still stop scheduling for explicit `/schedule` recovery;
-there is no fallback to unconstrained output.
+alongside `-o final`. The strict top-level object is `{summary: string, actions: []}`.
+Actions are a small `anyOf`; each variant requires every declared field, including
+`type`, and allows no undeclared fields:
+
+| Action | Required fields |
+| --- | --- |
+| `dispatch` | `type`, `message_id`, `policy`, `reason` |
+| `retry` | `type`, `session_id`, `policy`, `reason` |
+| `commit`, `block`, `fail` | `type`, `session_id`, `reason` |
+| `clear` | `type`, `session_id` |
+| `rename` | `type`, `session_id`, `name` |
+
+There is no `names` array. A session may receive at most one non-rename action
+and one rename in a decision. Dispatch and retry policies are `readonly`
+(`readonly` with a reversible trap), `write` (`readwrite` with a destructive
+trap), or `unrestricted` (`readwrite` with traps off), which requires justified
+permission. `block` records an informational note and does not gate execution;
+`fail` gates a session until explicit user continuation and is never used for
+traps. `clear` removes only the blocked note.
+
+The group summary and action reasons are user-facing. Runtime reports each action
+as applied or skipped and shows each affected session's latest action annotation.
+These annotations are not instructions injected into worker conversations.
+Structured output does not replace runtime checks for FIFO, holds, retry
+authorization, stale decisions, or writer ownership. A clean malformed decision
+gets one automatic corrective scheduler pass; a second rejected decision or a
+provider failure holds scheduling. Failed scheduler turns are not retried. Use
+`/schedule` to start a fresh scheduler session; existing workers may finish, but
+queued messages and other events do not release the scheduler hold. There is no
+fallback to unconstrained output.
 
 ### Scheduler context and usage
 
@@ -218,12 +243,17 @@ redraws. Snapshots include each session's two latest materialized requests and
 final responses before any active invocation. Requests are excerpted at 2,000
 characters and responses at 3,000, with explicit omission markers and a count of
 older turns. Pending/inflight mailbox messages and trap evidence remain complete.
-Failure diagnostics are kept separately from assistant responses.
+Failure diagnostics are kept separately from assistant responses. Snapshots
+include current blocked and failure reasons, but not routine scheduling
+annotations or the group summary. The scheduler view shows the summary and action
+results; each worker view shows its latest scheduling annotation. `mub status`
+and headless output expose the same structured results.
 
 Within one scheduler session, unchanged conversational evidence is referenced
 rather than resent. Scheduling policy is sent once; each pass still receives the
 current gates, holds, ownership, active workers, and FIFO mailboxes. The latest
-snapshot overrides older state, and previous decisions are not policy.
+snapshot overrides older state. Previous decisions remain in the persistent
+scheduler conversation until rotation, but are not policy.
 
 Only clean scheduler sessions rotate: after 12 passes, at 32,000 context tokens
 (or half the model's context window, whichever is smaller), after compaction,
@@ -267,15 +297,16 @@ system prompt remains until compaction or the normal rotation rules take effect.
 
 ### Session names and dependencies
 
-Sessions created without a name start as `Session N`. During ordinary scheduling
-passes, the scheduler gives them short topic-based names and updates those names
-when the conversation's main focus changes. Names do not include execution status;
-session IDs remain stable. Explicitly supplied names are user-owned and never
-overwritten by the scheduler, including when a rename happens during a scheduler
-pass. `/rename --auto` keeps the current title until a later scheduling pass finds
-a useful replacement; renaming alone does not wake the scheduler or affect queued
-work or holds. Existing sessions saved before name ownership was introduced keep
-their names as user-owned; use `/rename --auto` to opt them in.
+Sessions created without a name start as `Session N`. During scheduling passes,
+the scheduler may give auto-owned sessions short topic-based names and update
+them when the conversation's main focus changes. It should aim for titles within
+40 characters as a soft limit, not a hard ceiling. Names do not include execution
+status; session IDs remain stable. Explicitly supplied names are user-owned and
+never overwritten by the scheduler. `/rename --auto` keeps the current title
+until a later scheduling pass finds a useful replacement; renaming alone does
+not wake the scheduler or affect queued work or holds. Existing sessions saved
+before name ownership was introduced keep their names as user-owned; use
+`/rename --auto` to opt them in.
 
 The scheduler reasons about prerequisites from messages and outcomes; there is
 no dependency graph, numeric priority system, task decomposition, or PM review.
@@ -317,17 +348,17 @@ or shared user data, and operations needing broader permission remain blocked
 with a concrete explanation.
 
 A trap is not a failure. A session waiting for the writer slot or workspace stays
-trapped and can be retried automatically when available. Scheduler failure labels
-on trapped sessions are treated as blocking explanations, not as changes to the
-invocation's outcome. Explicit continuation permission is still required for
-genuine failures and interrupted turns; user holds always prohibit execution.
-Resuming a trapped turn preserves its trap classification and full command
-evidence for the scheduler, separately from explicit continuation permission.
+trapped and can be retried when available; the scheduler must never use `fail`
+for a trap. Explicit continuation permission is still required for genuine
+failures and interrupted turns; user holds always prohibit execution. Resuming a
+trapped turn preserves its trap classification and full command evidence for the
+scheduler, separately from explicit continuation permission.
 
-Trap relaxation applies to the **rest of that turn**, not one command. Ordinary writes
-start with `--trap destructive`; the scheduler can choose `off` when that broader
-permission is justified. A subsequent normal turn gets a fresh access/trap
-policy. Single-command approval is not implemented.
+Normal dispatch and retry policies pair readonly access with `--trap reversible`,
+readwrite access with `--trap destructive`, or readwrite access with traps off
+only when unrestricted permission is justified. Trap policy applies to the
+**rest of that turn**, not one command. A subsequent normal turn gets a fresh
+access/trap policy. Single-command approval is not implemented.
 
 Before a dirty handoff, when there is no explicit steering request, the scheduler
 prefers the owner's oldest ordinary FIFO message when it directly continues the
@@ -348,8 +379,9 @@ An unsuccessful handoff does not cause repeated commit requests without new user
 input.
 
 The scheduler does not investigate implementation quality, repair failures,
-troubleshoot provider issues, or work around Mu bugs. Failures are exposed and
-may block dependent messages. They are not automatically retried.
+troubleshoot provider issues, or work around Mu bugs. Worker-turn failures are
+exposed and may block dependent messages; failed Mu turns are not automatically
+retried.
 
 ### Interruption and shutdown
 
@@ -361,25 +393,32 @@ A new ordinary message releases the user hold for scheduling, but **does not
 authorize retrying an interrupted turn**. `mu retry` continues the old turn and
 cannot accept changed instructions. Use `/resume` explicitly after inspecting it;
 ordinary messages remain queued behind the interrupted work. To replace that
-unfinished work instead, use `/steer <text>`; old pending tool calls are
-superseded, not retried, and task success is not implied. For inactive interrupted,
-trapped, or failed sessions, the UI asks for confirmation. An explicit CLI
-`mub steer` is itself authorization.
+unfinished work instead, use `/steer <text>`. For inactive interrupted, trapped,
+or failed sessions, the UI asks for confirmation. An explicit CLI `mub steer` is
+itself authorization; holds and recovery gates still apply.
 
 Steering an active turn is soft: the current provider request and running Bash
 calls finish before the old turn stops, with no further old-turn work. Mu must
 have `soft_interrupt` enabled (the default); mub checks that its signal handler
 is installed before sending SIGQUIT to Mu alone, never its Bash children. A running
-write may finish before the correction takes effect; steering does not undo it.
-The scheduler admits the replacement and chooses its mode and trap. Steering has
-no timeout or escalation; use `/interrupt` to stop and hold it. `/resume` authorizes its
-continuation. Mu cannot accept a new prompt during unfinished compaction or while
-existing input has not been materialized. mub keeps the redirect pending; inspect
-and use `/resume` to explicitly recover the blocking turn before steering continues.
-That recovery uses Mu retry and may continue old work before the redirect is delivered.
-Uncertain delivery and crashes require explicit recovery, never silent retry or
-discard. If the targeted invocation finishes naturally before steering takes effect,
-the explicit redirect still gets delivered, without interrupting a successor.
+write may finish before the redirect takes effect; steering does not undo it.
+Runtime admits the redirect at Mu's safe boundary without a scheduler decision,
+starting its replacement invocation only after the old one stops. It inherits the
+prior access mode (or readonly if none),
+but gets a fresh normal trap: reversible for readonly, destructive for readwrite;
+it never inherits traps off. Writer-slot and dirty-owner restrictions still
+apply. Direct admission works while the scheduler is held if no promotion or
+dirty handoff is needed; those still require scheduler authorization. Old pending
+tool calls are superseded, not retried, the redirect is kept in Mu history, and
+task success is not implied. Steering has no timeout or escalation; use
+`/interrupt` to stop and hold it. Mu cannot accept a new prompt during unfinished
+compaction or while existing input has not been materialized. mub keeps the
+redirect pending; inspect and use `/resume` to explicitly recover the blocking
+turn before steering continues. That recovery requires a scheduler-authorized
+Mu retry and may continue old work before the redirect is delivered. Uncertain
+delivery and crashes require explicit recovery, never silent retry or discard.
+If the targeted invocation finishes naturally before steering takes effect, the
+explicit redirect still gets delivered, without interrupting a successor.
 
 Quitting with active workers or a scheduler asks for confirmation, defaulting to
 Cancel. Confirmation stops every owned invocation and records interruptions
@@ -424,7 +463,9 @@ mub run --headless --until-idle
 `send` and `steer` also read text from stdin. `status` and `logs` work without an
 open owner.
 `--until-idle` exits when no invocation or actionable scheduling event remains;
-held, blocked, or failed sessions may still have pending messages.
+held, blocked, or failed sessions may still have pending messages. A scheduler
+failure keeps the owner alive even with an empty mailbox until explicit recovery;
+use `mub schedule` to start a fresh scheduler session.
 
 `--scheduler-model`, `--worker-model`, and `--model` override models for the current
 launch. UI/CLI model selections persist and apply only to later invocations,
@@ -445,8 +486,10 @@ configuration.
 
 Mu journals own delivered conversations. mub does not copy transcripts or archive
 terminal logs. Live output and full trap evidence are transient; history replays
-from Mu. Only bounded recent outcome excerpts are kept for scheduling. A stable
-owner lock and a live control socket are runtime artifacts in `.mu/`.
+from Mu. Only bounded recent outcome excerpts are kept for scheduling, alongside
+current blocked and failure reasons. The latest scheduler application results and
+per-session scheduling annotations are also kept in the board snapshot for display.
+A stable owner lock and a live control socket are runtime artifacts in `.mu/`.
 
 A journal offset records each delivery boundary, allowing mub to distinguish a
 completed message from an invocation that never accepted its input. A crash

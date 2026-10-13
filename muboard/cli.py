@@ -192,7 +192,8 @@ def run(root, args):
                 engine.tick()
                 state = engine.state()
                 summary = dict(sessions=[dict(id=s["id"], name=s["name"], hold=s["hold"], gate=s["gate"],
-                                               active=s["active"], blocked=s["blocked"], steering=s.get("steering"))
+                                               active=s["active"], reason=s["reason"], blocked=s["blocked"],
+                                               steering=s.get("steering"), scheduling=s.get("scheduling"))
                                          for s in state["sessions"]],
                                queued=len(state["messages"]), scheduler=state["scheduler"], workspace=state["workspace"])
                 encoded = json.dumps(summary, ensure_ascii=False)

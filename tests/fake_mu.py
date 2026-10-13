@@ -77,50 +77,40 @@ def schedule(snapshot, config):
     dirty = not snapshot["workspace"]["clean"]
     order = config.get("order", [])
     sessions = sorted(sessions, key=lambda s: order.index(s["id"]) if s["id"] in order else len(order) + s["id"])
+
+    def writable(key):
+        return not writer and (not dirty or owner == key)
+
+    def retry_policy(session):
+        if session["gate"] == "trapped":
+            return "write"
+        return "readonly" if (session.get("last") or {}).get("mode", "readonly") == "readonly" else "write"
+
     for session in sessions:
         key = session["id"]
         if session["hold"]:
             continue
-        writable = not writer and (not dirty or owner == key)
         steering = session.get("steering")
         if steering:
-            if session["active"] or steering["phase"] in ("stopping", "held", "delivering"):
-                continue
-            if steering["phase"] == "ready":
-                message = next((m for m in snapshot["messages"] if m["id"] == steering["message_id"]), None)
-                if message and message["state"] == "pending":
-                    mode = "readwrite" if message["text"].startswith("write") else "readonly"
-                    if mode == "readonly" or writable:
-                        actions.append(dict(type="dispatch", message_id=message["id"], mode=mode,
-                                            trap="reversible" if mode == "readonly" else "destructive"))
-                        writer |= mode == "readwrite"
-                continue
-            if steering["phase"] == "recovery":
-                if session["user_retry_authorized"]:
-                    mode = (session.get("last") or {}).get("mode", "readwrite")
-                    if mode == "readonly" or writable:
-                        actions.append(dict(type="retry", session_id=key, mode=mode,
-                                            trap="reversible" if mode == "readonly" else "off",
-                                            reason="Explicitly recover Mu before applying the pending redirect"))
-                        writer |= mode == "readwrite"
-                continue
+            if (steering["phase"] == "recovery" and session["user_retry_authorized"]):
+                policy = retry_policy(session)
+                if policy == "readonly" or writable(key):
+                    actions.append(dict(type="retry", session_id=key, policy=policy,
+                                        reason="Explicitly recover Mu before applying the pending redirect"))
+                    writer |= policy != "readonly"
             continue
         if session["active"]:
-            message = next((m for m in snapshot["messages"]
-                            if m["session_id"] == key and m["state"] == "pending"), None)
-            if (config.get("auto_steer", False) and message and message["text"].startswith("steer ")
-                    and session["active"].get("steer_available")):
-                actions.append(dict(type="steer", message_id=message["id"], run_id=session["active"]["id"],
-                                    reason="The oldest pending message redirects the active work"))
             continue
         if session["gate"] == "trapped" or session["user_retry_authorized"]:
-            if writable:
-                actions.append(dict(type="retry", session_id=key, mode="readwrite", trap="off", reason="Scripted trap approval for this turn"))
-                writer = True
+            policy = retry_policy(session)
+            if policy == "readonly" or writable(key):
+                actions.append(dict(type="retry", session_id=key, policy=policy,
+                                    reason="Scripted retry for this turn"))
+                writer |= policy != "readonly"
             continue
         if session["gate"]:
             continue
-        if dirty and owner == key and writable and (session["last"] or {}).get("action") != "commit":
+        if dirty and owner == key and writable(key) and (session["last"] or {}).get("action") != "commit":
             actions.append(dict(type="commit", session_id=key, reason="Release checkout"))
             writer = True
             continue
@@ -131,15 +121,16 @@ def schedule(snapshot, config):
             prerequisite = int(message["text"].split()[1])
             source = next(s for s in sessions if s["id"] == prerequisite)
             if not source["last"] or source["gate"] or source["active"]:
-                actions.append(dict(type="label", session_id=key, status="blocked", reason=f"Waiting for S{prerequisite}"))
+                actions.append(dict(type="block", session_id=key, reason=f"Waiting for S{prerequisite}"))
                 continue
-        mode = "readwrite" if message["text"].startswith("write") else "readonly"
-        if mode == "readwrite" and not writable:
+        text = message["text"]
+        policy = "write" if text.startswith("write") else "readonly"
+        if policy != "readonly" and not writable(key):
             continue
-        actions.append(dict(type="dispatch", message_id=message["id"], mode=mode,
-                            trap="reversible" if mode == "readonly" else "destructive"))
-        writer |= mode == "readwrite"
-    return dict(reason="Scripted scheduling decision", names=[], actions=actions)
+        actions.append(dict(type="dispatch", message_id=message["id"], policy=policy,
+                            reason="Dispatch the oldest pending message"))
+        writer |= policy != "readonly"
+    return dict(summary="Scripted scheduling decision", actions=actions)
 
 
 def main():
