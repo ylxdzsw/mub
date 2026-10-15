@@ -246,8 +246,9 @@ older turns. Pending/inflight mailbox messages and trap evidence remain complete
 Failure diagnostics are kept separately from assistant responses. Snapshots
 include current blocked and failure reasons, but not routine scheduling
 annotations or the group summary. The scheduler view shows the summary and action
-results; each worker view shows its latest scheduling annotation. `mub status`
-and headless output expose the same structured results.
+results. Routine decisions and normal progress do not show a warning notice;
+blocked sessions, holds, and failures still surface reasons requiring attention.
+`mub status` and headless output expose the same structured results.
 
 Within one scheduler session, unchanged conversational evidence is referenced
 rather than resent. Scheduling policy is sent once; each pass still receives the

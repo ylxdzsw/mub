@@ -64,26 +64,45 @@ class InputSmoke(unittest.TestCase):
         ui.engine.request.assert_not_called()
         self.assertEqual(ui.draft, "/steer")
 
-    def test_resume_notice_distinguishes_authorization_block_and_retry(self):
+    def test_notices_only_show_attention_required_states(self):
         ui = _UI.__new__(_UI)
         session = dict(id=1, gate="interrupted", retry_authorized=True,
                        reason="Resume authorized; awaiting scheduler decision.")
-        ui.state = dict(sessions=[session], scheduler={})
+        ui.state = dict(sessions=[session], scheduler=dict(reason="Normal scheduling decision"))
         ui.selected, ui.ui_error = 1, ""
         self.assertEqual(ui._session_status(session), "resume authorized")
-        self.assertEqual(ui._notice(), session["reason"])
+        self.assertEqual(ui._notice(), "")
         session["blocked"] = "Inspection scope conflict"
         self.assertEqual(ui._session_status(session), "blocked")
         self.assertEqual(ui._notice(), "Blocked: Inspection scope conflict")
         session.update(blocked=None, retry_authorized=False,
                        active=dict(action="retry", mode="readwrite"))
         self.assertEqual(ui._session_status(session), "writing")
-        self.assertEqual(ui._notice(), "Retry running…")
+        self.assertEqual(ui._notice(), "")
         session["scheduling"] = dict(action=dict(type="retry", policy="write", reason="Build task-owned output"),
                                      applied=True, detail="")
-        self.assertEqual(ui._notice(), "Last scheduler action: retry (write) — Build task-owned output")
+        self.assertEqual(ui._notice(), "")
         session["scheduling"].update(applied=False, detail="Writer slot unavailable")
-        self.assertIn("skipped: Writer slot unavailable", ui._notice())
+        self.assertEqual(ui._notice(), "")
+        session.update(active=None, gate=None, reason="")
+        self.assertEqual(ui._notice(), "")
+        for gate in ("failed", "trapped", "interrupted"):
+            with self.subTest(gate=gate):
+                session.update(gate=gate, reason=f"Mu {gate}.")
+                self.assertEqual(ui._notice(), session["reason"])
+        session.update(hold=True, reason="Inspect before resuming")
+        self.assertEqual(ui._notice(), session["reason"])
+        session.update(hold=False, gate="redirect", reason="Redirect pending; awaiting runtime admission.")
+        self.assertEqual(ui._notice(), "")
+        session.update(active=dict(action="redirect"), steering=dict(phase="stopping"),
+                       reason="Steering requested; waiting for Mu's safe boundary.")
+        self.assertEqual(ui._notice(), "")
+        ui.selected = None
+        self.assertEqual(ui._notice(), "")
+        ui.state["scheduler"]["error"] = "Cannot apply decision"
+        self.assertIn("Scheduler held: Cannot apply decision", ui._notice())
+        ui.ui_error = "Close needs confirmation"
+        self.assertEqual(ui._notice(), ui.ui_error)
 
     def test_dirty_close_requires_currently_displayed_warning(self):
         sessions = [dict(id=1, name="Dirty", active=None), dict(id=2, name="Other", active=None)]
@@ -139,7 +158,7 @@ class InputSmoke(unittest.TestCase):
             engine.request.assert_called_once_with(dict(op="commit_close", session_id=1, discard=False))
             ui._main_key(4)
             self.assertEqual(engine.request.call_count, 1)
-            self.assertEqual(ui._notice(), "Committing before close…")
+            self.assertEqual(ui._notice(), "")
             sessions.pop(0)
             ui._tick()
             self.assertEqual(ui.selected, 2)
