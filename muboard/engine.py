@@ -677,7 +677,7 @@ Return {{"summary":"short explanation of the overall decision", "actions":[...]}
 - block(session_id, reason): record a waiting explanation, not a hold or failure. Withhold dependent execution yourself; the note gates nothing. Reconsider it when circumstances change.
 - fail(session_id, reason): mark a genuine failure requiring explicit user recovery. Never use for traps, unavailable capacity, uncertainty, or redirects. Never troubleshoot provider or Mu bugs.
 - clear(session_id): remove a blocked note only; it cannot release a hold, clear a gate, authorize retry, or run work.
-- rename(session_id, name): display metadata for name_source "auto" only, including active or held sessions. Keep titles within 40 characters, short and topic-based. Rename when the topic materially changes, not every turn; avoid statuses like Running or Done. Never rename a user-owned title.
+- rename(session_id, name): display metadata for name_source "auto" only, including active or held sessions. Treat the default "Session N" title as unnamed: include a rename for every such session as soon as its queued messages or conversation reveal a topic, including alongside its first dispatch. Leave the default only when no topic is available yet. Keep titles within 40 characters, short and topic-based. Once named, rename when the topic materially changes, not every turn; avoid statuses like Running or Done. Never rename a user-owned title.
 
 EXECUTION POLICY
 Choose one policy on every dispatch or retry:

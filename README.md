@@ -298,8 +298,11 @@ system prompt remains until compaction or the normal rotation rules take effect.
 ### Session names and dependencies
 
 Sessions created without a name start as `Session N`. During scheduling passes,
-the scheduler may give auto-owned sessions short topic-based names and update
-them when the conversation's main focus changes. It should aim for titles within
+the scheduler is instructed to give every auto-owned default title a short
+topic-based name as soon as queued messages or conversation reveal a topic,
+including alongside the first dispatch. With no topic yet, it leaves the default.
+It updates automatic names when the conversation's main focus changes, not every
+turn. It should aim for titles within
 40 characters as a soft limit, not a hard ceiling. Names do not include execution
 status; session IDs remain stable. Explicitly supplied names are user-owned and
 never overwritten by the scheduler. `/rename --auto` keeps the current title
