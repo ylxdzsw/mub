@@ -698,13 +698,19 @@ class SchedulerSmoke(unittest.TestCase):
                  policy="readonly", reason="Read it"),
             dict(type="block", session_id=auto["id"], reason="Wait instead"),
         ])
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as rejected:
             board._validate_plan(invalid, dict(snapshot=snapshot))
+        error = str(rejected.exception)
+        for detail in (f"S{auto['id']}", "actions[0] (dispatch)", "actions[1] (block)", "Keep only one"):
+            self.assertIn(detail, error)
+        prompt = board._scheduler_prompt(snapshot, bootstrap=False, correction=error)
+        self.assertIn(f"Rejection: {error}", prompt)
+        self.assertIn("No actions from it were applied", prompt)
         invalid["actions"] = [
             dict(type="rename", session_id=auto["id"], name="First title"),
             dict(type="rename", session_id=auto["id"], name="Second title"),
         ]
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, rf"S{auto['id']}: multiple rename actions"):
             board._validate_plan(invalid, dict(snapshot=snapshot))
 
         board.request(dict(op="interrupt", session_id=auto["id"]))
@@ -758,6 +764,75 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(session["gate"], "trapped")
         self.assertFalse(session["scheduling"]["applied"])
         self.assertIn("fail — skipped: A trap is not a failure", board._decision_text())
+
+    def test_scheduler_folds_clear_into_execution(self):
+        board = self.board()
+        session = self.new(board, "read work")
+        message = board.data["messages"][0]
+        (self.root / "task.txt").write_text("Task-owned changes\n")
+        board.data["owner"] = session["id"]
+        board._workspace()
+        clear = dict(type="clear", session_id=session["id"])
+        rename = dict(type="rename", session_id=session["id"], name="Task topic")
+        for kind in ("dispatch", "retry", "commit"):
+            action = dict(type=kind, reason="Continue work")
+            action.update(dict(message_id=message["id"]) if kind == "dispatch" else dict(session_id=session["id"]))
+            if kind != "commit":
+                action["policy"] = "readonly"
+            for reverse in (False, True):
+                with self.subTest(kind=kind, reverse=reverse):
+                    session.update(blocked="Waiting", gate="failed" if kind == "retry" else None,
+                                   retry_authorized=kind == "retry")
+                    actions = [action, clear, rename] if reverse else [clear, action, rename]
+                    active = dict(snapshot=board._scheduler_snapshot(), plan=dict(summary="Continue", actions=actions))
+                    self.assertEqual(board._validate_plan(active["plan"], active), [action, rename])
+                    revision = session["revision"]
+                    with patch.object(board, "_spawn") as spawn:
+                        board._apply_plan(active)
+                    spawn.assert_called_once()
+                    self.assertEqual(spawn.call_args.kwargs["action"], "message" if kind == "dispatch" else kind)
+                    self.assertEqual(session["revision"], revision)
+                    self.assertEqual([r["action"] for r in board.data["scheduler"]["decision"]["actions"]], [action, rename])
+                    self.assertEqual(active["plan"]["actions"], [action, clear, rename] if reverse else [clear, action, rename])
+
+        action = dict(type="dispatch", message_id=message["id"], policy="readonly", reason="Read work")
+        active = dict(snapshot=board._scheduler_snapshot(), plan=dict(summary="Continue", actions=[clear, action]))
+        session["revision"] += 1
+        with patch.object(board, "_spawn") as spawn:
+            board._apply_plan(active)
+        spawn.assert_not_called()
+        self.assertEqual(session["blocked"], "Waiting")
+        active["snapshot"] = board._scheduler_snapshot()
+        revision = session["revision"]
+        board._apply_plan(active)
+        self.assertIsNone(session["blocked"])
+        self.assertEqual(session["revision"], revision + 1)
+        self.assertIsNotNone(board._running(session["id"]))
+
+    def test_scheduler_rejects_conflicting_action_combinations(self):
+        board = self.board()
+        session = self.new(board, "read work")
+        active = dict(snapshot=board._scheduler_snapshot())
+        for kinds in (("retry", "commit"), ("block", "commit"), ("clear", "block"),
+                      ("clear", "fail"), ("clear", "clear"), ("clear", "retry", "commit")):
+            with self.subTest(kinds=kinds):
+                actions = []
+                for kind in kinds:
+                    action = dict(type=kind, session_id=session["id"])
+                    if kind != "clear":
+                        action["reason"] = "Work decision"
+                    if kind == "retry":
+                        action["policy"] = "readonly"
+                    actions.append(action)
+                with self.assertRaises(ValueError) as rejected:
+                    board._apply_plan(dict(active, plan=dict(summary="Conflicting work", actions=actions)))
+                error = str(rejected.exception)
+                self.assertIn(f"S{session['id']}: conflicting actions", error)
+                for i, kind in enumerate(kinds):
+                    self.assertIn(f"actions[{i}] ({kind})", error)
+                self.assertIn("the only allowed pair is clear plus dispatch, retry, or commit", error)
+                self.assertEqual(session["revision"], active["snapshot"]["sessions"][0]["revision"])
+                self.assertIsNone(session["blocked"])
 
     def test_legacy_names_are_user_owned(self):
         board = self.board()

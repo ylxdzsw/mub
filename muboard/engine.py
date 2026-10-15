@@ -670,13 +670,13 @@ SNAPSHOT
 - events are the arrivals that triggered this pass. They are not work to clear: apply what they justify, and leave the rest for a later pass.
 
 ACTIONS
-Return {{"summary":"short explanation of the overall decision", "actions":[...]}} matching the schema. The summary and each reason are shown to the user, so keep both brief and concrete. An empty actions list means wait for a new event, not poll. Include a nonempty user-facing reason on dispatch, retry, commit, block, and fail. Reasons explain decisions; they are not instructions sent to workers. At most one non-rename action and one rename per session per decision.
+Return {{"summary":"short explanation of the overall decision", "actions":[...]}} matching the schema. The summary and each reason are shown to the user, so keep both brief and concrete. An empty actions list means wait for a new event, not poll. Include a nonempty user-facing reason on dispatch, retry, commit, block, and fail. Reasons explain decisions; they are not instructions sent to workers. At most one non-rename action and one rename per session per decision, except that a redundant clear may accompany dispatch, retry, or commit in either order; the runtime folds it into the execution action.
 - dispatch(message_id, policy, reason): deliver the oldest ordinary pending message to its idle, unheld session with no gate or steering. Ordinary messages are always FIFO and never interrupt current work. There is no automatic steering or queue action.
 - retry(session_id, policy, reason): resume an eligible unfinished turn without new instructions. Traps need no explicit retry authorization; genuine failures/interruption do. User holds always prohibit retry.
 - commit(session_id, reason): request that the idle, unheld dirty owner commit only completed task-owned work or explain why it cannot. This is a handoff, never a repair request. It uses the writer slot and normal destructive-command trapping. Do not repeat an unsuccessful handoff without new user input.
 - block(session_id, reason): record a waiting explanation, not a hold or failure. Withhold dependent execution yourself; the note gates nothing. Reconsider it when circumstances change.
 - fail(session_id, reason): mark a genuine failure requiring explicit user recovery. Never use for traps, unavailable capacity, uncertainty, or redirects. Never troubleshoot provider or Mu bugs.
-- clear(session_id): remove a blocked note only; it cannot release a hold, clear a gate, authorize retry, or run work.
+- clear(session_id): remove a blocked note only; it cannot release a hold, clear a gate, authorize retry, or run work. Dispatch, retry, and commit automatically clear the note when starting, so omit a separate clear alongside them.
 - rename(session_id, name): display metadata for name_source "auto" only, including active or held sessions. Treat the default "Session N" title as unnamed: include a rename for every such session as soon as its queued messages or conversation reveal a topic, including alongside its first dispatch. Leave the default only when no topic is available yet. Keep titles within 40 characters, short and topic-based. Once named, rename when the topic materially changes, not every turn; avoid statuses like Running or Done. Never rename a user-owned title.
 
 EXECUTION POLICY
@@ -715,8 +715,10 @@ Return the JSON decision as your final answer. It applies after your clean exit,
                 session["context"] = dict(unchanged=True, read=context["read"])
         notice = ""
         if correction:
-            notice = (f"Your previous decision was rejected by the runtime: {correction}. "
-                      "Correct only that problem and return the full decision again, matching the schema. "
+            notice = ("Your previous decision was rejected by the runtime. No actions from it were applied.\n"
+                      f"Rejection: {correction}\n"
+                      "Correct the identified problem, keeping unrelated valid actions. "
+                      "Return the full corrected decision, matching the schema. "
                       "The snapshot below is unchanged and still authoritative.\n\n")
         return f"""{policy}
 
@@ -940,56 +942,77 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
             self._release(active, execute=False)
 
     def _validate_plan(self, plan, active):
+        """Validate the decision and return actions with redundant clears folded."""
         if (not isinstance(plan, dict) or set(plan) != {"summary", "actions"}
                 or not isinstance(plan["summary"], str) or not isinstance(plan["actions"], list)):
-            raise ValueError("Plan needs summary and actions")
+            raise ValueError("Decision must have exactly summary (a string) and actions (an array)")
         snapshot = active["snapshot"]
         sessions = {s["id"]: s for s in snapshot["sessions"]}
         messages = {m["id"]: m for m in snapshot["messages"]}
         variants = {v["properties"]["type"]["enum"][0]: set(v["properties"])
                     for v in SCHEDULER_SCHEMA["properties"]["actions"]["items"]["anyOf"]}
-        seen, named = set(), set()
-        for action in plan["actions"]:
+        grouped = {}
+        for index, action in enumerate(plan["actions"]):
+            where = f"actions[{index}]"
             if not isinstance(action, dict):
-                raise ValueError("Actions must be objects")
+                raise ValueError(f"{where}: action must be an object")
             kind = action.get("type")
-            if not isinstance(kind, str) or kind not in variants or set(action) != variants[kind]:
-                raise ValueError("Unsupported scheduler action or fields")
+            if not isinstance(kind, str) or kind not in variants:
+                raise ValueError(f"{where}: unsupported action type {kind!r}; choose from {', '.join(variants)}")
+            where += f" ({kind})"
+            if set(action) != variants[kind]:
+                raise ValueError(f"{where}: expected fields {sorted(variants[kind])}, got {sorted(action)}")
             if kind == "dispatch":
                 message_id = action["message_id"]
                 message = messages.get(message_id) if type(message_id) is int else None
                 if not message or message["state"] != "pending":
-                    raise ValueError("Delivery must reference a pending snapshot message")
+                    raise ValueError(f"{where}: message_id {message_id!r} is not a pending snapshot message")
                 key = message["session_id"]
             else:
                 key = action["session_id"]
             # Resolve the session before any session-keyed lookup: a message whose
             # session is gone must be a rejected decision, never a crash.
             if type(key) is not int or key not in sessions:
-                raise ValueError("Actions must reference a snapshot session")
+                raise ValueError(f"{where}: session {key!r} is not a snapshot session")
+            where += f" for S{key}"
             if kind == "dispatch":
                 if sessions[key].get("steering"):
-                    raise ValueError("Explicit redirects are delivered by the runtime")
+                    raise ValueError(f"{where}: explicit redirects are delivered by the runtime, not dispatch")
                 head = self._dispatch_head(sessions[key], snapshot["messages"])
                 if message["id"] != head["id"]:
-                    raise ValueError("Messages are FIFO within each session")
-            used = named if kind == "rename" else seen
-            if key in used:
-                raise ValueError("Use at most one action and one rename per snapshot session")
-            used.add(key)
+                    raise ValueError(f"{where}: messages are FIFO; dispatch message {head['id']} before {message['id']}")
+            grouped.setdefault(key, []).append((index, kind))
             if kind == "rename":
-                session_name(action["name"])
+                try:
+                    session_name(action["name"])
+                except ValueError as error:
+                    raise ValueError(f"{where}: {error}") from error
             elif kind != "clear":
                 if not isinstance(action["reason"], str) or not action["reason"].strip():
-                    raise ValueError("Actions need a reason")
+                    raise ValueError(f"{where}: reason must be a nonempty string explaining this action")
             if kind in ("dispatch", "retry"):
                 policy = action["policy"]
                 if not isinstance(policy, str) or policy not in EXECUTION_POLICIES:
-                    raise ValueError("Choose readonly, write, or unrestricted policy")
+                    raise ValueError(f"{where}: policy {policy!r} is invalid; choose readonly, write, or unrestricted")
+        folded = set()
+        for key, actions in grouped.items():
+            renames = [f"actions[{i}]" for i, kind in actions if kind == "rename"]
+            if len(renames) > 1:
+                raise ValueError(f"S{key}: multiple rename actions ({', '.join(renames)}); keep only one rename per session")
+            ordinary = [(i, kind) for i, kind in actions if kind != "rename"]
+            if len(ordinary) > 1:
+                kinds = {kind for _, kind in ordinary}
+                if len(ordinary) == 2 and "clear" in kinds and kinds & {"dispatch", "retry", "commit"}:
+                    folded.update(i for i, kind in ordinary if kind == "clear")
+                else:
+                    details = ", ".join(f"actions[{i}] ({kind})" for i, kind in ordinary)
+                    raise ValueError(f"S{key}: conflicting actions: {details}. Keep only one non-rename action per session; "
+                                     "the only allowed pair is clear plus dispatch, retry, or commit (clear is redundant)")
+        return [action for i, action in enumerate(plan["actions"]) if i not in folded]
 
     def _apply_plan(self, active):
         plan, snapshot = active["plan"], active["snapshot"]
-        self._validate_plan(plan, active)
+        actions = self._validate_plan(plan, active)
         revisions = {s["id"]: s["revision"] for s in snapshot["sessions"]}
         messages = {m["id"]: m for m in snapshot["messages"]}
         scheduler = self.data["scheduler"]
@@ -1005,7 +1028,7 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
             if not applied:
                 scheduler["reason"] += f"\nSkipped: S{key} {action['type']}: {detail}"
 
-        for action in plan["actions"]:
+        for action in actions:
             kind = action["type"]
             key = messages[action["message_id"]]["session_id"] if kind == "dispatch" else action["session_id"]
             session = next((s for s in self.data["sessions"] if s["id"] == key), None)

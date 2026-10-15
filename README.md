@@ -217,7 +217,11 @@ Actions are a small `anyOf`; each variant requires every declared field, includi
 | `rename` | `type`, `session_id`, `name` |
 
 There is no `names` array. A session may receive at most one non-rename action
-and one rename in a decision. Dispatch and retry policies are `readonly`
+and one rename in a decision, except that a redundant `clear` may accompany
+`dispatch`, `retry`, or `commit` in either order. Runtime folds that `clear` into
+the execution action before application, not into a separate state change;
+starting execution already clears the waiting note. Other multi-action
+combinations remain invalid. Dispatch and retry policies are `readonly`
 (`readonly` with a reversible trap), `write` (`readwrite` with a destructive
 trap), or `unrestricted` (`readwrite` with traps off), which requires justified
 permission. `block` records an informational note and does not gate execution;
@@ -229,7 +233,9 @@ as applied or skipped and shows each affected session's latest action annotation
 These annotations are not instructions injected into worker conversations.
 Structured output does not replace runtime checks for FIFO, holds, retry
 authorization, stale decisions, or writer ownership. A clean malformed decision
-gets one automatic corrective scheduler pass; a second rejected decision or a
+gets one automatic corrective scheduler pass, with the rejection identifying
+the offending action and, for conflicts, the session and action combination.
+No actions from a rejected decision are applied. A second rejected decision or a
 provider failure holds scheduling. Failed scheduler turns are not retried. Use
 `/schedule` to start a fresh scheduler session; existing workers may finish, but
 queued messages and other events do not release the scheduler hold. There is no
