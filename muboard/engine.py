@@ -51,10 +51,7 @@ SCHEDULER_SCHEMA = _object_schema(
         _object_schema(
             type=dict(type="string", enum=["set_wait_reason"]),
             session_id=dict(type="integer"),
-            wait_reason=dict(type="string")),
-        _object_schema(
-            type=dict(type="string", enum=["clear_wait_reason"]),
-            session_id=dict(type="integer")),
+            wait_reason=dict(type=["string", "null"])),
         _object_schema(
             type=dict(type="string", enum=["rename_session"]),
             session_id=dict(type="integer"),
@@ -697,11 +694,13 @@ Input snapshot
 - trigger_events identify what prompted this pass, with id, kind, session_id, and event-specific details. They are notifications, not a checklist of work to clear. The latest snapshot supersedes prior state; use only it and its referenced history.
 
 Output actions
-summary explains the overall decision; reason and wait_reason explain individual actions to the user, not instructions to workers. Keep explanations brief and concrete, and all supplied reason/wait_reason values nonempty. Use at most one action other than rename_session plus one rename_session per session. Execution automatically clears waiting notes; a redundant clear_wait_reason alongside execution is accepted and folded away, but should be omitted.
+summary explains the overall decision; reason and wait_reason explain individual actions to the user, not instructions to workers. Keep explanations brief and concrete. reason must be a nonempty string; wait_reason must be a nonempty string or null.
+
+Choose one outcome per session: execute, wait, fail, clear an obsolete waiting note, or leave unchanged. Emit at most one corresponding action, optionally accompanied by one rename_session. Actions describe the chosen outcome, not a sequence of edits or alternatives. dispatch_message counts toward the session identified by its message_id. Execution and mark_failed already clear waiting notes; do not accompany them with set_wait_reason, even with null.
 - dispatch_message: deliver the session's oldest ordinary pending message as a new turn. Requires no continuation gate or pending redirect.
 - continue_turn: resume an eligible unfinished turn without new instructions, using the continuation rules above.
 - request_commit: invoke the dirty owner, with no continuation gate, to commit completed task-owned work or explain why a safe handoff is impossible. Uses write policy; it is a handoff request, not implementation or repair.
-- set_wait_reason / clear_wait_reason: set or remove only the informational wait_reason. Neither changes holds, continuation_state, or recovery authorization; withhold dependent execution yourself.
+- set_wait_reason: a nonempty string replaces the informational waiting note; null removes an obsolete note without starting or failing work. Empty or whitespace-only strings are invalid. Neither value changes holds, continuation_state, or recovery authorization; withhold dependent execution yourself. If the note is unchanged, omit this action.
 - mark_failed: set continuation_state to failed, record reason in state_detail, and clear the waiting note and recovery authorization. Requires explicit user recovery afterward. May stop a trapped turn when its command shows that continuation must be refused; unavailable for redirects.
 - rename_session: update only an auto-owned display name, including on active or held sessions. May accompany another action for the same session in the same decision, in either order. Names must be nonempty, single-line printable text; user-owned names are unchanged.
 
@@ -737,6 +736,12 @@ These illustrate action choice, subject to eligibility and user scope.
 - A exits cleanly but reports a fatal task error requiring user intervention: mark_failed with the reported error as evidence. Dependent B keeps its pending work and waits.
 - Idle A owns dirty work; B has ready writer work: prefer A's queued follow-up if it plainly continues that work; otherwise request_commit from A for handoff.
 - A's invocation fails or is interrupted: retain its recovery gate until explicit user continuation; independent eligible B may still run.
+- A must wait for a handoff: emit only set_wait_reason for A, optionally with rename_session. If its waiting note needs new wording, set_wait_reason replaces it directly.
+- A's blocker is resolved and its oldest pending message is eligible: emit only dispatch_message for A, optionally with rename_session; execution clears its old waiting note.
+- A's waiting note is obsolete, but there is no eligible work to start: emit only set_wait_reason with wait_reason: null for A, optionally with rename_session.
+
+5. FINAL CHECK
+Before returning JSON, group actions by session (resolve dispatch_message through messages). Keep at most one non-renaming action and one rename_session per session. Remove competing alternatives and redundant clears, then check that summary and action reasons describe the same outcome. If nothing changes for a session, omit its actions; an empty actions list is valid.
 """
 
     @staticmethod
@@ -745,7 +750,11 @@ These illustrate action choice, subject to eligibility and user scope.
                 for s in snapshot["sessions"]}
 
     def _scheduler_prompt(self, snapshot, *, bootstrap=True, correction=None):
-        policy = self._scheduler_policy() if bootstrap else "Use the scheduling policy established at session start. Return only the JSON decision."
+        policy = self._scheduler_policy() if bootstrap else (
+            "Use the scheduling policy established at session start. Return only the JSON decision. "
+            "Choose at most one non-renaming action per session, optionally with one rename_session; "
+            "resolve dispatch_message to its message's session. set_wait_reason takes a nonempty string to replace "
+            "the note or null to remove it. Execution and mark_failed clear it automatically; omit a separate waiting-note action.")
         payload = copy.deepcopy(snapshot)
         known = self.data["scheduler"].get("context_versions", {}) if not bootstrap else {}
         versions = self._context_versions(snapshot)
@@ -759,7 +768,10 @@ These illustrate action choice, subject to eligibility and user scope.
         if correction:
             notice = ("Your previous decision was rejected by the runtime. No actions from it were applied.\n"
                       f"Rejection: {correction}\n"
-                      "Correct the identified problem, keeping unrelated valid actions. "
+                      "Rebuild the full decision from the unchanged snapshot, keeping unrelated valid actions. "
+                      "For each session with conflicting actions, choose its intended outcome and replace the conflicting "
+                      "actions with at most one non-renaming action, optionally with one rename_session. "
+                      "Do not append an opposite action to undo a rejected action; none were applied. "
                       "Return the full corrected decision, matching the schema. "
                       "The snapshot below is unchanged and still authoritative.\n\n")
         return f"""{policy}
@@ -982,7 +994,7 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
             self._release(active, execute=False)
 
     def _validate_plan(self, plan, active):
-        """Validate the decision and return actions with redundant clears folded."""
+        """Validate the decision and return its actions."""
         if (not isinstance(plan, dict) or set(plan) != {"summary", "actions"}
                 or not isinstance(plan["summary"], str) or not isinstance(plan["actions"], list)):
             raise ValueError("Decision must have exactly summary (a string) and actions (an array)")
@@ -1027,31 +1039,26 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
                     session_name(action["name"])
                 except ValueError as error:
                     raise ValueError(f"{where}: {error}") from error
-            elif kind != "clear_wait_reason":
+            else:
                 field = "wait_reason" if kind == "set_wait_reason" else "reason"
-                if not isinstance(action[field], str) or not action[field].strip():
-                    raise ValueError(f"{where}: {field} must be a nonempty string explaining this action")
+                nullable = kind == "set_wait_reason"
+                if not (nullable and action[field] is None) and (not isinstance(action[field], str) or not action[field].strip()):
+                    raise ValueError(f"{where}: {field} must be a nonempty string" + (" or null" if nullable else " explaining this action"))
             if kind in ("dispatch_message", "continue_turn"):
                 policy = action["execution_policy"]
                 if not isinstance(policy, str) or policy not in EXECUTION_POLICIES:
                     raise ValueError(f"{where}: execution_policy {policy!r} is invalid; choose readonly, write, or unrestricted")
-        folded = set()
         for key, actions in grouped.items():
             renames = [f"actions[{i}]" for i, kind in actions if kind == "rename_session"]
             if len(renames) > 1:
                 raise ValueError(f"S{key}: multiple rename_session actions ({', '.join(renames)}); keep only one rename_session per session")
             ordinary = [(i, kind) for i, kind in actions if kind != "rename_session"]
             if len(ordinary) > 1:
-                kinds = {kind for _, kind in ordinary}
-                if len(ordinary) == 2 and "clear_wait_reason" in kinds and kinds & {"dispatch_message", "continue_turn", "request_commit"}:
-                    folded.update(i for i, kind in ordinary if kind == "clear_wait_reason")
-                else:
-                    details = ", ".join(f"actions[{i}] ({kind})" for i, kind in ordinary)
-                    raise ValueError(f"S{key}: conflicting actions: {details}. "
-                                     "Keep only one action other than rename_session per session; "
-                                     "the only allowed pair is clear_wait_reason plus dispatch_message, continue_turn, or request_commit "
-                                     "(clear_wait_reason is redundant)")
-        return [action for i, action in enumerate(plan["actions"]) if i not in folded]
+                details = ", ".join(f"actions[{i}] ({kind})" for i, kind in ordinary)
+                raise ValueError(f"S{key}: conflicting actions: {details}. "
+                                 "Keep only one action other than rename_session per session. "
+                                 "set_wait_reason replaces or removes the note; execution and mark_failed clear it automatically.")
+        return plan["actions"]
 
     def _apply_plan(self, active):
         plan, snapshot = active["plan"], active["snapshot"]
@@ -1088,15 +1095,15 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
                 result(action, key, session, False, "Session is running")
                 continue
             steering = session.get("steering")
-            if steering and kind not in (("continue_turn", "set_wait_reason", "clear_wait_reason") if steering["phase"] == "recovery"
-                                         else ("set_wait_reason", "clear_wait_reason")):
+            if steering and kind not in (("continue_turn", "set_wait_reason") if steering["phase"] == "recovery"
+                                         else ("set_wait_reason",)):
                 result(action, key, session, False, "Redirect belongs to runtime admission or explicit recovery")
                 continue
-            if kind in ("set_wait_reason", "mark_failed", "clear_wait_reason"):
+            if kind in ("set_wait_reason", "mark_failed"):
                 if kind == "mark_failed":
                     session.update(gate="failed", reason=action["reason"], blocked=None, retry_authorized=False)
                 else:
-                    session["blocked"] = action["wait_reason"] if kind == "set_wait_reason" else None
+                    session["blocked"] = action["wait_reason"]
                 session["revision"] += 1
                 result(action, key, session, True)
                 continue

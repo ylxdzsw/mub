@@ -229,7 +229,6 @@ Actions are a small `anyOf`; each variant requires every declared field, includi
 | `continue_turn` | `type`, `session_id`, `execution_policy`, `reason` |
 | `request_commit`, `mark_failed` | `type`, `session_id`, `reason` |
 | `set_wait_reason` | `type`, `session_id`, `wait_reason` |
-| `clear_wait_reason` | `type`, `session_id` |
 | `rename_session` | `type`, `session_id`, `name` |
 
 `dispatch_message` starts a new turn for the oldest pending message;
@@ -238,20 +237,26 @@ Actions are a small `anyOf`; each variant requires every declared field, includi
 workspace handoff; it does not directly execute a Git commit.
 
 There is no `names` array. A session may receive at most one action other than
-`rename_session` and one `rename_session` in a decision, except that a redundant
-`clear_wait_reason` may accompany `dispatch_message`, `continue_turn`, or
-`request_commit` in either order. Runtime folds that clear into the execution
-action before application, not into a separate state change; starting execution
-already clears the waiting note. Renaming may accompany another eligible action
-for the same session in either order. Other combinations of non-renaming actions
-remain invalid.
+`rename_session` and one `rename_session` in a decision. Renaming may accompany
+another eligible action for the same session in either order. All combinations
+of multiple non-renaming actions are invalid; execution and `mark_failed`
+already clear the waiting note.
+
+The scheduler policy asks for one outcome per session, with an optional rename,
+and repeats that rule on subsequent passes. Setting a waiting note replaces its
+previous text directly; emitting two waiting-note actions in one decision is
+invalid. Before returning, the scheduler is instructed to group actions by session and
+check that the summary agrees with the chosen outcomes. A correction replaces
+conflicting actions rather than appending actions to undo a rejected decision.
+
 Execution policies are `readonly` (`readonly` with a reversible trap), `write`
 (`readwrite` with a destructive trap), or `unrestricted` (`readwrite` with traps
-off), which requires justified permission. `set_wait_reason` records an
-informational note and does not gate execution; `mark_failed` gates a session
-until explicit user continuation, including when a trapped command establishes
-that continuation must be refused.
-`clear_wait_reason` removes only the waiting note.
+off), which requires justified permission. `set_wait_reason.wait_reason` is a
+required nullable string (`"type": ["string", "null"]`): a nonempty string
+replaces the informational note, and JSON `null` removes it. Empty and
+whitespace-only strings are rejected. The note does not gate execution;
+`mark_failed` gates a session until explicit user continuation, including when
+a trapped command establishes that continuation must be refused.
 
 The group summary and action reasons are user-facing. Runtime reports each action
 as applied or skipped and shows each affected session's latest action annotation.

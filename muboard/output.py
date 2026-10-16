@@ -139,6 +139,8 @@ def scheduling_note(result):
         label += f" ({policy})"
     if action["type"] in ("rename_session", "rename"):
         label += f" to {action['name']}"
+    if action["type"] == "set_wait_reason" and action["wait_reason"] is None:
+        label += " — clear waiting note"
     if not result["applied"]:
         # A declined action is normal runtime arbitration, not a failure.
         label += " — skipped: " + result["detail"]
