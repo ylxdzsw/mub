@@ -338,10 +338,9 @@ class _UI:
                 steering_ids.add(steering["message_id"])
         queued = sum(message["state"] == "pending" and message["id"] not in steering_ids
                      for message in self.state["messages"])
-        steering = len(steering_ids)
         ready = sum(not any(session.get(key) for key in ("active", "hold", "gate", "blocked"))
                     for session in sessions)
-        return f"{running} running · {queued} queued · {steering} steering · {ready} ready"
+        return f"{running} running · {queued} queued · {ready} ready"
 
     def _session_status(self, session):
         if steering := self._steering_info(session)[0]:
