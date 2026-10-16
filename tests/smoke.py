@@ -716,6 +716,24 @@ class SchedulerSmoke(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, rf"S{auto['id']}: multiple rename_session actions"):
             board._validate_plan(invalid, dict(snapshot=snapshot))
 
+        for reverse in (False, True):
+            with self.subTest(rename_wait_reverse=reverse):
+                auto["name"] = f"Session {auto['id']}"
+                rename = dict(type="rename_session", session_id=auto["id"], name="Naming while waiting")
+                wait = dict(type="set_wait_reason", session_id=auto["id"], wait_reason="Waiting for prerequisite")
+                actions = [wait, rename] if reverse else [rename, wait]
+                active = dict(snapshot=board._scheduler_snapshot(), plan=dict(summary="Name pending work", actions=actions))
+                pending = json.loads(json.dumps(board.data["messages"]))
+                revision = auto["revision"]
+                with patch.object(board, "_spawn") as spawn:
+                    board._apply_plan(active)
+                spawn.assert_not_called()
+                self.assertEqual(auto["name"], rename["name"])
+                self.assertEqual(auto["blocked"], wait["wait_reason"])
+                self.assertEqual(auto["revision"], revision + 1)
+                self.assertEqual(board.data["messages"], pending)
+                self.assertTrue(all(result["applied"] for result in board.data["scheduler"]["decision"]["actions"]))
+
         board.request(dict(op="interrupt", session_id=auto["id"]))
         revision = auto["revision"]
         pending = json.loads(json.dumps(board.data["messages"]))

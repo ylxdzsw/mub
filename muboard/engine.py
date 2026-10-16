@@ -703,7 +703,7 @@ summary explains the overall decision; reason and wait_reason explain individual
 - request_commit: invoke the dirty owner, with no continuation gate, to commit completed task-owned work or explain why a safe handoff is impossible. Uses write policy; it is a handoff request, not implementation or repair.
 - set_wait_reason / clear_wait_reason: set or remove only the informational wait_reason. Neither changes holds, continuation_state, or recovery authorization; withhold dependent execution yourself.
 - mark_failed: set continuation_state to failed, record reason in state_detail, and clear the waiting note and recovery authorization. Requires explicit user recovery afterward. May stop a trapped turn when its command shows that continuation must be refused; unavailable for redirects.
-- rename_session: update only an auto-owned display name, including on active or held sessions. Names must be nonempty, single-line printable text; user-owned names are unchanged.
+- rename_session: update only an auto-owned display name, including on active or held sessions. May accompany another action for the same session in the same decision, in either order. Names must be nonempty, single-line printable text; user-owned names are unchanged.
 
 execution_policy on dispatch_message and continue_turn controls access and Bash trapping: readonly uses a reader slot and blocks reversible/destructive commands; write uses the writer slot and blocks destructive commands; unrestricted uses the writer slot with traps off. A continuation's policy applies to the rest of the turn, not just the trapped command. Traps are not a sandbox and changing policy never expands user scope.
 
@@ -724,7 +724,7 @@ Runtime already gates Mu startup failures, crashes, and nonzero error exits as f
 
 Ordering and handoff. Preserve ordinary per-session FIFO; messages never interrupt active work. Across sessions, prefer explicit user priorities and prerequisites, then the dirty owner's next message when it plainly continues the same uncommitted work, then global submission order. This is a preference, not permission to drain unrelated work, starve other writers, or wait for hypothetical follow-ups. After considering that continuation, request_commit only when another session has ready writer work blocked by the dirty checkout; otherwise retain changes for follow-up. Do not repeat an unsuccessful handoff without new user input. A queued user request to commit is an ordinary dispatch_message, not a substitute request_commit.
 
-Naming. Treat an auto-owned "Session N" title as unnamed: rename as soon as queued messages or history reveal a topic, alongside another action when useful. Prefer short topic titles within 40 characters, not statuses; rename an established title only when the topic materially changes.
+Naming. Treat an auto-owned "Session N" title as unnamed: rename as soon as queued messages or history reveal a topic, even if the initial prompt is blocked. Combine rename_session with set_wait_reason or another eligible action for that session in the same pass. Prefer short topic titles within 40 characters, not statuses; rename an established title only when the topic materially changes.
 
 4. EXAMPLES
 These illustrate action choice, subject to eligibility and user scope.

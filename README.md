@@ -242,7 +242,9 @@ There is no `names` array. A session may receive at most one action other than
 `clear_wait_reason` may accompany `dispatch_message`, `continue_turn`, or
 `request_commit` in either order. Runtime folds that clear into the execution
 action before application, not into a separate state change; starting execution
-already clears the waiting note. Other multi-action combinations remain invalid.
+already clears the waiting note. Renaming may accompany another eligible action
+for the same session in either order. Other combinations of non-renaming actions
+remain invalid.
 Execution policies are `readonly` (`readonly` with a reversible trap), `write`
 (`readwrite` with a destructive trap), or `unrestricted` (`readwrite` with traps
 off), which requires justified permission. `set_wait_reason` records an
@@ -364,7 +366,9 @@ system prompt remains until compaction or the normal rotation rules take effect.
 Sessions created without a name start as `Session N`. During scheduling passes,
 the scheduler is instructed to give every auto-owned default title a short
 topic-based name as soon as queued messages or conversation reveal a topic,
-including alongside the first dispatch. With no topic yet, it leaves the default.
+even if the initial prompt is blocked. It can rename and set a waiting note or
+take another eligible action for the same session in the same pass, including
+alongside the first dispatch. With no topic yet, it leaves the default.
 It updates automatic names when the conversation's main focus changes, not every
 turn. It should aim for titles within
 40 characters as a soft limit, not a hard ceiling. Names do not include execution
