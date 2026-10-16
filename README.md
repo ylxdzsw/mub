@@ -210,23 +210,30 @@ Actions are a small `anyOf`; each variant requires every declared field, includi
 
 | Action | Required fields |
 | --- | --- |
-| `dispatch` | `type`, `message_id`, `policy`, `reason` |
-| `retry` | `type`, `session_id`, `policy`, `reason` |
-| `commit`, `block`, `fail` | `type`, `session_id`, `reason` |
-| `clear` | `type`, `session_id` |
-| `rename` | `type`, `session_id`, `name` |
+| `dispatch_message` | `type`, `message_id`, `execution_policy`, `reason` |
+| `continue_turn` | `type`, `session_id`, `execution_policy`, `reason` |
+| `request_commit`, `mark_failed` | `type`, `session_id`, `reason` |
+| `set_wait_reason` | `type`, `session_id`, `wait_reason` |
+| `clear_wait_reason` | `type`, `session_id` |
+| `rename_session` | `type`, `session_id`, `name` |
 
-There is no `names` array. A session may receive at most one non-rename action
-and one rename in a decision, except that a redundant `clear` may accompany
-`dispatch`, `retry`, or `commit` in either order. Runtime folds that `clear` into
-the execution action before application, not into a separate state change;
-starting execution already clears the waiting note. Other multi-action
-combinations remain invalid. Dispatch and retry policies are `readonly`
-(`readonly` with a reversible trap), `write` (`readwrite` with a destructive
-trap), or `unrestricted` (`readwrite` with traps off), which requires justified
-permission. `block` records an informational note and does not gate execution;
-`fail` gates a session until explicit user continuation and is never used for
-traps. `clear` removes only the blocked note.
+`dispatch_message` starts a new turn for the oldest pending message;
+`continue_turn` resumes an existing unfinished turn without new instructions.
+`request_commit` asks a worker to commit completed task-owned changes for a
+workspace handoff; it does not directly execute a Git commit.
+
+There is no `names` array. A session may receive at most one action other than
+`rename_session` and one `rename_session` in a decision, except that a redundant
+`clear_wait_reason` may accompany `dispatch_message`, `continue_turn`, or
+`request_commit` in either order. Runtime folds that clear into the execution
+action before application, not into a separate state change; starting execution
+already clears the waiting note. Other multi-action combinations remain invalid.
+Execution policies are `readonly` (`readonly` with a reversible trap), `write`
+(`readwrite` with a destructive trap), or `unrestricted` (`readwrite` with traps
+off), which requires justified permission. `set_wait_reason` records an
+informational note and does not gate execution; `mark_failed` gates a session
+until explicit user continuation and is never used for traps.
+`clear_wait_reason` removes only the waiting note.
 
 The group summary and action reasons are user-facing. Runtime reports each action
 as applied or skipped and shows each affected session's latest action annotation.
@@ -243,8 +250,40 @@ fallback to unconstrained output.
 
 ### Scheduler context and usage
 
-Scheduler snapshots exclude UI/model-selection and process bookkeeping. Worker
-responses come from canonical Mu journal text, not PTY progress notices or screen
+Scheduler snapshots have `sessions`, `messages`, `workspace`, and `trigger_events`.
+They exclude UI/model-selection and process bookkeeping, including session
+revisions used internally to reject stale decisions. The scheduler-facing names
+are separate from the durable state and CLI status fields; existing board files
+need no migration.
+
+| Session field | Meaning |
+| --- | --- |
+| `id`, `name`, `name_source` | Board session ID, display title, and `auto`/`user` naming ownership. |
+| `held` | Prohibits execution and state actions; display renaming remains allowed. |
+| `continuation_state` | Continuation gate such as `trapped`, `failed`, `interrupted`, or `redirect`; null does not imply idle. |
+| `user_continue_authorized` | Explicit permission to continue a failed/interrupted turn, not permission needed for new messages. |
+| `state_detail` | Runtime explanation of current state; informational. |
+| `wait_reason` | Informational waiting note; does not itself block execution. |
+| `pending_redirect` | Runtime-owned user redirect: `message_id`, `interrupted_run_id`, `superseded_message_id`, `phase`, and `workspace_access`. |
+| `current_run` | Running invocation, or null: `run_id`, `operation`, `workspace_access`, `command_trap`, and `message_id`. |
+| `last_run` | Previous outcome: `outcome`, `original_operation`, `workspace_access`, `command_trap`, `completed`, `message_id`, and relevant `diagnostic`/`trap_evidence`. |
+| `history` | Recent `turns` with `turn_id`, `request`, and `response`, plus `omitted_turn_count` and `read_command` when a journal exists. |
+
+Run operations are `message`, `retry`, `commit`, or `redirect`;
+`last_run.original_operation` retains the original operation across retries.
+`workspace_access` is `readonly` or `readwrite`; `command_trap` is `reversible`,
+`destructive`, or `off`. `last_run.completed` reports Mu completion, separately
+from Git cleanliness. Redirect phases are `stopping`, `ready`, `delivering`,
+`held`, or `recovery`; the redirect's message remains in the mailbox.
+
+Messages contain `id`, `session_id`, verbatim `text`, and `delivery_state`
+(`pending`, `inflight`, or `interrupted`); only pending messages are dispatchable.
+Workspace fields are `clean`, `git_status` (Git porcelain text), and
+`owner_session_id`; an active writer can reserve ownership before making changes.
+Trigger events contain `id`, `kind`, `session_id`, and event-specific fields such
+as `message_id`, `outcome`, `detail`, `superseded_message_id`, or `run_id`.
+
+Worker responses come from canonical Mu journal text, not PTY progress notices or screen
 redraws. Snapshots include each session's two latest materialized requests and
 final responses before any active invocation. Requests are excerpted at 2,000
 characters and responses at 3,000, with explicit omission markers and a count of
@@ -257,7 +296,9 @@ blocked sessions, holds, and failures still surface reasons requiring attention.
 `mub status` and headless output expose the same structured results.
 
 Within one scheduler session, unchanged conversational evidence is referenced
-rather than resent. Scheduling policy is sent once; each pass still receives the
+rather than resent using `history.unchanged_since_previous_snapshot` and
+`history.read_command`. This flag only describes reused history, not unchanged
+session state. Scheduling policy is sent once; each pass still receives the
 current gates, holds, ownership, active workers, and FIFO mailboxes. The latest
 snapshot overrides older state. Previous decisions remain in the persistent
 scheduler conversation until rotation, but are not policy.
@@ -358,7 +399,7 @@ or shared user data, and operations needing broader permission remain blocked
 with a concrete explanation.
 
 A trap is not a failure. A session waiting for the writer slot or workspace stays
-trapped and can be retried when available; the scheduler must never use `fail`
+trapped and can be retried when available; the scheduler must never use `mark_failed`
 for a trap. Explicit continuation permission is still required for genuine
 failures and interrupted turns; user holds always prohibit execution. Resuming a
 trapped turn preserves its trap classification and full command evidence for the

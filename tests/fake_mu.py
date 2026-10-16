@@ -72,8 +72,8 @@ def schedule(snapshot, config):
         return config["plan"]
     actions = []
     sessions = snapshot["sessions"]
-    writer = any(s["active"] and s["active"]["mode"] == "readwrite" for s in sessions)
-    owner = snapshot["workspace"]["owner"]
+    writer = any(s["current_run"] and s["current_run"]["workspace_access"] == "readwrite" for s in sessions)
+    owner = snapshot["workspace"]["owner_session_id"]
     dirty = not snapshot["workspace"]["clean"]
     order = config.get("order", [])
     sessions = sorted(sessions, key=lambda s: order.index(s["id"]) if s["id"] in order else len(order) + s["id"])
@@ -82,52 +82,52 @@ def schedule(snapshot, config):
         return not writer and (not dirty or owner == key)
 
     def retry_policy(session):
-        if session["gate"] == "trapped":
+        if session["continuation_state"] == "trapped":
             return "write"
-        return "readonly" if (session.get("last") or {}).get("mode", "readonly") == "readonly" else "write"
+        return "readonly" if (session.get("last_run") or {}).get("workspace_access", "readonly") == "readonly" else "write"
 
     for session in sessions:
         key = session["id"]
-        if session["hold"]:
+        if session["held"]:
             continue
-        steering = session.get("steering")
+        steering = session.get("pending_redirect")
         if steering:
-            if (steering["phase"] == "recovery" and session["user_retry_authorized"]):
+            if (steering["phase"] == "recovery" and session["user_continue_authorized"]):
                 policy = retry_policy(session)
                 if policy == "readonly" or writable(key):
-                    actions.append(dict(type="retry", session_id=key, policy=policy,
+                    actions.append(dict(type="continue_turn", session_id=key, execution_policy=policy,
                                         reason="Explicitly recover Mu before applying the pending redirect"))
                     writer |= policy != "readonly"
             continue
-        if session["active"]:
+        if session["current_run"]:
             continue
-        if session["gate"] == "trapped" or session["user_retry_authorized"]:
+        if session["continuation_state"] == "trapped" or session["user_continue_authorized"]:
             policy = retry_policy(session)
             if policy == "readonly" or writable(key):
-                actions.append(dict(type="retry", session_id=key, policy=policy,
+                actions.append(dict(type="continue_turn", session_id=key, execution_policy=policy,
                                     reason="Scripted retry for this turn"))
                 writer |= policy != "readonly"
             continue
-        if session["gate"]:
+        if session["continuation_state"]:
             continue
-        if dirty and owner == key and writable(key) and (session["last"] or {}).get("action") != "commit":
-            actions.append(dict(type="commit", session_id=key, reason="Release checkout"))
+        if dirty and owner == key and writable(key) and (session["last_run"] or {}).get("original_operation") != "commit":
+            actions.append(dict(type="request_commit", session_id=key, reason="Release checkout"))
             writer = True
             continue
         message = next((m for m in snapshot["messages"] if m["session_id"] == key), None)
-        if not message or message["state"] != "pending":
+        if not message or message["delivery_state"] != "pending":
             continue
         if message["text"].startswith("depends "):
             prerequisite = int(message["text"].split()[1])
             source = next(s for s in sessions if s["id"] == prerequisite)
-            if not source["last"] or source["gate"] or source["active"]:
-                actions.append(dict(type="block", session_id=key, reason=f"Waiting for S{prerequisite}"))
+            if not source["last_run"] or source["continuation_state"] or source["current_run"]:
+                actions.append(dict(type="set_wait_reason", session_id=key, wait_reason=f"Waiting for S{prerequisite}"))
                 continue
         text = message["text"]
         policy = "write" if text.startswith("write") else "readonly"
         if policy != "readonly" and not writable(key):
             continue
-        actions.append(dict(type="dispatch", message_id=message["id"], policy=policy,
+        actions.append(dict(type="dispatch_message", message_id=message["id"], execution_policy=policy,
                             reason="Dispatch the oldest pending message"))
         writer |= policy != "readonly"
     return dict(summary="Scripted scheduling decision", actions=actions)

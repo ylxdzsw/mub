@@ -135,14 +135,14 @@ def literal(value):
 def scheduling_note(result):
     action = result["action"]
     label = action["type"]
-    if policy := action.get("policy"):
+    if policy := action.get("execution_policy", action.get("policy")):
         label += f" ({policy})"
-    if action["type"] == "rename":
+    if action["type"] in ("rename_session", "rename"):
         label += f" to {action['name']}"
     if not result["applied"]:
         # A declined action is normal runtime arbitration, not a failure.
         label += " — skipped: " + result["detail"]
-    if reason := action.get("reason"):
+    if reason := action.get("wait_reason", action.get("reason")):
         label += " — " + reason
     return label
 

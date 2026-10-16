@@ -79,7 +79,7 @@ class InputSmoke(unittest.TestCase):
                        active=dict(action="retry", mode="readwrite"))
         self.assertEqual(ui._session_status(session), "writing")
         self.assertEqual(ui._notice(), "")
-        session["scheduling"] = dict(action=dict(type="retry", policy="write", reason="Build task-owned output"),
+        session["scheduling"] = dict(action=dict(type="continue_turn", execution_policy="write", reason="Build task-owned output"),
                                      applied=True, detail="")
         self.assertEqual(ui._notice(), "")
         session["scheduling"].update(applied=False, detail="Writer slot unavailable")
@@ -518,13 +518,13 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(set(SCHEDULER_SCHEMA["properties"]), {"summary", "actions"})
         self.assertEqual(set(SCHEDULER_SCHEMA["required"]), {"summary", "actions"})
         expected_fields = {
-            "dispatch": {"type", "message_id", "policy", "reason"},
-            "retry": {"type", "session_id", "policy", "reason"},
-            "commit": {"type", "session_id", "reason"},
-            "block": {"type", "session_id", "reason"},
-            "fail": {"type", "session_id", "reason"},
-            "clear": {"type", "session_id"},
-            "rename": {"type", "session_id", "name"},
+            "dispatch_message": {"type", "message_id", "execution_policy", "reason"},
+            "continue_turn": {"type", "session_id", "execution_policy", "reason"},
+            "request_commit": {"type", "session_id", "reason"},
+            "set_wait_reason": {"type", "session_id", "wait_reason"},
+            "mark_failed": {"type", "session_id", "reason"},
+            "clear_wait_reason": {"type", "session_id"},
+            "rename_session": {"type", "session_id", "name"},
         }
         self.assertEqual({v["properties"]["type"]["enum"][0] for v in variants}, set(expected_fields))
         schemas = [SCHEDULER_SCHEMA, *variants]
@@ -537,8 +537,8 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(SCHEDULER_SCHEMA["properties"]["summary"]["type"], "string")
         self.assertEqual(SCHEDULER_SCHEMA["properties"]["actions"]["type"], "array")
         for variant in variants:
-            if variant["properties"]["type"]["enum"][0] in ("dispatch", "retry"):
-                self.assertEqual(set(variant["properties"]["policy"]["enum"]),
+            if variant["properties"]["type"]["enum"][0] in ("dispatch_message", "continue_turn"):
+                self.assertEqual(set(variant["properties"]["execution_policy"]["enum"]),
                                  {"readonly", "write", "unrestricted"})
         self.assertNotIn("names", SCHEDULER_SCHEMA["properties"])
         self.assertNotIn("steer", {v["properties"]["type"]["enum"][0] for v in variants})
@@ -559,9 +559,12 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertGreater(scheduler["last_usage"]["seconds"], 0)
         snapshot = board._scheduler_snapshot()
         payload = json.loads(board._scheduler_prompt(snapshot, bootstrap=False).split("SNAPSHOT:\n", 1)[1])
-        self.assertTrue(payload["sessions"][0]["context"]["unchanged"])
+        self.assertTrue(payload["sessions"][0]["history"]["unchanged_since_previous_snapshot"])
+        self.assertNotIn("revision", payload["sessions"][0])
+        self.assertEqual(payload["messages"], snapshot["messages"])
+        self.assertEqual(set(payload), {"sessions", "messages", "workspace", "trigger_events"})
         payload = json.loads(board._scheduler_prompt(snapshot).split("SNAPSHOT:\n", 1)[1])
-        self.assertIn("turns", payload["sessions"][0]["context"])
+        self.assertIn("turns", payload["sessions"][0]["history"])
 
         board.scheduler_turn_limit = scheduler["turns"]
         board.request(dict(op="send", session_id=first["id"], text="read follow-up"))
@@ -571,23 +574,23 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(self.journal(scheduler)["new_args"], ["new", "--no-context"])
         self.assertIn(old, scheduler["previous_sessions"])
         self.assertTrue((self.root / ".mu/sessions" / f"{old}.jsonl").exists())
-        context = snapshot["sessions"][0]["context"]
+        context = snapshot["sessions"][0]["history"]
         self.assertEqual(context["turns"][0]["request"], "read design; do not write")
         self.assertEqual(context["turns"][0]["response"], first["last"]["summary"])
         self.until(board, board.idle)
         board.request(dict(op="send", session_id=first["id"], text="read third"))
         self.until(board, board.idle)
         snapshot = board._scheduler_snapshot()
-        context = snapshot["sessions"][0]["context"]
-        self.assertEqual(context["omitted_turns"], 1)
+        context = snapshot["sessions"][0]["history"]
+        self.assertEqual(context["omitted_turn_count"], 1)
         self.assertEqual([t["request"] for t in context["turns"]], ["read follow-up", "read third"])
         result = subprocess.check_output([sys.executable, "-m", "muboard", "-C", str(self.root),
-            "context", f"S{first['id']}", "--before", context["read"].split()[-1], "--turn", "t1"],
+            "context", f"S{first['id']}", "--before", context["read_command"].split()[-1], "--turn", "t1"],
             env=dict(os.environ, PYTHONPATH=str(ROOT)))
         self.assertEqual(json.loads(result)["turns"][0]["request"], "read design; do not write")
         board.close()
         reopened = self.board()
-        self.assertEqual(reopened._scheduler_snapshot()["sessions"][0]["context"], context)
+        self.assertEqual(reopened._scheduler_snapshot()["sessions"][0]["history"], context)
         self.assertEqual(len(self.journal(second)["invocations"]), 1)
 
     def test_canonical_responses_and_compaction_accounting(self):
@@ -662,16 +665,16 @@ class SchedulerSmoke(unittest.TestCase):
         removed = board.store.session(board.request(dict(op="new"))["session_id"])
 
         def proposal(name):
-            snapshot = json.loads(json.dumps(dict(board.state(), events=board.data["events"])))
+            snapshot = board._scheduler_snapshot()
             return dict(snapshot=snapshot, plan=dict(summary="Name topics", actions=[
-                dict(type="rename", session_id=auto["id"], name=name),
-                dict(type="rename", session_id=locked["id"], name="Must not replace user name"),
+                dict(type="rename_session", session_id=auto["id"], name=name),
+                dict(type="rename_session", session_id=locked["id"], name="Must not replace user name"),
             ]))
 
         active = proposal("Session naming")
-        active["plan"]["actions"].append(dict(type="rename", session_id=removed["id"], name="Removed"))
-        active["plan"]["actions"].append(dict(type="dispatch", message_id=board.data["messages"][0]["id"],
-                                                policy="readonly", reason="Read the naming request"))
+        active["plan"]["actions"].append(dict(type="rename_session", session_id=removed["id"], name="Removed"))
+        active["plan"]["actions"].append(dict(type="dispatch_message", message_id=board.data["messages"][0]["id"],
+                                                execution_policy="readonly", reason="Read the naming request"))
         board.request(dict(op="remove", session_id=removed["id"]))
         with patch.object(board, "_spawn") as spawn:
             board._apply_plan(active)
@@ -681,7 +684,7 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(auto["name_source"], "auto")
         decision = board.data["scheduler"]["decision"]
         self.assertEqual(decision["summary"], "Name topics")
-        dispatch_result = next(result for result in decision["actions"] if result["action"]["type"] == "dispatch")
+        dispatch_result = next(result for result in decision["actions"] if result["action"]["type"] == "dispatch_message")
         self.assertEqual(dispatch_result["session_id"], auto["id"])
         self.assertTrue(dispatch_result["applied"])
         self.assertEqual(dispatch_result["action"]["reason"], "Read the naming request")
@@ -694,23 +697,23 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertNotIn("scheduling", board._scheduler_snapshot()["sessions"][0])
         snapshot = board._scheduler_snapshot()
         invalid = dict(summary="Duplicate work", actions=[
-            dict(type="dispatch", message_id=board.data["messages"][0]["id"],
-                 policy="readonly", reason="Read it"),
-            dict(type="block", session_id=auto["id"], reason="Wait instead"),
+            dict(type="dispatch_message", message_id=board.data["messages"][0]["id"],
+                 execution_policy="readonly", reason="Read it"),
+            dict(type="set_wait_reason", session_id=auto["id"], wait_reason="Wait instead"),
         ])
         with self.assertRaises(ValueError) as rejected:
             board._validate_plan(invalid, dict(snapshot=snapshot))
         error = str(rejected.exception)
-        for detail in (f"S{auto['id']}", "actions[0] (dispatch)", "actions[1] (block)", "Keep only one"):
+        for detail in (f"S{auto['id']}", "actions[0] (dispatch_message)", "actions[1] (set_wait_reason)", "Keep only one"):
             self.assertIn(detail, error)
         prompt = board._scheduler_prompt(snapshot, bootstrap=False, correction=error)
         self.assertIn(f"Rejection: {error}", prompt)
         self.assertIn("No actions from it were applied", prompt)
         invalid["actions"] = [
-            dict(type="rename", session_id=auto["id"], name="First title"),
-            dict(type="rename", session_id=auto["id"], name="Second title"),
+            dict(type="rename_session", session_id=auto["id"], name="First title"),
+            dict(type="rename_session", session_id=auto["id"], name="Second title"),
         ]
-        with self.assertRaisesRegex(ValueError, rf"S{auto['id']}: multiple rename actions"):
+        with self.assertRaisesRegex(ValueError, rf"S{auto['id']}: multiple rename_session actions"):
             board._validate_plan(invalid, dict(snapshot=snapshot))
 
         board.request(dict(op="interrupt", session_id=auto["id"]))
@@ -746,24 +749,25 @@ class SchedulerSmoke(unittest.TestCase):
             board._apply_plan(dict(snapshot=board._scheduler_snapshot(),
                                    plan=dict(summary=summary, actions=[action])))
 
-        apply(dict(type="block", session_id=session["id"], reason="Waiting for review"), "Blocked")
+        apply(dict(type="set_wait_reason", session_id=session["id"], wait_reason="Waiting for review"), "Blocked")
         self.assertEqual(session["blocked"], "Waiting for review")
-        self.assertEqual(session["scheduling"]["action"]["reason"], "Waiting for review")
-        apply(dict(type="clear", session_id=session["id"]), "Cleared")
+        self.assertEqual(session["scheduling"]["action"]["wait_reason"], "Waiting for review")
+        self.assertIn("set_wait_reason — Waiting for review", board._decision_text())
+        apply(dict(type="clear_wait_reason", session_id=session["id"]), "Cleared")
         self.assertIsNone(session["blocked"])
         self.assertIsNone(session["gate"])
-        apply(dict(type="fail", session_id=session["id"], reason="Cannot continue safely"), "Failed")
+        apply(dict(type="mark_failed", session_id=session["id"], reason="Cannot continue safely"), "Failed")
         self.assertEqual(session["gate"], "failed")
         self.assertEqual(session["reason"], "Cannot continue safely")
         self.assertEqual(session["scheduling"]["action"]["reason"], "Cannot continue safely")
-        apply(dict(type="clear", session_id=session["id"]), "Clear only the note")
+        apply(dict(type="clear_wait_reason", session_id=session["id"]), "Clear only the note")
         self.assertEqual(session["gate"], "failed")
         session.update(gate="trapped", last=dict(exit="trapped", summary="Trapped command"))
         board.traps[session["id"]] = "Trapped command"
-        apply(dict(type="fail", session_id=session["id"], reason="Not allowed for traps"), "Rejected")
+        apply(dict(type="mark_failed", session_id=session["id"], reason="Not allowed for traps"), "Rejected")
         self.assertEqual(session["gate"], "trapped")
         self.assertFalse(session["scheduling"]["applied"])
-        self.assertIn("fail — skipped: A trap is not a failure", board._decision_text())
+        self.assertIn("mark_failed — skipped: A trap is not a failure", board._decision_text())
 
     def test_scheduler_folds_clear_into_execution(self):
         board = self.board()
@@ -772,17 +776,17 @@ class SchedulerSmoke(unittest.TestCase):
         (self.root / "task.txt").write_text("Task-owned changes\n")
         board.data["owner"] = session["id"]
         board._workspace()
-        clear = dict(type="clear", session_id=session["id"])
-        rename = dict(type="rename", session_id=session["id"], name="Task topic")
-        for kind in ("dispatch", "retry", "commit"):
+        clear = dict(type="clear_wait_reason", session_id=session["id"])
+        rename = dict(type="rename_session", session_id=session["id"], name="Task topic")
+        for kind in ("dispatch_message", "continue_turn", "request_commit"):
             action = dict(type=kind, reason="Continue work")
-            action.update(dict(message_id=message["id"]) if kind == "dispatch" else dict(session_id=session["id"]))
-            if kind != "commit":
-                action["policy"] = "readonly"
+            action.update(dict(message_id=message["id"]) if kind == "dispatch_message" else dict(session_id=session["id"]))
+            if kind != "request_commit":
+                action["execution_policy"] = "readonly"
             for reverse in (False, True):
                 with self.subTest(kind=kind, reverse=reverse):
-                    session.update(blocked="Waiting", gate="failed" if kind == "retry" else None,
-                                   retry_authorized=kind == "retry")
+                    session.update(blocked="Waiting", gate="failed" if kind == "continue_turn" else None,
+                                   retry_authorized=kind == "continue_turn")
                     actions = [action, clear, rename] if reverse else [clear, action, rename]
                     active = dict(snapshot=board._scheduler_snapshot(), plan=dict(summary="Continue", actions=actions))
                     self.assertEqual(board._validate_plan(active["plan"], active), [action, rename])
@@ -790,12 +794,12 @@ class SchedulerSmoke(unittest.TestCase):
                     with patch.object(board, "_spawn") as spawn:
                         board._apply_plan(active)
                     spawn.assert_called_once()
-                    self.assertEqual(spawn.call_args.kwargs["action"], "message" if kind == "dispatch" else kind)
+                    self.assertEqual(spawn.call_args.kwargs["action"], {"dispatch_message": "message", "continue_turn": "retry", "request_commit": "commit"}[kind])
                     self.assertEqual(session["revision"], revision)
                     self.assertEqual([r["action"] for r in board.data["scheduler"]["decision"]["actions"]], [action, rename])
                     self.assertEqual(active["plan"]["actions"], [action, clear, rename] if reverse else [clear, action, rename])
 
-        action = dict(type="dispatch", message_id=message["id"], policy="readonly", reason="Read work")
+        action = dict(type="dispatch_message", message_id=message["id"], execution_policy="readonly", reason="Read work")
         active = dict(snapshot=board._scheduler_snapshot(), plan=dict(summary="Continue", actions=[clear, action]))
         session["revision"] += 1
         with patch.object(board, "_spawn") as spawn:
@@ -813,16 +817,16 @@ class SchedulerSmoke(unittest.TestCase):
         board = self.board()
         session = self.new(board, "read work")
         active = dict(snapshot=board._scheduler_snapshot())
-        for kinds in (("retry", "commit"), ("block", "commit"), ("clear", "block"),
-                      ("clear", "fail"), ("clear", "clear"), ("clear", "retry", "commit")):
+        for kinds in (("continue_turn", "request_commit"), ("set_wait_reason", "request_commit"), ("clear_wait_reason", "set_wait_reason"),
+                      ("clear_wait_reason", "mark_failed"), ("clear_wait_reason", "clear_wait_reason"), ("clear_wait_reason", "continue_turn", "request_commit")):
             with self.subTest(kinds=kinds):
                 actions = []
                 for kind in kinds:
                     action = dict(type=kind, session_id=session["id"])
-                    if kind != "clear":
-                        action["reason"] = "Work decision"
-                    if kind == "retry":
-                        action["policy"] = "readonly"
+                    if kind != "clear_wait_reason":
+                        action["wait_reason" if kind == "set_wait_reason" else "reason"] = "Work decision"
+                    if kind == "continue_turn":
+                        action["execution_policy"] = "readonly"
                     actions.append(action)
                 with self.assertRaises(ValueError) as rejected:
                     board._apply_plan(dict(active, plan=dict(summary="Conflicting work", actions=actions)))
@@ -830,7 +834,7 @@ class SchedulerSmoke(unittest.TestCase):
                 self.assertIn(f"S{session['id']}: conflicting actions", error)
                 for i, kind in enumerate(kinds):
                     self.assertIn(f"actions[{i}] ({kind})", error)
-                self.assertIn("the only allowed pair is clear plus dispatch, retry, or commit", error)
+                self.assertIn("the only allowed pair is clear_wait_reason plus dispatch_message, continue_turn, or request_commit", error)
                 self.assertEqual(session["revision"], active["snapshot"]["sessions"][0]["revision"])
                 self.assertIsNone(session["blocked"])
 
@@ -984,7 +988,7 @@ class SchedulerSmoke(unittest.TestCase):
         session = self.new(board, "write hold with unrestricted policy")
         message_id = board.data["messages"][0]["id"]
         self.config(plan=dict(summary="Explicit unrestricted request", actions=[dict(
-            type="dispatch", message_id=message_id, policy="unrestricted", reason="Use the requested policy")]))
+            type="dispatch_message", message_id=message_id, execution_policy="unrestricted", reason="Use the requested policy")]))
         self.until(board, lambda: self.steerable(board, session))
         original = board._running(session["id"])["record"]
         self.assertEqual((original["mode"], original["trap"]), ("readwrite", "off"))
@@ -1176,8 +1180,8 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertTrue(all("--no-context" not in t["args"] for t in turns))
         self.assertEqual(board.output(session["id"])["text"].count("mu> "), 1)
         snapshots = [json.loads(p.read_text()) for p in (self.root / ".mu/fake").glob("snapshot-*")]
-        trapped = next(s for snap in snapshots for s in snap["sessions"] if s["gate"] == "trapped")
-        self.assertIn("complete stdin", trapped["last"]["trap_output"])
+        trapped = next(s for snap in snapshots for s in snap["sessions"] if s["continuation_state"] == "trapped")
+        self.assertIn("complete stdin", trapped["last_run"]["trap_evidence"])
         board.request(dict(op="send", session_id=session["id"], text="read next"))
         self.until(board, board.idle)
         args = self.journal(session)["invocations"][-1]["args"]
@@ -1189,10 +1193,10 @@ class SchedulerSmoke(unittest.TestCase):
         session = self.new(board, "trap write")
         self.until(board, lambda: board._running(session["id"]) is not None)
         self.config(plan=dict(summary="Inspection scope conflict", actions=[
-            dict(type="block", session_id=session["id"], reason="Needs reconsideration")]))
+            dict(type="set_wait_reason", session_id=session["id"], wait_reason="Needs reconsideration")]))
         self.until(board, board.idle)
         self.assertEqual(session["gate"], "trapped")
-        evidence = board._scheduler_snapshot()["sessions"][0]["last"]["trap_output"]
+        evidence = board._scheduler_snapshot()["sessions"][0]["last_run"]["trap_evidence"]
         for gate in ("trapped", "interrupted"):
             session["gate"] = gate
             result = board.request(dict(op="resume", session_id=session["id"]))
@@ -1201,7 +1205,7 @@ class SchedulerSmoke(unittest.TestCase):
             self.assertTrue(session["retry_authorized"])
             self.assertIsNone(session["blocked"])
             self.assertIsNone(board._running(session["id"]))
-            self.assertEqual(board._scheduler_snapshot()["sessions"][0]["last"]["trap_output"], evidence)
+            self.assertEqual(board._scheduler_snapshot()["sessions"][0]["last_run"]["trap_evidence"], evidence)
         self.until(board, board.idle)
         self.assertEqual(session["blocked"], "Needs reconsideration")
         self.assertEqual(len(self.journal(session)["invocations"]), 1)
@@ -1302,8 +1306,8 @@ class SchedulerSmoke(unittest.TestCase):
         active = board._running(None)
         last_message = board.data["messages"][-1]
         with self.assertRaisesRegex(ValueError, "FIFO"):
-            board._validate_plan(dict(summary="wrong", actions=[dict(type="dispatch", message_id=last_message["id"],
-                                                                        policy="readonly", reason="Skip FIFO")]), active)
+            board._validate_plan(dict(summary="wrong", actions=[dict(type="dispatch_message", message_id=last_message["id"],
+                                                                        execution_policy="readonly", reason="Skip FIFO")]), active)
         board.request(dict(op="interrupt", session_id=held["id"]))
         board.request(dict(op="remove", session_id=removed["id"], discard=True))
         self.until(board, board.idle)
