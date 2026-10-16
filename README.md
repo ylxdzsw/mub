@@ -232,7 +232,8 @@ Execution policies are `readonly` (`readonly` with a reversible trap), `write`
 (`readwrite` with a destructive trap), or `unrestricted` (`readwrite` with traps
 off), which requires justified permission. `set_wait_reason` records an
 informational note and does not gate execution; `mark_failed` gates a session
-until explicit user continuation and is never used for traps.
+until explicit user continuation, including when a trapped command establishes
+that continuation must be refused.
 `clear_wait_reason` removes only the waiting note.
 
 The group summary and action reasons are user-facing. Runtime reports each action
@@ -398,12 +399,28 @@ worker's original user scope. Actual out-of-scope changes, effects on unrelated
 or shared user data, and operations needing broader permission remain blocked
 with a concrete explanation.
 
-A trap is not a failure. A session waiting for the writer slot or workspace stays
-trapped and can be retried when available; the scheduler must never use `mark_failed`
-for a trap. Explicit continuation permission is still required for genuine
-failures and interrupted turns; user holds always prohibit execution. Resuming a
-trapped turn preserves its trap classification and full command evidence for the
-scheduler, separately from explicit continuation permission.
+A session waiting for a writer slot, workspace access, a prerequisite, or more
+scheduling evidence keeps its pending work and continuation state. This includes
+trapped turns waiting for admission and sessions whose prerequisites are held or
+failed. The scheduler may explain the wait with `set_wait_reason` and reconsider
+on relevant events.
+
+`mark_failed` stops this session's work when concrete evidence shows that it needs
+user intervention: a worker reports a fatal task error, a trapped command would
+violate user scope or perform an unauthorized destructive action, or the worker
+establishes an unrecoverable condition with no authorized way to proceed. The
+reason identifies the failure and its evidence. A trap alone is insufficient;
+ordinary task-scoped traps can continue with suitable access when admitted.
+Runtime already gates Mu startup failures, crashes, and nonzero error exits as
+failed, except that exit code 3 denotes a trap and user-stopped runs are
+interrupted. The scheduler preserves existing recovery gates. Ordinary tool
+errors and failing tests remain part of ongoing work when the worker can address
+them within scope.
+
+Explicit continuation permission is required after failure and interruption;
+user holds always prohibit execution. Resuming a trapped turn preserves its trap
+classification and full command evidence for the scheduler, separately from
+explicit continuation permission.
 
 Normal dispatch and retry policies pair readonly access with `--trap reversible`,
 readwrite access with `--trap destructive`, or readwrite access with traps off

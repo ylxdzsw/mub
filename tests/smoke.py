@@ -764,10 +764,23 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(session["gate"], "failed")
         session.update(gate="trapped", last=dict(exit="trapped", summary="Trapped command"))
         board.traps[session["id"]] = "Trapped command"
-        apply(dict(type="mark_failed", session_id=session["id"], reason="Not allowed for traps"), "Rejected")
+        apply(dict(type="set_wait_reason", session_id=session["id"], wait_reason="Waiting for writer access"), "Wait")
         self.assertEqual(session["gate"], "trapped")
+        session["retry_authorized"] = True
+        reason = "Trapped command deletes unrelated user data despite an explicit restriction"
+        apply(dict(type="mark_failed", session_id=session["id"], reason=reason), "Refuse continuation")
+        self.assertEqual(session["gate"], "failed")
+        self.assertEqual(session["reason"], reason)
+        self.assertIsNone(session["blocked"])
+        self.assertFalse(session["retry_authorized"])
+        self.assertTrue(session["scheduling"]["applied"])
+        self.assertEqual(session["last"]["exit"], "trapped")
+        self.assertEqual(board.traps[session["id"]], "Trapped command")
+        apply(dict(type="continue_turn", session_id=session["id"], execution_policy="readonly",
+                   reason="Retry without user authorization"), "Refused")
+        self.assertEqual(session["gate"], "failed")
         self.assertFalse(session["scheduling"]["applied"])
-        self.assertIn("mark_failed — skipped: A trap is not a failure", board._decision_text())
+        self.assertIn("Continuation requires user authorization", board._decision_text())
 
     def test_scheduler_folds_clear_into_execution(self):
         board = self.board()

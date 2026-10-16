@@ -702,7 +702,7 @@ summary explains the overall decision; reason and wait_reason explain individual
 - continue_turn: resume an eligible unfinished turn without new instructions, using the continuation rules above.
 - request_commit: invoke the dirty owner, with no continuation gate, to commit completed task-owned work or explain why a safe handoff is impossible. Uses write policy; it is a handoff request, not implementation or repair.
 - set_wait_reason / clear_wait_reason: set or remove only the informational wait_reason. Neither changes holds, continuation_state, or recovery authorization; withhold dependent execution yourself.
-- mark_failed: set continuation_state to failed, record reason in state_detail, and clear the waiting note and recovery authorization. Requires explicit user recovery afterward; unavailable for traps or redirects.
+- mark_failed: set continuation_state to failed, record reason in state_detail, and clear the waiting note and recovery authorization. Requires explicit user recovery afterward. May stop a trapped turn when its command shows that continuation must be refused; unavailable for redirects.
 - rename_session: update only an auto-owned display name, including on active or held sessions. Names must be nonempty, single-line printable text; user-owned names are unchanged.
 
 execution_policy on dispatch_message and continue_turn controls access and Bash trapping: readonly uses a reader slot and blocks reversible/destructive commands; write uses the writer slot and blocks destructive commands; unrestricted uses the writer slot with traps off. A continuation's policy applies to the rest of the turn, not just the trapped command. Traps are not a sandbox and changing policy never expands user scope.
@@ -712,7 +712,15 @@ Evidence and scope. Read requests before authorizing writes or relaxing traps un
 
 Execution choice. Match access to the requested work. Conversational change requests can authorize ordinary implementation without imperative wording or a second approval. Initial readonly classification is provisional. Inspect full trap_evidence and continue task-related work with a suitable policy; repeating the same command under the same blocking policy will trap again. Necessary reversible inspection setup may use write within review/discussion scope without authorizing implementation. Judge actual effects and purpose, not risk labels or words such as "Edit". Withhold out-of-scope changes or operations needing broader permission, explaining the concrete conflict; use unrestricted only when the broader permission is justified.
 
-Waiting and failure. Not runnable now does not mean failed. Capacity contention, another session's dirty checkout, unmet prerequisites, and uncertainty call for waiting, optionally explained with set_wait_reason, while preserving pending work and continuation state. This applies to new and unfinished work, even if the blocker is held or failed. Reconsider on relevant events. Use mark_failed only for an evidenced failure of this session's work: requiring user recovery is a consequence, not evidence of failure. Do not propagate a prerequisite's failure automatically to dependents.
+Waiting. Leave work pending while it needs a writer slot, workspace access, a prerequisite, or more evidence to make a scheduling decision. Preserve pending messages and continuation state; optionally explain the blocker with set_wait_reason. Reconsider when relevant events arrive. This applies to new and unfinished work, including trapped turns waiting for writer access. A held or failed prerequisite leaves dependent work waiting; do not propagate its failure to dependents.
+
+Failure. Use mark_failed when concrete evidence shows that this session's current task or turn cannot continue within the user's authorization and needs user intervention. State the specific failure and its evidence in reason. Examples:
+
+- The worker explicitly reports a fatal error or says it cannot complete the task without user intervention, even if Mu exited cleanly.
+- A trapped command would violate an explicit user restriction, change unrelated user data, or perform a destructive action without the required permission. Inspect full trap_evidence and user scope before refusing continuation with mark_failed. A trap alone is insufficient: ordinary task-scoped traps should be continued with suitable access, or wait for admission.
+- The worker reports an unrecoverable condition in its own task, such as lost required data or denied access to a required service, and establishes that no authorized way to proceed remains.
+
+Runtime already gates Mu startup failures, crashes, and nonzero error exits as failed; retain that gate until explicit user continuation authorizes recovery, without issuing a redundant mark_failed. Exit code 3 denotes a trap, and user-stopped runs are interrupted; preserve those classifications unless the evidence above warrants mark_failed. Ordinary tool errors, failing tests, and unsuccessful approaches can remain part of ongoing work when the worker can address them within scope. Missing evidence calls for waiting. The scheduler must not investigate or repair the task itself.
 
 Ordering and handoff. Preserve ordinary per-session FIFO; messages never interrupt active work. Across sessions, prefer explicit user priorities and prerequisites, then the dirty owner's next message when it plainly continues the same uncommitted work, then global submission order. This is a preference, not permission to drain unrelated work, starve other writers, or wait for hypothetical follow-ups. After considering that continuation, request_commit only when another session has ready writer work blocked by the dirty checkout; otherwise retain changes for follow-up. Do not repeat an unsuccessful handoff without new user input. A queued user request to commit is an ordinary dispatch_message, not a substitute request_commit.
 
@@ -725,6 +733,8 @@ These illustrate action choice, subject to eligibility and user scope.
 - A owns the writer slot; B has an independent read-only question: dispatch B with readonly.
 - B exits after prerequisite work: if its response establishes completion and admission is available, dispatch dependent A; otherwise retain A's pending work and explain the unmet prerequisite.
 - A traps on a task-scoped reversible setup command during review: continue_turn with write if admitted, without expanding scope to implementation; if writer access is unavailable, leave it trapped with a waiting note.
+- A traps on deleting unrelated user data despite an explicit restriction: mark_failed with the command and scope violation as evidence; do not resume automatically.
+- A exits cleanly but reports a fatal task error requiring user intervention: mark_failed with the reported error as evidence. Dependent B keeps its pending work and waits.
 - Idle A owns dirty work; B has ready writer work: prefer A's queued follow-up if it plainly continues that work; otherwise request_commit from A for handoff.
 - A's invocation fails or is interrupted: retain its recovery gate until explicit user continuation; independent eligible B may still run.
 """
@@ -1084,9 +1094,6 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
                 continue
             if kind in ("set_wait_reason", "mark_failed", "clear_wait_reason"):
                 if kind == "mark_failed":
-                    if session["gate"] == "trapped":
-                        result(action, key, session, False, "A trap is not a failure")
-                        continue
                     session.update(gate="failed", reason=action["reason"], blocked=None, retry_authorized=False)
                 else:
                     session["blocked"] = action["wait_reason"] if kind == "set_wait_reason" else None
