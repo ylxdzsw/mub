@@ -381,7 +381,9 @@ for a possible future follow-up. Holds, recovery gates, and writer ownership sti
 apply, and independent readers may still run. This avoids commit boundaries solely
 for session switching without requiring the worker to combine commits.
 
-For a dirty handoff, the scheduler may ask the owning session to commit only its
+Only when another session has ready work requiring writer access and is blocked
+by the dirty checkout may the scheduler request a commit handoff. Otherwise it
+retains uncommitted changes for follow-up. It asks the owning session to commit only its
 completed, task-owned changes or explain why it cannot. This is a visibly
 scheduler-authored request, which may precede queued user messages. It is not an
 implementation follow-up or permission to commit incomplete/unrelated work.
