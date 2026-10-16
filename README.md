@@ -15,8 +15,8 @@ tasks with a completion lifecycle.
 ## Run
 
 Requires Linux with pidfds, Python 3.12+, Git, and configured `mu` on PATH
-supporting `--no-context` and `--output-schema`. The scheduler's model/provider
-must support native structured output.
+supporting `--automated`, `--no-context`, and `--output-schema`. The scheduler's
+model/provider must support native structured output.
 Installation includes the embedded Rust terminal engine
 `par-term-emu-core-rust` (and its Pillow dependency); no shell, GUI toolkit,
 terminal server, or system terminal library is needed.
@@ -37,6 +37,10 @@ unchanged. When starting a board outside a Git repository, mub initializes the
 selected directory on `master`; read-only commands such as `status` never
 initialize Git. mub does not switch branches or choose a remote's default branch.
 Do not run another editing agent against the same checkout outside mub.
+
+Scheduler and worker turns, including retries, use Mu's `--automated` flag:
+they leave the shell's `current-session` selection untouched and suppress
+completion bells. Their sessions remain journaled and listed by Mu.
 
 ## UI
 
@@ -89,8 +93,19 @@ Type your first message to automatically create a session, or use `/new [name]`
 to create one explicitly. Use `Tab` / `Shift-Tab` to switch sessions and
 `/scheduler` to inspect the scheduler's decisions and output.
 The conversation pane shows the session's model even before its first message.
-Use `/model session` to choose a model and reasoning effort for that session only,
-whether it is new or already has history.
+Use `/model session` to choose a model, thinking effort, and fast mode for that
+session only, whether it is new or already has history. In one picker, use
+`↑` / `↓` to select a model, `←` / `→` to adjust its effort slider, and Space
+to toggle fast mode. The picker previews the full model reference; Enter applies
+it and Esc cancels. Fast on adds `@fast` (priority, which may cost more); fast
+off omits the suffix and uses the upstream default. The effort slider includes
+default and each model's supported levels. Selecting inheritance leaves both
+effort and fast mode to the inherited model selection.
+Mu handles provider support; native Anthropic Messages rejects explicit
+processing preferences. CLI model options also accept `@standard`, for example
+`--scheduler-model 'openai/gpt-5:high@standard'`.
+Choose explicit scheduler/worker models for predictable automation; otherwise
+Mu retains its normal session and `current-session` model inheritance.
 Scheduler status appears once in the top bar. Errors, holds, and blocking reasons
 appear only when relevant; model defaults and active models are available through
 `/model`, and the full keyboard reference through `/help`.
@@ -142,8 +157,8 @@ Local commands:
   commit attempts. Queued messages are discarded only on successful close after
   confirmation; new messages arriving during the commit prevent automatic close.
 - `/model`: show the selected scheduler/worker defaults and active invocation models.
-- `/model scheduler|worker|both`: select models and reasoning effort.
-- `/model session`: select the current session's model and effort, or remove its override.
+- `/model scheduler|worker|both`: select models, thinking effort, and fast mode.
+- `/model session`: select the current session's model, effort, and fast mode, or remove its override.
 - `/links`: show hyperlink targets from the selected terminal without opening them.
 - `/interrupt`: interrupt and hold the selected session.
 - `/resume`: release a session hold and explicitly authorize continuation of its

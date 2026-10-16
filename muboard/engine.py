@@ -896,7 +896,7 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent.parent), env.get("PYTHONPATH")]))
         if self.server:
             env["MUB_SOCKET"] = str(self.server.path)
-        args = [self.mu, *(["retry"] if action == "retry" else []), "-s", mu_session,
+        args = [self.mu, *(["retry"] if action == "retry" else []), "--automated", "-s", mu_session,
                 "-o", "final" if kind == "scheduler" else "concise", "--trap", record["trap"]]
         if kind == "scheduler":
             args += ["--no-context", "--output-schema", json.dumps(SCHEDULER_SCHEMA, separators=(",", ":"))]

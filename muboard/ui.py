@@ -55,7 +55,7 @@ class _UI:
         "/new [name]": "Create and select a session",
         "/rename <name>|--auto": "Name the selected session, or let its name evolve automatically",
         "/close": "Close the selected session",
-        "/model [session|scheduler|worker|both]": "Show models, or choose a session/role model and effort",
+        "/model [session|scheduler|worker|both]": "Show models, or choose a model, thinking effort, and fast mode",
         "/interrupt": "Interrupt and hold the selected session",
         "/resume [selected]": "Authorize continuation and ask the scheduler to reconsider",
         "/steer <text>": "Supersede the selected session's unfinished turn with a new prompt",
@@ -862,29 +862,12 @@ class _UI:
         chosen = {}
         for current_role in roles:
             selected = session.get("model") if current_role == "session" else response["selected"].get(current_role)
-            base, separator, effort = (selected or "").rpartition(":")
-            if not separator:
-                base, effort = selected or "", ""
-            available = response["available"]
-            models = [model["id"] for model in available]
-            options = ["Inherit worker/Mu selection" if current_role == "session" else "Mu/session default", *models]
-            initial = models.index(base) + 1 if base in models else 0
-            choice = self._pick(f"{current_role.title()} model · next invocation", options, initial)
-            if choice is None:
+            reference = self._pick(
+                f"{current_role.title()} model · next invocation", response["available"], selected,
+                inherit="Inherit worker/Mu selection" if current_role == "session" else "Mu/session default")
+            if reference is None:
                 return
-            reference = None
-            if choice:
-                model = available[choice - 1]
-                reference = model["id"]
-                efforts = model.get("supported_efforts") or []
-                if efforts:
-                    current_effort = efforts.index(effort) + 1 if base == reference and effort in efforts else 0
-                    effort_choice = self._pick(f"Effort · {reference}", ["Default effort", *efforts], current_effort)
-                    if effort_choice is None:
-                        return
-                    if effort_choice:
-                        reference += ":" + efforts[effort_choice - 1]
-            chosen[current_role] = reference
+            chosen[current_role] = reference or None
         if role == "session":
             self._request({"op": "set_session_model", "session_id": session["id"], "model": chosen["session"]})
         else:
@@ -918,37 +901,58 @@ class _UI:
             self._refresh()
             self._getch()
 
-    def _pick(self, title, options, selected=0):
-        if not options:
-            return None
-        selected = max(0, min(len(options) - 1, selected))
+    def _pick(self, title, models, selected=None, *, inherit="Mu/session default"):
+        selection, _, processing = (selected or "").partition("@")
+        base, separator, effort = selection.rpartition(":")
+        if not separator:
+            base, effort = selection, ""
+        models = [dict(id=""), *models]
+        names = [model["id"] for model in models]
+        selected = names.index(base) if base in names else 0
+        fast = processing == "fast"
         while not self.engine.done:
             self._tick()
+            model = models[selected]
+            efforts = ["", *(model.get("supported_efforts") or [])]
+            effort_index = efforts.index(effort) if effort in efforts else 0
+            reference = model["id"]
+            if reference:
+                reference += (":" + efforts[effort_index] if effort_index else "") + ("@fast" if fast else "")
             self.window.erase()
             height, width = self.window.getmaxyx()
             self._add(0, 1, title, width - 2, self.colors.get("title", 0))
-            visible = max(0, height - 4)
-            start = max(0, min(selected, len(options) - visible)) if visible else selected
-            for index in range(start, min(len(options), start + visible)):
-                self._add(2 + index - start, 2, options[index], width - 4,
+            visible = max(0, height - 8)
+            start = max(0, min(selected, len(models) - visible)) if visible else selected
+            for index in range(start, min(len(models), start + visible)):
+                self._add(2 + index - start, 2, names[index] or inherit, width - 4,
                           curses.A_REVERSE if index == selected else 0)
-            if height >= 2:
-                self._add(height - 2, 1, self.ui_error, width - 2, self.colors.get("error", 0))
-            self._add(height - 1, 0, "↑↓ select · Enter choose · Q/Esc cancel", attr=curses.A_DIM)
+            slider = "─".join("●" if index == effort_index else "○" for index in range(len(efforts)))
+            thinking = (f"← {slider} →  {efforts[effort_index] or 'default'}" if len(efforts) > 1
+                        else "No effort options" if reference else "Inherited")
+            self._add(height - 5, 2, "Thinking: " + thinking, width - 4)
+            self._add(height - 4, 2, "Fast: " + ("[x] on · priority may cost more" if fast else "[ ] off · upstream default")
+                      if reference else "Fast: inherited", width - 4)
+            self._add(height - 3, 2, reference or inherit, width - 4, self.colors.get("title", 0))
+            self._add(height - 2, 1, self.ui_error, width - 2, self.colors.get("error", 0))
+            self._add(height - 1, 0, "↑↓ model · ←→ effort · Space fast · Enter apply · Q/Esc cancel", attr=curses.A_DIM)
             self._refresh()
             key = self._getch()
             if key in (3, 27, "q", "Q"):
                 return None
             if key in (10, 13, curses.KEY_ENTER):
-                return selected
+                return reference
             if key in (curses.KEY_UP, "k"):
                 selected = max(0, selected - 1)
             elif key in (curses.KEY_DOWN, "j"):
-                selected = min(len(options) - 1, selected + 1)
+                selected = min(len(models) - 1, selected + 1)
             elif key == curses.KEY_PPAGE:
                 selected = max(0, selected - max(1, visible))
             elif key == curses.KEY_NPAGE:
-                selected = min(len(options) - 1, selected + max(1, visible))
+                selected = min(len(models) - 1, selected + max(1, visible))
+            elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                effort = efforts[max(0, min(len(efforts) - 1, effort_index + (-1 if key == curses.KEY_LEFT else 1)))]
+            elif key == " " and reference:
+                fast = not fast
         return None
 
     def _confirm(self, title, message):
