@@ -930,7 +930,7 @@ class _UI:
             self.window.erase()
             height, width = self.window.getmaxyx()
             self._add(0, 1, title, width - 2, self.colors.get("title", 0))
-            visible = max(0, height - 8)
+            visible = min(len(models), max(0, height - 8))
             start = max(0, min(selected, len(models) - visible)) if visible else selected
             for index in range(start, min(len(models), start + visible)):
                 self._add(2 + index - start, 2, names[index] or inherit, width - 4,
@@ -938,10 +938,11 @@ class _UI:
             slider = "─".join("●" if index == effort_index else "○" for index in range(len(efforts)))
             thinking = (f"← {slider} →  {efforts[effort_index] or 'default'}" if len(efforts) > 1
                         else "No effort options" if reference else "Inherited")
-            self._add(height - 5, 2, "Thinking: " + thinking, width - 4)
-            self._add(height - 4, 2, "Fast: " + ("[x] on · priority may cost more" if fast else "[ ] off · upstream default")
+            options_row = 3 + visible
+            self._add(options_row, 2, "Thinking: " + thinking, width - 4)
+            self._add(options_row + 1, 2, "Fast: " + ("[x] on · priority may cost more" if fast else "[ ] off · upstream default")
                       if reference else "Fast: inherited", width - 4)
-            self._add(height - 3, 2, reference or inherit, width - 4, self.colors.get("title", 0))
+            self._add(options_row + 2, 2, reference or inherit, width - 4, self.colors.get("title", 0))
             self._add(height - 2, 1, self.ui_error, width - 2, self.colors.get("error", 0))
             self._add(height - 1, 0, "↑↓ model · ←→ effort · Space fast · Enter apply · Q/Esc cancel", attr=curses.A_DIM)
             self._refresh()
