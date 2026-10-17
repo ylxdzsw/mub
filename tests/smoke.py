@@ -10,6 +10,7 @@ from pathlib import Path
 import pty
 import select
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -1589,6 +1590,14 @@ class SchedulerSmoke(unittest.TestCase):
         def state():
             return read_state(self.root)
 
+        def assert_responsive():
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(2)
+                client.connect(str(self.root / ".mu/mub.sock"))
+                client.sendall(b'{"op":"status"}\n')
+                with client.makefile("rb") as response:
+                    self.assertTrue(json.loads(response.readline())["ok"])
+
         try:
             wait(lambda: b"Mu Board" in screen)
             send("/model worker\r")
@@ -1642,8 +1651,14 @@ class SchedulerSmoke(unittest.TestCase):
             wait(lambda: "> /rename " in visible())
             send("\x03\t")
             wait(lambda: "To S2" in visible())
-            send("\x1b[<0;5;3M\x1b[<0;5;3m")
+            send("\x1b[<0;5;3M")
             wait(lambda: "To S1" in visible())
+            # A release in a later read must not block ticks until another key.
+            send("\x1b[<0;5;3m")
+            assert_responsive()
+            for button in (1, 2):
+                send(f"\x1b[<{button};5;3M\x1b[<{button};5;3m")
+                assert_responsive()
             send("\x1b[<64;40;6M")
             wait(lambda: "History" in visible())
             send("\x1b[1;5F")

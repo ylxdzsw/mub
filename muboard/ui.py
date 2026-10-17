@@ -98,7 +98,8 @@ class _UI:
         curses.typeahead(-1)
         window.keypad(True)
         window.timeout(50)
-        curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
+        # Filtering releases here can make ncurses wait past the input timeout.
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
         curses.mouseinterval(0)
         if curses.has_colors():
             curses.start_color()
@@ -217,7 +218,15 @@ class _UI:
             key = self.window.get_wch()
             if key == curses.KEY_MOUSE:
                 _, x, y, _, buttons = curses.getmouse()
-                return ("mouse", x, y, buttons)
+                key = ("mouse", x, y, buttons)
+                # One notification can cover several queued mouse reports.
+                while True:
+                    try:
+                        _, x, y, _, buttons = curses.getmouse()
+                    except curses.error:
+                        break
+                    self.pending_keys.append(("mouse", x, y, buttons))
+                return key
             key = {curses.KEY_SR: "shift-up", curses.KEY_SF: "shift-down",
                    curses.KEY_SLEFT: "shift-left", curses.KEY_SRIGHT: "shift-right"}.get(key, key)
             if isinstance(key, int) and key > curses.KEY_MAX:
@@ -1051,7 +1060,8 @@ class _UI:
                 left, top, width, height = self.output_rect
                 if left <= x < left + width and top <= y < top + height:
                     self._view_scroll(amount)
-        elif buttons & curses.BUTTON1_PRESSED:
+        elif buttons & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED |
+                        curses.BUTTON1_DOUBLE_CLICKED | curses.BUTTON1_TRIPLE_CLICKED):
             for row, width, session_id in self.session_hits:
                 if y == row and 0 <= x < width:
                     self._select(session_id)
