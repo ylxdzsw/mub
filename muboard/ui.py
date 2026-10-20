@@ -325,7 +325,7 @@ class _UI:
 
     def _scheduler_line(self):
         scheduler = self.state["scheduler"]
-        status = "held: failed" if scheduler.get("error") else "active" if scheduler["active"] else "idle"
+        status = "held: failed" if scheduler.get("error") else "active" if scheduler["active"] else "possible stall" if scheduler.get("stall") else "idle"
         return f"Scheduler {status}"
 
     def _scheduler_usage_lines(self):
@@ -501,6 +501,8 @@ class _UI:
             return self.ui_error
         if error := self.state["scheduler"].get("error"):
             return f"Scheduler held: {error} · /schedule to recover"
+        if self.state["scheduler"].get("stall"):
+            return "Possible scheduling stall · inspect /scheduler · /schedule to rerun"
         session = self._session()
         if session:
             if session.get("hold"):

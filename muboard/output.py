@@ -134,6 +134,8 @@ def literal(value):
 
 def scheduling_note(result):
     action = result["action"]
+    if action["type"] in ("run", "rename", "mark-failed", "note"):
+        return ("" if result["applied"] else "Rejected: ") + result["detail"]
     label = action["type"]
     if policy := action.get("execution_policy", action.get("policy")):
         label += f" ({policy})"

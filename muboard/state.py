@@ -119,6 +119,7 @@ class Store:
         # A reply is not permission to retry an interrupted turn.
         if session["hold"] or session["gate"] or session["blocked"]:
             session["revision"] += 1
+        session.pop("handoff_failed", None)
         session.update(hold=False, blocked=None, retry_authorized=False)
         message = dict(id=self.data["next_message"], session_id=session_id, text=text, state="pending")
         self.data["next_message"] += 1

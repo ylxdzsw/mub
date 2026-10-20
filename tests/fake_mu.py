@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import uuid
+import xml.etree.ElementTree as ET
 
 ROOT = Path.cwd()
 STORE = ROOT / ".mu" / "fake"
@@ -67,12 +68,102 @@ def delay(seconds):
         time.sleep(0.01)
 
 
+def _scalar(text):
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _xml_value(element):
+    children = list(element)
+    if not children:
+        return _scalar(element.text)
+    result = {}
+    for child in children:
+        value = _xml_value(child)
+        if child.tag in result:
+            if not isinstance(result[child.tag], list):
+                result[child.tag] = [result[child.tag]]
+            result[child.tag].append(value)
+        else:
+            result[child.tag] = value
+    return result
+
+
+def _items(value, child):
+    if value is None:
+        return []
+    if isinstance(value, dict) and child in value:
+        value = value[child]
+    return value if isinstance(value, list) else [value]
+
+
+def parse_snapshot(prompt):
+    document = prompt.split("SNAPSHOT:\n", 1)[1].strip()
+    root = ET.fromstring(document)
+    snapshot = _xml_value(root)
+    sessions = _items(snapshot.get("sessions"), "session")
+    messages = []
+    for session in sessions:
+        nested = _items(session.pop("messages", None), "message")
+        for message in nested:
+            message.setdefault("session_id", session["id"])
+            messages.append(message)
+    snapshot["sessions"] = sessions
+    snapshot["messages"] = messages
+    snapshot["trigger_events"] = _items(snapshot.get("trigger_events"), "event")
+    return snapshot
+
+
+def _action_kind(action):
+    return action["action"]
+
+
+def scheduler_command(action, snapshot):
+    kind = _action_kind(action)
+    session_id = action.get("session_id")
+    if kind == "run":
+        return ["run", "--trap", action["trap"], f"S{session_id}"]
+    if kind == "rename":
+        return ["rename", f"S{session_id}", action["name"]]
+    if kind == "mark-failed":
+        return ["mark-failed", f"S{session_id}", action["reason"]]
+    if kind == "note":
+        if action.get("wait_reason") is None and action.get("note") is None:
+            return ["note", f"S{session_id}", "--clear"]
+        return ["note", f"S{session_id}", action.get("note", action.get("wait_reason"))]
+    raise ValueError(f"Unknown scheduler fixture action: {kind}")
+
+
+def invoke_scheduler_command(action, snapshot):
+    args = scheduler_command(action, snapshot)
+    result = subprocess.run([sys.executable, "-m", "muboard", "-C", str(ROOT), *args],
+                            cwd=ROOT, env=os.environ.copy(), capture_output=True, text=True)
+    output = result.stdout.strip() or result.stderr.strip()
+    return result.returncode, output
+
+
 def schedule(snapshot, config):
-    if "plan" in config:
-        return config["plan"]
+    if "scheduler_actions_once" in config:
+        marker = STORE / "scheduler-actions-used"
+        if marker.exists():
+            return []
+        marker.write_text("used\n")
+        return config["scheduler_actions_once"]
+    if "scheduler_actions" in config:
+        return config["scheduler_actions"]
     actions = []
     sessions = snapshot["sessions"]
-    writer = any(s["current_run"] and s["current_run"]["workspace_access"] == "readwrite" for s in sessions)
+    writer = any(s.get("current_run") and s["current_run"].get("workspace_access") == "readwrite"
+                 for s in sessions)
     owner = snapshot["workspace"]["owner_session_id"]
     dirty = not snapshot["workspace"]["clean"]
     order = config.get("order", [])
@@ -81,10 +172,10 @@ def schedule(snapshot, config):
     def writable(key):
         return not writer and (not dirty or owner == key)
 
-    def retry_policy(session):
+    def retry_trap(session):
         if session["continuation_state"] == "trapped":
-            return "write"
-        return "readonly" if (session.get("last_run") or {}).get("workspace_access", "readonly") == "readonly" else "write"
+            return "destructive"
+        return "reversible" if (session.get("last_run") or {}).get("workspace_access", "readonly") == "readonly" else "destructive"
 
     for session in sessions:
         key = session["id"]
@@ -93,26 +184,20 @@ def schedule(snapshot, config):
         steering = session.get("pending_redirect")
         if steering:
             if (steering["phase"] == "recovery" and session["user_continue_authorized"]):
-                policy = retry_policy(session)
-                if policy == "readonly" or writable(key):
-                    actions.append(dict(type="continue_turn", session_id=key, execution_policy=policy,
-                                        reason="Explicitly recover Mu before applying the pending redirect"))
-                    writer |= policy != "readonly"
+                trap = retry_trap(session)
+                if trap == "reversible" or writable(key):
+                    actions.append(dict(action="run", session_id=key, trap=trap))
+                    writer |= trap != "reversible"
             continue
         if session["current_run"]:
             continue
         if session["continuation_state"] == "trapped" or session["user_continue_authorized"]:
-            policy = retry_policy(session)
-            if policy == "readonly" or writable(key):
-                actions.append(dict(type="continue_turn", session_id=key, execution_policy=policy,
-                                    reason="Scripted retry for this turn"))
-                writer |= policy != "readonly"
+            trap = retry_trap(session)
+            if trap == "reversible" or writable(key):
+                actions.append(dict(action="run", session_id=key, trap=trap))
+                writer |= trap != "reversible"
             continue
         if session["continuation_state"]:
-            continue
-        if dirty and owner == key and writable(key) and (session["last_run"] or {}).get("original_operation") != "commit":
-            actions.append(dict(type="request_commit", session_id=key, reason="Release checkout"))
-            writer = True
             continue
         message = next((m for m in snapshot["messages"] if m["session_id"] == key), None)
         if not message or message["delivery_state"] != "pending":
@@ -121,16 +206,15 @@ def schedule(snapshot, config):
             prerequisite = int(message["text"].split()[1])
             source = next(s for s in sessions if s["id"] == prerequisite)
             if not source["last_run"] or source["continuation_state"] or source["current_run"]:
-                actions.append(dict(type="set_wait_reason", session_id=key, wait_reason=f"Waiting for S{prerequisite}"))
+                actions.append(dict(action="note", session_id=key, note=f"Waiting for S{prerequisite}"))
                 continue
         text = message["text"]
-        policy = "write" if text.startswith("write") else "readonly"
-        if policy != "readonly" and not writable(key):
+        trap = "destructive" if text.startswith("write") else "reversible"
+        if trap != "reversible" and not writable(key) and not (dirty and owner and owner != key):
             continue
-        actions.append(dict(type="dispatch_message", message_id=message["id"], execution_policy=policy,
-                            reason="Dispatch the oldest pending message"))
-        writer |= policy != "readonly"
-    return dict(summary="Scripted scheduling decision", actions=actions)
+        actions.append(dict(action="run", session_id=key, trap=trap))
+        writer |= trap != "reversible"
+    return actions
 
 
 def main():
@@ -209,7 +293,7 @@ def main():
         return code
 
     if role == "scheduler":
-        snapshot = json.loads(prompt.split("SNAPSHOT:\n", 1)[1])
+        snapshot = parse_snapshot(prompt)
         save(STORE / ("snapshot-" + uuid.uuid4().hex + ".json"), snapshot)
         if diagnostic := config.get("scheduler_stderr"):
             print(diagnostic, file=sys.stderr, flush=True)
@@ -218,9 +302,19 @@ def main():
             return finish(130, "scheduler interrupted", False)
         if config.get("scheduler_fail"):
             return finish(1, "fake provider failure", False)
-        plan = schedule(snapshot, config)
-        delay(config.get("after_plan_delay", 0))
-        return finish(0, config.get("scheduler_stdout", json.dumps(plan)), True)
+        actions = schedule(snapshot, config)
+        results = []
+        for action in actions:
+            try:
+                code, output = invoke_scheduler_command(action, snapshot)
+            except (OSError, ValueError, StopIteration) as error:
+                code, output = 1, str(error)
+            results.append(dict(action=action, code=code, output=output))
+        data["scheduler_commands"] = results
+        delay(config.get("after_action_delay", 0))
+        if config.get("scheduler_fail_after_actions"):
+            return finish(1, "Scheduler failed after admitting work", False)
+        return finish(0, config.get("scheduler_stdout", "Scheduling pass complete."), True)
 
     task = data["prompt"]
     own_file = ROOT / f"work-{key}.txt"

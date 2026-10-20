@@ -15,8 +15,8 @@ tasks with a completion lifecycle.
 ## Run
 
 Requires Linux with pidfds, Python 3.12+, Git, and configured `mu` on PATH
-supporting `--automated`, `--no-context`, and `--output-schema`. The scheduler's
-model/provider must support native structured output.
+supporting `--automated` and `--no-context`. The scheduler uses ordinary Mu
+tool calls and `mub` commands rather than a structured final decision.
 Installation includes the embedded Rust terminal engine
 `par-term-emu-core-rust` (and its Pillow dependency); no shell, GUI toolkit,
 terminal server, or system terminal library is needed.
@@ -34,7 +34,7 @@ All directories in a Git worktree resolve to the same board at its root. Only
 one mub owner may run in that worktree. Mu invocations run at the worktree root.
 Existing branches (including an unborn branch) and detached HEADs are left
 unchanged. When starting a board outside a Git repository, mub initializes the
-selected directory on `master`; read-only commands such as `status` never
+selected directory on `master`; the read-only `context` command never
 initialize Git. mub does not switch branches or choose a remote's default branch.
 Do not run another editing agent against the same checkout outside mub.
 
@@ -51,11 +51,10 @@ as Markdown. mub adds only the live model/context/cwd header and literal `mu>`
 prompt; retry does not duplicate the user prompt. History preparation runs
 behind the durable launch gate, so it cannot overlap the new turn's journal.
 Independent readers drain every worker PTY, including hidden/headless sessions.
-Scheduler JSON stays on a separate non-terminal path: only stdout is parsed as
-the decision. Stderr diagnostics, including compaction reports, remain visible
-in the scheduler pane and live CLI logs; the latest scheduler stderr is also
-available in CLI logs after exit while the owner remains open. CLI logs and trap
-evidence use complete captured output rather than a bounded screen snapshot.
+The scheduler's XML snapshot and command feedback stay on a separate
+non-terminal path. Scheduler diagnostics, including compaction reports, remain
+visible in the scheduler pane. Trap evidence uses complete captured output
+rather than a bounded screen snapshot.
 The composer is always active, sends to the selected session, and grows with its
 draft up to four visible rows. When text is hidden, its divider shows `↑ N more`
 and/or `↓ N more`, counting wrapped rows above and below the visible prompt.
@@ -176,8 +175,8 @@ Local commands:
   Old pending tool calls are superseded, not retried, and the redirect remains in
   Mu history; neither implies task success. Holds and recovery gates still apply.
   For an inactive interrupted, trapped, or failed session, the UI confirms that
-  old pending calls will not be retried. In the CLI, `mub steer` itself is explicit
-  authorization; no extra flag is needed.
+  old pending calls will not be retried. The TUI's `/steer` command itself is
+  explicit authorization; no extra flag is needed.
 - `/schedule`: recheck the workspace and scheduling. After a scheduler error,
   explicitly start a fresh scheduler session instead of retrying its old turn.
 - `/scheduler`: select the scheduler's decisions and output without triggering a
@@ -218,86 +217,90 @@ current invocation; the scheduler does not automatically steer them. Explicit
 `/steer` redirects are admitted directly by runtime at Mu's safe boundary, without
 a scheduler decision.
 
-Every scheduler turn passes a fixed JSON Schema through Mu's `--output-schema`,
-alongside `-o final`. The strict top-level object is `{summary: string, actions: []}`.
-Actions are a small `anyOf`; each variant requires every declared field, including
-`type`, and allows no undeclared fields:
+The scheduler does not return a JSON decision. It reads the current XML snapshot
+and uses Bash to issue four small, immediate commands:
 
-| Action | Required fields |
+```sh
+mub run S12 --trap reversible
+mub rename S11 "Endpoint implementation"
+mub mark-failed S10 "Cannot proceed within the user's authorization"
+mub note S13 "Waiting for S10 to implement the endpoint"
+mub note S13 --clear
+```
+
+`run` selects the runtime's next operation for that session: the oldest pending
+message or an eligible continuation. The trap setting also selects workspace
+admission:
+
+| Trap | Workspace access |
 | --- | --- |
-| `dispatch_message` | `type`, `message_id`, `execution_policy`, `reason` |
-| `continue_turn` | `type`, `session_id`, `execution_policy`, `reason` |
-| `request_commit`, `mark_failed` | `type`, `session_id`, `reason` |
-| `set_wait_reason` | `type`, `session_id`, `wait_reason` |
-| `rename_session` | `type`, `session_id`, `name` |
+| `reversible` | Reader; reversible and destructive commands are trapped |
+| `destructive` | Writer; destructive commands are trapped |
+| `off` | Writer; traps are disabled |
 
-`dispatch_message` starts a new turn for the oldest pending message;
-`continue_turn` resumes an existing unfinished turn without new instructions.
-`request_commit` asks a worker to commit completed task-owned changes for a
-workspace handoff; it does not directly execute a Git commit.
+The runtime still enforces FIFO, one invocation per session, holds, recovery
+authorization, stale-pass protection, and fresh writer admission. `run` never
+grants user recovery permission. `rename` changes only an automatic session
+name, and `note` is an informational scheduler note, not a dependency,
+worker instruction, or execution gate. `mark-failed` records a concrete reason
+and leaves the source session awaiting explicit user intervention.
 
-There is no `names` array. A session may receive at most one action other than
-`rename_session` and one `rename_session` in a decision. Renaming may accompany
-another eligible action for the same session in either order. All combinations
-of multiple non-renaming actions are invalid; execution and `mark_failed`
-already clear the waiting note.
+Commands are applied as they are issued and return their immediate admission
+result; they do not wait for a worker or poll for completion. A successful
+writer handoff reports that the destination is scheduled, not started. The
+scheduler finishes once it has made the decisions supported by the snapshot;
+the runtime wakes it for later events. It must not sleep, poll status, wait for
+an action it initiated, or perform worker work itself. Scheduling mutations go
+through `mub`; only necessary readonly inspection is allowed outside it, and
+the scheduler must not make any other mutations.
 
-The scheduler policy asks for one outcome per session, with an optional rename,
-and repeats that rule on subsequent passes. Setting a waiting note replaces its
-previous text directly; emitting two waiting-note actions in one decision is
-invalid. Before returning, the scheduler is instructed to group actions by session and
-check that the summary agrees with the chosen outcomes. A correction replaces
-conflicting actions rather than appending actions to undo a rejected decision.
+When a selected writer is blocked by an idle, eligible dirty owner, the runtime
+automatically asks that source session to commit its completed, task-owned work.
+It reserves the destination's specific pending operation, but does not start the
+destination yet. After the source completes successfully, the checkout is
+probed fresh and the reserved destination starts automatically if it is still
+eligible. An unsuccessful handoff is reported on the source; the destination
+remains pending and is not marked failed. The runtime does not retry an
+unsuccessful handoff without new user input.
 
-Execution policies are `readonly` (`readonly` with a reversible trap), `write`
-(`readwrite` with a destructive trap), or `unrestricted` (`readwrite` with traps
-off), which requires justified permission. `set_wait_reason.wait_reason` is a
-required nullable string (`"type": ["string", "null"]`): a nonempty string
-replaces the informational note, and JSON `null` removes it. Empty and
-whitespace-only strings are rejected. The note does not gate execution;
-`mark_failed` gates a session until explicit user continuation, including when
-a trapped command establishes that continuation must be refused.
-
-The group summary and action reasons are user-facing. Runtime reports each action
-as applied or skipped and shows each affected session's latest action annotation.
-These annotations are not instructions injected into worker conversations.
-Structured output does not replace runtime checks for FIFO, holds, retry
-authorization, stale decisions, or writer ownership. A clean malformed decision
-gets one automatic corrective scheduler pass, with the rejection identifying
-the offending action and, for conflicts, the session and action combination.
-No actions from a rejected decision are applied. A second rejected decision or a
-provider failure holds scheduling. Failed scheduler turns are not retried. Use
-`/schedule` to start a fresh scheduler session; existing workers may finish, but
-queued messages and other events do not release the scheduler hold. There is no
-fallback to unconstrained output.
+A scheduler/provider failure holds scheduling and is not retried. Existing
+workers may finish, but their events do not silently release the hold; use the
+TUI's `/schedule` to start a fresh scheduler session. After a clean scheduler
+pass, mub may display a possible-stall advisory when eligible work remains but
+no worker or handoff is making progress. Inspect `/scheduler` to understand
+the decision and use `/schedule` explicitly if another pass is wanted. The
+advisory does not launch work or rerun the scheduler automatically.
 
 ### Scheduler context and usage
 
-Scheduler snapshots have `sessions`, `messages`, `workspace`, and `trigger_events`.
-They exclude UI/model-selection and process bookkeeping, including session
-revisions used internally to reject stale decisions. The scheduler-facing names
-are separate from the durable state and CLI status fields; existing board files
-need no migration.
+Scheduler snapshots are readable XML, not a final JSON action object. They are
+organized around sessions rather than a global message list. The snapshot has
+global workspace and event sections, then a session section for each board
+session. Each session groups its pending FIFO messages, current and previous
+run evidence, recent history, waiting note, and runtime-computed eligibility.
+The eligibility section identifies the next operation, required reader/writer
+admission, recovery and hold gates, and concrete runtime blockers. It describes
+what is mechanically possible now; it does not prove that a dependency is
+satisfied or that the user's scope authorizes the work.
 
-| Session field | Meaning |
+Worker text is clearly marked as evidence, not scheduler instructions. Omitted
+history and fixed journal prefixes remain explicit so contextual approvals and
+dependencies can be inspected without pulling later output into an earlier
+decision. The scheduler-facing snapshot is separate from durable board state.
+
+| Session section | Meaning |
 | --- | --- |
-| `id`, `name`, `name_source` | Board session ID, display title, and `auto`/`user` naming ownership. |
-| `held` | Prohibits execution and state actions; display renaming remains allowed. |
-| `continuation_state` | Continuation gate such as `trapped`, `failed`, `interrupted`, or `redirect`; null does not imply idle. |
-| `user_continue_authorized` | Explicit permission to continue a failed/interrupted turn, not permission needed for new messages. |
-| `state_detail` | Runtime explanation of current state; informational. |
-| `wait_reason` | Informational waiting note; does not itself block execution. |
-| `pending_redirect` | Runtime-owned user redirect: `message_id`, `interrupted_run_id`, `superseded_message_id`, `phase`, and `workspace_access`. |
-| `current_run` | Running invocation, or null: `run_id`, `operation`, `workspace_access`, `command_trap`, and `message_id`. |
-| `last_run` | Previous outcome: `outcome`, `original_operation`, `workspace_access`, `command_trap`, `completed`, `message_id`, and relevant `diagnostic`/`trap_evidence`. |
-| `history` | Recent `turns` with `turn_id`, `request`, and `response`, plus `omitted_turn_count` and `read_command` when a journal exists. |
+| identity | Board session ID, display title, and automatic/user naming ownership. |
+| state and gates | Holds, continuation state, recovery authorization, and runtime detail; a null continuation gate does not imply idle. |
+| eligibility | Next pending or continuation operation, access/trap choices, writer ownership, and blockers computed from a fresh runtime view. |
+| current/last run | Active or previous operation, access, trap, completion, diagnostics, and complete trap evidence. |
+| history | Recent requests and final responses, with omitted-count and fixed-prefix read commands when a journal exists. |
 
-Run operations are `message`, `retry`, `commit`, or `redirect`;
-`last_run.original_operation` retains the original operation across retries.
-`workspace_access` is `readonly` or `readwrite`; `command_trap` is `reversible`,
-`destructive`, or `off`. `last_run.completed` reports Mu completion, separately
-from Git cleanliness. Redirect phases are `stopping`, `ready`, `delivering`,
-`held`, or `recovery`; the redirect's message remains in the mailbox.
+Run operations include new messages, recovery, worker-mediated handoff commits,
+and user redirects. `workspace_access` is `readonly` or `readwrite`;
+`command_trap` is `reversible`, `destructive`, or `off`. Completion reports Mu
+completion separately from Git cleanliness. Redirect phases and recovery gates
+remain runtime-owned; a redirect's message remains in the mailbox.
 
 Messages contain `id`, `session_id`, verbatim `text`, and `delivery_state`
 (`pending`, `inflight`, or `interrupted`); only pending messages are dispatchable.
@@ -306,25 +309,28 @@ Workspace fields are `clean`, `git_status` (Git porcelain text), and
 Trigger events contain `id`, `kind`, `session_id`, and event-specific fields such
 as `message_id`, `outcome`, `detail`, `superseded_message_id`, or `run_id`.
 
-Worker responses come from canonical Mu journal text, not PTY progress notices or screen
-redraws. Snapshots include each session's two latest materialized requests and
-final responses before any active invocation. Requests are excerpted at 2,000
-characters and responses at 3,000, with explicit omission markers and a count of
-older turns. Pending/inflight mailbox messages and trap evidence remain complete.
-Failure diagnostics are kept separately from assistant responses. Snapshots
-include current blocked and failure reasons, but not routine scheduling
-annotations or the group summary. The scheduler view shows the summary and action
-results. Routine decisions and normal progress do not show a warning notice;
-blocked sessions, holds, and failures still surface reasons requiring attention.
-`mub status` and headless output expose the same structured results.
+Worker responses come from canonical Mu journal text, not PTY progress notices or
+screen redraws. Snapshots include each session's recent materialized requests and
+final responses before any active invocation. Requests and responses are
+excerpted with explicit omission markers and a count of older turns, while
+pending/inflight messages and trap evidence remain complete. Failure
+diagnostics are kept separately from assistant responses. The scheduler view
+shows the XML snapshot, command feedback, and any stall advisory; blocked
+sessions, holds, and failures still surface reasons requiring attention.
 
-Within one scheduler session, unchanged conversational evidence is referenced
-rather than resent using `history.unchanged_since_previous_snapshot` and
-`history.read_command`. This flag only describes reused history, not unchanged
-session state. Scheduling policy is sent once; each pass still receives the
-current gates, holds, ownership, active workers, and FIFO mailboxes. The latest
-snapshot overrides older state. Previous decisions remain in the persistent
-scheduler conversation until rotation, but are not policy.
+Within one scheduler session, unchanged conversational evidence may be
+referenced rather than resent. This only describes reused history, not unchanged
+session state. Each pass still receives current gates, holds, ownership, active
+workers, FIFO mailboxes, and eligibility. The latest XML snapshot overrides
+older state; earlier command explanations are not policy. A fresh scheduler session
+receives the full runtime/workflow introduction, I/O contract, scheduling policy,
+and typical examples. All pending events are merged into one scheduling pass;
+events arriving during that pass are collected for the next one. Subsequent
+wakeups list the batch of events **since the previous snapshot**, not since the
+previous pass ended, followed by the current snapshot. These events are not a
+to-do list: the scheduler may already have observed or addressed some through
+command feedback, or runtime may have handled them. It reconciles the current
+snapshot with prior command results and acts only where a decision is still needed.
 
 Only clean scheduler sessions rotate: after 12 passes, at 32,000 context tokens
 (or half the model's context window, whichever is smaller), after compaction,
@@ -348,13 +354,10 @@ approvals or dependencies, and inspect omitted user requests before authorizing
 writes or relaxing traps. Excerpts never imply that earlier restrictions expired.
 These checks remain model instructions, not a sandbox or a new approval system.
 
-`mub status` exposes `scheduler.last_usage`, the last 24 passes in `recent_usage`,
-and `usage_totals` accumulated from this version onward. They report provider
-requests, reported input/cached-input/output/reasoning tokens, compactions, and
-per-pass elapsed time, prompt characters, and Mu's context estimate/report.
-Reasoning tokens are included in output tokens; cached input is included in total
-input. Missing usage is unreported, not zero cost. Journals retain the detailed
-provider records. `/model` also shows the most recent scheduler pass's usage.
+The TUI may show recent scheduler usage, including provider requests, reported
+input/cached-input/output/reasoning tokens, compactions, and elapsed time.
+Missing usage is unreported, not zero cost; journals retain detailed provider
+records.
 
 Scheduler creation and every scheduler invocation use Mu's `--no-context`,
 omitting skills and global/project `AGENTS.md` while retaining the system preamble,
@@ -426,10 +429,13 @@ with a concrete explanation.
 A session waiting for a writer slot, workspace access, a prerequisite, or more
 scheduling evidence keeps its pending work and continuation state. This includes
 trapped turns waiting for admission and sessions whose prerequisites are held or
-failed. The scheduler may explain the wait with `set_wait_reason` and reconsider
-on relevant events.
+failed. The scheduler explains the blocker to the user with `mub note` and ends
+its pass; the runtime wakes it on relevant events. Harmless task-scoped reversible
+setup, such as browser testing during a review, does not require failure or user
+intervention just because readonly admission trapped it. Continue with an appropriate
+trap setting when admitted, or leave the turn trapped and pending with a waiting note.
 
-`mark_failed` stops this session's work when concrete evidence shows that it needs
+`mark-failed` stops this session's work when concrete evidence shows that it needs
 user intervention: a worker reports a fatal task error, a trapped command would
 violate user scope or perform an unauthorized destructive action, or the worker
 establishes an unrecoverable condition with no authorized way to proceed. The
@@ -463,14 +469,19 @@ for a possible future follow-up. Holds, recovery gates, and writer ownership sti
 apply, and independent readers may still run. This avoids commit boundaries solely
 for session switching without requiring the worker to combine commits.
 
-Only when another session has ready work requiring writer access and is blocked
-by the dirty checkout may the scheduler request a commit handoff. Otherwise it
-retains uncommitted changes for follow-up. It asks the owning session to commit only its
-completed, task-owned changes or explain why it cannot. This is a visibly
-scheduler-authored request, which may precede queued user messages. It is not an
-implementation follow-up or permission to commit incomplete/unrelated work.
-An unsuccessful handoff does not cause repeated commit requests without new user
-input.
+When the scheduler selects a writer that needs a dirty checkout, the runtime
+handles the handoff automatically. It asks the idle, eligible dirty owner to
+commit only its completed, task-owned changes or explain why it cannot. The
+source handoff is recorded before the destination starts: the destination's
+specific operation is scheduled, but the destination has not started. After a
+successful worker-mediated commit, a fresh Git probe admits that reserved
+destination if it is still eligible. This is not an implementation follow-up or
+permission to commit incomplete or unrelated work.
+
+If the source refuses, traps, fails, is interrupted, or returns with a dirty
+checkout, the handoff is unsuccessful on the source session. The destination
+remains pending and is not marked failed. mub does not retry the handoff without
+new user input.
 
 The scheduler does not investigate implementation quality, repair failures,
 troubleshoot provider issues, or work around Mu bugs. Worker-turn failures are
@@ -480,15 +491,15 @@ retried.
 ### Interruption and shutdown
 
 Interrupting a session records a user hold before signaling its processes. The
-hold blocks all automatic work, including queued messages, retries, and commit
-requests. Selecting a session, scrolling, or changing models does not release it.
+hold blocks all automatic work, including queued messages, retries, and handoffs.
+Selecting a session, scrolling, or changing models does not release it.
 
 A new ordinary message releases the user hold for scheduling, but **does not
 authorize retrying an interrupted turn**. `mu retry` continues the old turn and
 cannot accept changed instructions. Use `/resume` explicitly after inspecting it;
 ordinary messages remain queued behind the interrupted work. To replace that
 unfinished work instead, use `/steer <text>`. For inactive interrupted, trapped,
-or failed sessions, the UI asks for confirmation. An explicit CLI `mub steer` is
+or failed sessions, the UI asks for confirmation. The TUI's `/steer` command is
 itself authorization; holds and recovery gates still apply.
 
 Steering an active turn is soft: the current provider request and running Bash
@@ -526,49 +537,55 @@ interrupt forces termination immediately.
 
 ## CLI and headless use
 
-An open TUI or headless owner accepts mutations over a private local socket.
-Submissions do not implicitly start a daemon.
+Plain `mub` launches the TUI. An open TUI or headless owner accepts scheduler
+commands over a private local socket; commands do not implicitly start an owner.
+The root startup flags remain available for automation and testing:
 
 ```sh
-mub new --name API 'Implement the API endpoint'
-mub new --name Review --model provider/model:high 'Review the API'
-mub model S1 provider/model:high # change only S1, starting with its next invocation
-mub model S1 default             # remove S1's override
-mub send S1 'Use cursor-based pagination'
-mub steer S1 'Stop the old approach and use cursor-based pagination'
-mub rename S1 'API pagination'
-mub rename S1 --auto            # allow the name to evolve on later scheduler passes
-mub new --name Investigation 'Read the existing authentication flow'
-mub status
-mub logs S1
-mub interrupt S1
-mub resume S1
-mub remove S2                   # add --discard to discard pending messages
-mub models
-mub models --scheduler provider/model:low --worker provider/model:high
-mub models --worker default
-mub schedule
-mub quit --yes                  # explicitly stop running agents
-
-mub run --headless
-mub run --headless --until-idle
+mub -C /path/to/worktree
+mub -C /path/to/worktree --headless
+mub -C /path/to/worktree --headless --until-idle
+mub -C /path/to/worktree --headless --scheduler-model provider/model
 ```
 
-`send` and `steer` also read text from stdin. `status` and `logs` work without an
-open owner.
+The scheduler has four immediate CLI actions and no JSON decision protocol:
+
+```sh
+mub run S12 --trap reversible
+mub run S12 --trap destructive
+mub run S12 --trap off
+mub rename S11 "API pagination"
+mub mark-failed S10 "Cannot proceed within the user's authorization"
+mub note S13 "Waiting for S10 to implement the endpoint"
+mub note S13 --clear
+```
+
+`run` requires one of the three trap settings. The runtime chooses dispatch or
+continuation and returns immediately after admission or handoff initiation.
+`rename`, `mark-failed`, and `note` likewise return a plain-text result. The
+scheduler pass identifier is carried in `MUB_PASS_ID` when the scheduler uses
+these commands; the owner validates it along with the caller.
+
+The only other CLI subcommand is the read-only history inspector:
+
+```sh
+mub context S1                              # exact requests and final responses
+mub context S1 --requests                   # inspect scope and restrictions only
+mub context S1 --before 12345 --turn t3     # one turn from a journal prefix
+```
+
+`context` returns JSON and can read history without an open owner. There are no
+CLI status, logs, polling, model, shutdown, message, steering, hold, or session
+lifecycle controls. Those remain TUI user controls, including `/new`, `/model`,
+`/interrupt`, `/resume`, `/steer`, `/schedule`, `/scheduler`, and `/quit`.
 `--until-idle` exits when no invocation or actionable scheduling event remains;
 held, blocked, or failed sessions may still have pending messages. A scheduler
-failure keeps the owner alive even with an empty mailbox until explicit recovery;
-use `mub schedule` to start a fresh scheduler session.
+failure keeps the owner alive even with an empty mailbox until the user starts a
+fresh pass with `/schedule`.
 
-`--scheduler-model`, `--worker-model`, and `--model` override models for the current
-launch. UI/CLI model selections persist and apply only to later invocations,
-including existing sessions. “Mu/session default” removes an override.
-Per-session model choices persist and take precedence over the worker default,
-including launch overrides. Removing a session override inherits the worker
-selection, or Mu's remembered session/configured model when no worker override
-is set. Active invocations retain their model; changing a model does not release
-a hold or trigger work.
+`--scheduler-model`, `--worker-model`, and `--model` override models for the
+current owner launch. Model selection and the other interactive controls remain
+available in the TUI; active invocations retain their launch-time model.
 
 ## Persistence
 
@@ -613,7 +630,7 @@ uv run python tests/smoke.py
 
 Smoke checks use temporary Git worktrees and fake Mu processes, with no provider
 calls. They exercise mailbox delivery, reader/writer concurrency, clean handoffs,
-traps, failures, interruption holds, stale decisions, persistence, and a real
+traps, failures, interruption holds, stale scheduler commands, persistence, and a real
 PTY-driven UI workflow. Terminal checks cover cursor/erase updates, color,
 split UTF-8, wide cells, alternate screens, hyperlinks, ignored bells,
 and draining large output while preserving complete trap evidence.

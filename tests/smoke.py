@@ -18,14 +18,14 @@ import tempfile
 import termios
 import time
 import unittest
+import xml.etree.ElementTree as ET
 from unittest.mock import DEFAULT, MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 FAKE = ROOT / "tests/fake_mu.py"
 sys.path.insert(0, str(ROOT))
 
-from muboard.engine import Engine, SCHEDULER_SCHEMA, owned_members
-from muboard.ipc import ControlServer
+from muboard.engine import Engine, owned_members
 from muboard.output import conversation, excerpt, journal_events, live_prompt, plain_output, prompt_bytes, scheduler_usage
 from muboard.terminal import Capture, Screen
 from muboard.state import read_state
@@ -80,7 +80,7 @@ class InputSmoke(unittest.TestCase):
                        active=dict(action="retry", mode="readwrite"))
         self.assertEqual(ui._session_status(session), "writing")
         self.assertEqual(ui._notice(), "")
-        session["scheduling"] = dict(action=dict(type="continue_turn", execution_policy="write", reason="Build task-owned output"),
+        session["scheduling"] = dict(action=dict(action="run", trap="destructive"),
                                      applied=True, detail="")
         self.assertEqual(ui._notice(), "")
         session["scheduling"].update(applied=False, detail="Writer slot unavailable")
@@ -100,6 +100,9 @@ class InputSmoke(unittest.TestCase):
         self.assertEqual(ui._notice(), "")
         ui.selected = None
         self.assertEqual(ui._notice(), "")
+        ui.state["scheduler"]["stall"] = "Possible scheduling stall: " + "pending work " * 20
+        self.assertIn("inspect /scheduler", ui._notice())
+        self.assertLess(len(ui._notice()), 80)
         ui.state["scheduler"]["error"] = "Cannot apply decision"
         self.assertIn("Scheduler held: Cannot apply decision", ui._notice())
         ui.ui_error = "Close needs confirmation"
@@ -413,7 +416,6 @@ class SchedulerSmoke(unittest.TestCase):
 
     def board(self, directory=None):
         board = Engine(directory or self.root, mu=str(FAKE))
-        board.server = ControlServer(board.root)
         self.boards.append(board)
         return board
 
@@ -470,7 +472,8 @@ class SchedulerSmoke(unittest.TestCase):
         self.until(reopened, reopened.idle)
         self.assertNotEqual(reopened.data["scheduler"]["session"], old)
         prompt = self.journal(reopened.data["scheduler"])["invocations"][0]["prompt"]
-        self.assertIn("You schedule messages", prompt)
+        self.assertIn("You schedule", prompt)
+        self.assertNotIn("JSON decision", prompt)
         self.assertNotIn("read design", prompt)
 
     def test_exit_preserves_scheduler_with_remaining_state(self):
@@ -494,106 +497,99 @@ class SchedulerSmoke(unittest.TestCase):
                 self.assertEqual(state["scheduler"]["turns"], 3)
                 self.assertTrue(state["events"])
 
-    def test_batched_snapshots_rotation_and_usage(self):
+    def test_scheduler_uses_xml_snapshot_and_accepts_plain_final(self):
+        self.config(scheduler_actions=[], scheduler_stdout="Nothing eligible in this pass.")
         board = self.board()
-        board.scheduler_turn_limit = 100
-        first = self.new(board, "read design; do not write")
-        board.tick()
-        self.assertIsNone(board._running(None))
-        second = self.new(board, "read independent")
-        self.until(board, lambda: board._running(None) is not None)
-        snapshot = board._running(None)["snapshot"]
-        self.assertEqual(len(snapshot["messages"]), 2)
-        self.assertNotIn("models", snapshot)
-        self.assertNotIn("next_model", snapshot["sessions"][0])
+        first = self.new(board, "read XML evidence")
+        second = self.new(board, "read another request")
+        self.until(board, lambda: board._running(None) is not None
+                   and self.journal(board.data["scheduler"])["invocations"])
+        scheduler = board._running(None)
+        invocation = self.journal(board.data["scheduler"])["invocations"][0]
+        self.assertNotIn("--output-schema", invocation["args"])
+        for heading in ("1. RUNTIME, WORKFLOW, AND ROLE", "2. I/O CONTRACT",
+                        "3. SCHEDULING POLICY", "4. TYPICAL EXAMPLES"):
+            self.assertIn(heading, invocation["prompt"])
+        document = invocation["prompt"].split("SNAPSHOT:\n", 1)[1].strip()
+        root = ET.fromstring(document)
+        self.assertEqual(root.tag, "snapshot")
+        self.assertIsNone(root.find("./messages"))
+        session_nodes = root.findall("./sessions/session")
+        self.assertEqual({int(node.findtext("id")) for node in session_nodes}, {first["id"], second["id"]})
+        for node in session_nodes:
+            self.assertIsNotNone(node.find("execution"))
+            self.assertIsNotNone(node.find("messages"))
+        self.assertIsNotNone(scheduler)
         self.until(board, board.idle)
-        scheduler = board.data["scheduler"]
-        old = scheduler["session"]
-        prompts = self.journal(scheduler)["invocations"]
-        self.assertEqual(self.journal(scheduler)["new_args"], ["new", "--no-context"])
-        self.assertTrue(all("--no-context" in p["args"] for p in prompts))
-        for invocation in prompts:
-            args = invocation["args"]
-            self.assertEqual(json.loads(args[args.index("--output-schema") + 1]), SCHEDULER_SCHEMA)
-        variants = SCHEDULER_SCHEMA["properties"]["actions"]["items"]["anyOf"]
-        self.assertEqual(set(SCHEDULER_SCHEMA["properties"]), {"summary", "actions"})
-        self.assertEqual(set(SCHEDULER_SCHEMA["required"]), {"summary", "actions"})
-        expected_fields = {
-            "dispatch_message": {"type", "message_id", "execution_policy", "reason"},
-            "continue_turn": {"type", "session_id", "execution_policy", "reason"},
-            "request_commit": {"type", "session_id", "reason"},
-            "set_wait_reason": {"type", "session_id", "wait_reason"},
-            "mark_failed": {"type", "session_id", "reason"},
-            "rename_session": {"type", "session_id", "name"},
-        }
-        self.assertEqual({v["properties"]["type"]["enum"][0] for v in variants}, set(expected_fields))
-        schemas = [SCHEDULER_SCHEMA, *variants]
-        for schema in schemas:
-            self.assertFalse(schema["additionalProperties"])
-            self.assertEqual(set(schema["required"]), set(schema["properties"]))
-        for variant in variants:
-            action = variant["properties"]["type"]["enum"][0]
-            self.assertEqual(set(variant["properties"]), expected_fields[action])
-        self.assertEqual(SCHEDULER_SCHEMA["properties"]["summary"]["type"], "string")
-        self.assertEqual(SCHEDULER_SCHEMA["properties"]["actions"]["type"], "array")
-        for variant in variants:
-            if variant["properties"]["type"]["enum"][0] in ("dispatch_message", "continue_turn"):
-                self.assertEqual(set(variant["properties"]["execution_policy"]["enum"]),
-                                 {"readonly", "write", "unrestricted"})
-        self.assertNotIn("names", SCHEDULER_SCHEMA["properties"])
-        self.assertNotIn("steer", {v["properties"]["type"]["enum"][0] for v in variants})
-        wait_schema = next(v for v in variants if v["properties"]["type"]["enum"] == ["set_wait_reason"])
-        self.assertEqual(wait_schema["properties"]["wait_reason"], {"type": ["string", "null"]})
-        self.assertNotIn("scheduling", snapshot["sessions"][0])
-        self.assertIn("40 characters", board._scheduler_policy())
-        for worker in (first, second):
-            self.assertEqual(self.journal(worker)["new_args"], ["new"])
-            self.assertTrue(all("--no-context" not in p["args"] for p in self.journal(worker)["invocations"]))
-            self.assertTrue(all("--output-schema" not in p["args"] for p in self.journal(worker)["invocations"]))
-        self.assertGreaterEqual(len(prompts), 2)
-        self.assertIn("You schedule messages", prompts[0]["prompt"])
-        self.assertTrue(all("You schedule messages" not in p["prompt"] for p in prompts[1:]))
-        self.assertEqual(first["last"]["summary"], "Handled: read design; do not write")
-        self.assertNotIn("LIVE:", first["last"]["summary"])
-        self.assertEqual(scheduler["usage_totals"]["input_tokens"], 100 * len(prompts))
-        self.assertEqual(scheduler["last_usage"]["cache_read_input_tokens"], 60)
-        self.assertEqual(scheduler["last_usage"]["reasoning_output_tokens"], 5)
-        self.assertGreater(scheduler["last_usage"]["seconds"], 0)
+        self.assertIsNone(board.data["scheduler"]["error"])
+        self.assertIn("Nothing eligible", board.output(None)["text"])
+        snapshots = [json.loads(path.read_text()) for path in (self.root / ".mu/fake").glob("snapshot-*")]
+        parsed = snapshots[-1]
+        self.assertEqual({message["session_id"] for message in parsed["messages"]}, {first["id"], second["id"]})
         snapshot = board._scheduler_snapshot()
-        payload = json.loads(board._scheduler_prompt(snapshot, bootstrap=False).split("SNAPSHOT:\n", 1)[1])
-        self.assertTrue(payload["sessions"][0]["history"]["unchanged_since_previous_snapshot"])
-        self.assertNotIn("revision", payload["sessions"][0])
-        self.assertEqual(payload["messages"], snapshot["messages"])
-        self.assertEqual(set(payload), {"sessions", "messages", "workspace", "trigger_events"})
-        payload = json.loads(board._scheduler_prompt(snapshot).split("SNAPSHOT:\n", 1)[1])
-        self.assertIn("turns", payload["sessions"][0]["history"])
+        snapshot["trigger_events"] = [
+            dict(kind="worker_exit", session_id=first["id"], outcome="clean"),
+            dict(kind="worker_exit", session_id=second["id"], outcome="trapped"),
+            dict(kind="submitted", session_id=first["id"]),
+            dict(kind="recheck", session_id=None),
+        ]
+        wakeup, document = board._scheduler_prompt(snapshot, bootstrap=False).split("SNAPSHOT:\n", 1)
+        self.assertIn("Events since the previous snapshot (batched for this pass):", wakeup)
+        self.assertIn("not a to-do list", wakeup)
+        self.assertIn(f"S{first['id']} finished its invocation.", wakeup)
+        self.assertIn(f"S{second['id']} stopped at a command trap.", wakeup)
+        self.assertIn(f"S{first['id']} received a new message.", wakeup)
+        self.assertIn("The user requested a scheduling pass.", wakeup)
+        self.assertNotIn("1. RUNTIME", wakeup)
+        self.assertEqual(ET.fromstring(document).tag, "snapshot")
 
-        board.scheduler_turn_limit = scheduler["turns"]
-        board.request(dict(op="send", session_id=first["id"], text="read follow-up"))
-        self.until(board, lambda: board._running(None) is not None)
-        snapshot = board._running(None)["snapshot"]
-        self.assertNotEqual(scheduler["session"], old)
-        self.assertEqual(self.journal(scheduler)["new_args"], ["new", "--no-context"])
-        self.assertIn(old, scheduler["previous_sessions"])
-        self.assertTrue((self.root / ".mu/sessions" / f"{old}.jsonl").exists())
-        context = snapshot["sessions"][0]["history"]
-        self.assertEqual(context["turns"][0]["request"], "read design; do not write")
-        self.assertEqual(context["turns"][0]["response"], first["last"]["summary"])
+    def test_scheduler_commands_apply_immediately_and_require_pass_auth(self):
+        self.config(scheduler_delay=0.25, after_action_delay=0.1,
+                    scheduler_stdout="Actions admitted; final explanation is plain text.")
+        board = self.board()
+        session = self.new(board, "read command fixture")
+        locked = board.store.session(board.request(dict(op="new", name="Locked title"))["session_id"])
+        self.config(scheduler_delay=0.25, after_action_delay=0.3, worker_delay=0.5, scheduler_actions_once=[
+            dict(action="rename", session_id=locked["id"], name="Must not replace user name"),
+            dict(action="rename", session_id=session["id"], name="Command fixture"),
+            dict(action="note", session_id=session["id"], note="Waiting briefly"),
+            dict(action="run", session_id=session["id"], trap="reversible"),
+        ], scheduler_stdout="Actions admitted; final explanation is plain text.")
+        self.until(board, lambda: board._running(None) is not None
+                   and self.journal(board.data["scheduler"])["active"]["busy"])
+        command = [sys.executable, "-m", "muboard", "-C", str(self.root),
+                   "note", f"S{session['id']}", "unauthorized"]
+        environment = dict(os.environ, PYTHONPATH=str(ROOT))
+        environment["MUB_PASS_ID"] = board._running(None)["record"]["id"]
+        process = subprocess.Popen(command, cwd=ROOT, env=environment,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        while process.poll() is None:
+            board.tick()
+            time.sleep(0.01)
+        self.assertNotEqual(process.returncode, 0)
+        self.until(board, lambda: board._running(session["id"]) is not None)
+        self.assertIsNotNone(board._running(None))
         self.until(board, board.idle)
-        board.request(dict(op="send", session_id=first["id"], text="read third"))
+        self.assertEqual(session["name"], "Command fixture")
+        self.assertEqual(session["name_source"], "auto")
+        self.assertEqual(locked["name"], "Locked title")
+        self.assertIsNone(session["blocked"])
+        self.assertEqual([turn["prompt"] for turn in self.journal(session)["invocations"]],
+                         ["read command fixture"])
+        self.assertIsNone(board.data["scheduler"]["error"])
+
+    def test_scheduler_reports_advisory_stall_without_rerunning(self):
+        self.config(scheduler_actions=[], scheduler_stdout="I am waiting on evidence.")
+        board = self.board()
+        session = self.new(board, "read stalled work")
         self.until(board, board.idle)
-        snapshot = board._scheduler_snapshot()
-        context = snapshot["sessions"][0]["history"]
-        self.assertEqual(context["omitted_turn_count"], 1)
-        self.assertEqual([t["request"] for t in context["turns"]], ["read follow-up", "read third"])
-        result = subprocess.check_output([sys.executable, "-m", "muboard", "-C", str(self.root),
-            "context", f"S{first['id']}", "--before", context["read_command"].split()[-1], "--turn", "t1"],
-            env=dict(os.environ, PYTHONPATH=str(ROOT)))
-        self.assertEqual(json.loads(result)["turns"][0]["request"], "read design; do not write")
-        board.close()
-        reopened = self.board()
-        self.assertEqual(reopened._scheduler_snapshot()["sessions"][0]["history"], context)
-        self.assertEqual(len(self.journal(second)["invocations"]), 1)
+        stall = board.data["scheduler"].get("stall")
+        self.assertTrue(stall)
+        self.assertIn(f"S{session['id']}", json.dumps(stall))
+        count = len(self.journal(board.data["scheduler"])["invocations"])
+        for _ in range(10):
+            board.tick()
+        self.assertEqual(len(self.journal(board.data["scheduler"])["invocations"]), count)
 
     def test_canonical_responses_and_compaction_accounting(self):
         events = [dict(type="prompt_queued", prompt_id="q1", prompt=dict(text="Discuss only")),
@@ -660,225 +656,6 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(self.journal(scheduler)["new_args"], ["new"])
         self.assertIn("--no-context", self.journal(scheduler)["invocations"][0]["args"])
 
-    def test_evolving_names_and_user_ownership(self):
-        board = self.board()
-        auto = self.new(board, "read naming design")
-        locked = board.store.session(board.request(dict(op="new", name="Session 2"))["session_id"])
-        removed = board.store.session(board.request(dict(op="new"))["session_id"])
-
-        def proposal(name):
-            snapshot = board._scheduler_snapshot()
-            return dict(snapshot=snapshot, plan=dict(summary="Name topics", actions=[
-                dict(type="rename_session", session_id=auto["id"], name=name),
-                dict(type="rename_session", session_id=locked["id"], name="Must not replace user name"),
-            ]))
-
-        active = proposal("Session naming")
-        active["plan"]["actions"].append(dict(type="rename_session", session_id=removed["id"], name="Removed"))
-        active["plan"]["actions"].append(dict(type="dispatch_message", message_id=board.data["messages"][0]["id"],
-                                                execution_policy="readonly", reason="Read the naming request"))
-        board.request(dict(op="remove", session_id=removed["id"]))
-        with patch.object(board, "_spawn") as spawn:
-            board._apply_plan(active)
-            spawn.assert_called_once()
-        self.assertEqual(auto["name"], "Session naming")
-        self.assertEqual(locked["name"], "Session 2")
-        self.assertEqual(auto["name_source"], "auto")
-        decision = board.data["scheduler"]["decision"]
-        self.assertEqual(decision["summary"], "Name topics")
-        dispatch_result = next(result for result in decision["actions"] if result["action"]["type"] == "dispatch_message")
-        self.assertEqual(dispatch_result["session_id"], auto["id"])
-        self.assertTrue(dispatch_result["applied"])
-        self.assertEqual(dispatch_result["action"]["reason"], "Read the naming request")
-        self.assertEqual(auto["scheduling"], dispatch_result)
-        self.assertTrue(board.data["scheduler"]["reason"].startswith("Name topics"))
-        self.assertIn("Skipped", board.data["scheduler"]["reason"])
-        self.assertEqual(read_state(self.root)["scheduler"]["decision"], decision)
-        self.assertEqual(next(s for s in read_state(self.root)["sessions"] if s["id"] == auto["id"])["scheduling"],
-                         dispatch_result)
-        self.assertNotIn("scheduling", board._scheduler_snapshot()["sessions"][0])
-        snapshot = board._scheduler_snapshot()
-        invalid = dict(summary="Duplicate work", actions=[
-            dict(type="dispatch_message", message_id=board.data["messages"][0]["id"],
-                 execution_policy="readonly", reason="Read it"),
-            dict(type="set_wait_reason", session_id=auto["id"], wait_reason="Wait instead"),
-        ])
-        with self.assertRaises(ValueError) as rejected:
-            board._validate_plan(invalid, dict(snapshot=snapshot))
-        error = str(rejected.exception)
-        for detail in (f"S{auto['id']}", "actions[0] (dispatch_message)", "actions[1] (set_wait_reason)", "Keep only one"):
-            self.assertIn(detail, error)
-        prompt = board._scheduler_prompt(snapshot, bootstrap=False, correction=error)
-        self.assertIn(f"Rejection: {error}", prompt)
-        self.assertIn("No actions from it were applied", prompt)
-        invalid["actions"] = [
-            dict(type="rename_session", session_id=auto["id"], name="First title"),
-            dict(type="rename_session", session_id=auto["id"], name="Second title"),
-        ]
-        with self.assertRaisesRegex(ValueError, rf"S{auto['id']}: multiple rename_session actions"):
-            board._validate_plan(invalid, dict(snapshot=snapshot))
-
-        for reverse, wait_reason in ((False, "Waiting for prerequisite"), (True, "Waiting for prerequisite"), (False, None), (True, None)):
-            with self.subTest(rename_wait_reverse=reverse, wait_reason=wait_reason):
-                auto["name"] = f"Session {auto['id']}"
-                rename = dict(type="rename_session", session_id=auto["id"], name="Naming while waiting")
-                wait = dict(type="set_wait_reason", session_id=auto["id"], wait_reason=wait_reason)
-                actions = [wait, rename] if reverse else [rename, wait]
-                active = dict(snapshot=board._scheduler_snapshot(), plan=dict(summary="Name pending work", actions=actions))
-                pending = json.loads(json.dumps(board.data["messages"]))
-                revision = auto["revision"]
-                with patch.object(board, "_spawn") as spawn:
-                    board._apply_plan(active)
-                spawn.assert_not_called()
-                self.assertEqual(auto["name"], rename["name"])
-                self.assertEqual(auto["blocked"], wait["wait_reason"])
-                self.assertEqual(auto["revision"], revision + 1)
-                self.assertEqual(board.data["messages"], pending)
-                self.assertTrue(all(result["applied"] for result in board.data["scheduler"]["decision"]["actions"]))
-
-        board.request(dict(op="interrupt", session_id=auto["id"]))
-        revision = auto["revision"]
-        pending = json.loads(json.dumps(board.data["messages"]))
-        board._apply_plan(proposal("Naming implementation"))
-        self.assertEqual(auto["name"], "Naming implementation")
-        self.assertTrue(auto["hold"])
-        self.assertEqual(auto["revision"], revision)
-        self.assertEqual(board.data["messages"], pending)
-
-        active = proposal("Stale automatic name")
-        board.request(dict(op="rename", session_id=auto["id"], name="My title"))
-        board._apply_plan(active)
-        self.assertEqual(auto["name"], "My title")
-        events = list(board.data["events"])
-        board.request(dict(op="rename", session_id=auto["id"], name=None))
-        self.assertEqual(board.data["events"], events)
-        board._apply_plan(proposal("Automatic again"))
-        saved = read_state(self.root)["sessions"][0]
-        self.assertEqual((saved["name"], saved["name_source"]), ("Automatic again", "auto"))
-        for invalid in ("", "two\nlines"):
-            with self.assertRaises(ValueError):
-                board._validate_plan(proposal(invalid)["plan"], proposal(invalid))
-        long_title = proposal("x" * 120)
-        board._validate_plan(long_title["plan"], long_title)
-
-    def test_scheduler_block_clear_and_fail_actions(self):
-        board = self.board()
-        session = board.store.session(board.request(dict(op="new"))["session_id"])
-
-        def apply(action, summary):
-            board._apply_plan(dict(snapshot=board._scheduler_snapshot(),
-                                   plan=dict(summary=summary, actions=[action])))
-
-        apply(dict(type="set_wait_reason", session_id=session["id"], wait_reason="Waiting for review"), "Blocked")
-        self.assertEqual(session["blocked"], "Waiting for review")
-        self.assertEqual(session["scheduling"]["action"]["wait_reason"], "Waiting for review")
-        self.assertIn("set_wait_reason — Waiting for review", board._decision_text())
-        apply(dict(type="set_wait_reason", session_id=session["id"], wait_reason="Waiting for handoff"), "Replaced")
-        self.assertEqual(session["blocked"], "Waiting for handoff")
-        apply(dict(type="set_wait_reason", session_id=session["id"], wait_reason=None), "Cleared")
-        self.assertIsNone(session["blocked"])
-        self.assertIsNone(session["gate"])
-        self.assertIn("set_wait_reason — clear waiting note", board._decision_text())
-        self.assertIsNone(read_state(self.root)["sessions"][0]["blocked"])
-        self.assertIsNone(read_state(self.root)["scheduler"]["decision"]["actions"][0]["action"]["wait_reason"])
-        for invalid in ("", " \t\n", False, 0, [], {}):
-            with self.subTest(wait_reason=invalid), self.assertRaisesRegex(ValueError, "wait_reason must be a nonempty string or null"):
-                apply(dict(type="set_wait_reason", session_id=session["id"], wait_reason=invalid), "Invalid")
-        apply(dict(type="mark_failed", session_id=session["id"], reason="Cannot continue safely"), "Failed")
-        self.assertEqual(session["gate"], "failed")
-        self.assertEqual(session["reason"], "Cannot continue safely")
-        self.assertEqual(session["scheduling"]["action"]["reason"], "Cannot continue safely")
-        session["blocked"] = "Obsolete note"
-        apply(dict(type="set_wait_reason", session_id=session["id"], wait_reason=None), "Clear only the note")
-        self.assertEqual(session["gate"], "failed")
-        self.assertIsNone(session["blocked"])
-        session.update(gate="trapped", last=dict(exit="trapped", summary="Trapped command"))
-        board.traps[session["id"]] = "Trapped command"
-        apply(dict(type="set_wait_reason", session_id=session["id"], wait_reason="Waiting for writer access"), "Wait")
-        self.assertEqual(session["gate"], "trapped")
-        session["retry_authorized"] = True
-        reason = "Trapped command deletes unrelated user data despite an explicit restriction"
-        apply(dict(type="mark_failed", session_id=session["id"], reason=reason), "Refuse continuation")
-        self.assertEqual(session["gate"], "failed")
-        self.assertEqual(session["reason"], reason)
-        self.assertIsNone(session["blocked"])
-        self.assertFalse(session["retry_authorized"])
-        self.assertTrue(session["scheduling"]["applied"])
-        self.assertEqual(session["last"]["exit"], "trapped")
-        self.assertEqual(board.traps[session["id"]], "Trapped command")
-        apply(dict(type="continue_turn", session_id=session["id"], execution_policy="readonly",
-                   reason="Retry without user authorization"), "Refused")
-        self.assertEqual(session["gate"], "failed")
-        self.assertFalse(session["scheduling"]["applied"])
-        self.assertIn("Continuation requires user authorization", board._decision_text())
-
-    def test_scheduler_execution_clears_waiting_note(self):
-        board = self.board()
-        session = self.new(board, "read work")
-        message = board.data["messages"][0]
-        (self.root / "task.txt").write_text("Task-owned changes\n")
-        board.data["owner"] = session["id"]
-        board._workspace()
-        rename = dict(type="rename_session", session_id=session["id"], name="Task topic")
-        for kind in ("dispatch_message", "continue_turn", "request_commit"):
-            action = dict(type=kind, reason="Continue work")
-            action.update(dict(message_id=message["id"]) if kind == "dispatch_message" else dict(session_id=session["id"]))
-            if kind != "request_commit":
-                action["execution_policy"] = "readonly"
-            for reverse in (False, True):
-                with self.subTest(kind=kind, reverse=reverse):
-                    session.update(blocked="Waiting", gate="failed" if kind == "continue_turn" else None,
-                                   retry_authorized=kind == "continue_turn")
-                    actions = [action, rename] if reverse else [rename, action]
-                    active = dict(snapshot=board._scheduler_snapshot(), plan=dict(summary="Continue", actions=actions))
-                    self.assertEqual(board._validate_plan(active["plan"], active), actions)
-                    revision = session["revision"]
-                    with patch.object(board, "_spawn") as spawn:
-                        board._apply_plan(active)
-                    spawn.assert_called_once()
-                    self.assertEqual(spawn.call_args.kwargs["action"], {"dispatch_message": "message", "continue_turn": "retry", "request_commit": "commit"}[kind])
-                    self.assertEqual(session["revision"], revision)
-                    self.assertEqual([r["action"] for r in board.data["scheduler"]["decision"]["actions"]], actions)
-
-        action = dict(type="dispatch_message", message_id=message["id"], execution_policy="readonly", reason="Read work")
-        active = dict(snapshot=board._scheduler_snapshot(), plan=dict(summary="Continue", actions=[action]))
-        session["revision"] += 1
-        with patch.object(board, "_spawn") as spawn:
-            board._apply_plan(active)
-        spawn.assert_not_called()
-        self.assertEqual(session["blocked"], "Waiting")
-        active["snapshot"] = board._scheduler_snapshot()
-        revision = session["revision"]
-        board._apply_plan(active)
-        self.assertIsNone(session["blocked"])
-        self.assertEqual(session["revision"], revision + 1)
-        self.assertIsNotNone(board._running(session["id"]))
-
-    def test_scheduler_rejects_conflicting_action_combinations(self):
-        board = self.board()
-        session = self.new(board, "read work")
-        active = dict(snapshot=board._scheduler_snapshot())
-        wait = dict(type="set_wait_reason", session_id=session["id"], wait_reason="Waiting")
-        clear = dict(wait, wait_reason=None)
-        execute = [dict(type="continue_turn", session_id=session["id"], reason="Continue work", execution_policy="readonly")]
-        execute += [dict(type=kind, session_id=session["id"], reason="Work decision") for kind in ("request_commit", "mark_failed")]
-        execute += [dict(type="dispatch_message", message_id=board.data["messages"][0]["id"],
-                         execution_policy="readonly", reason="Read work")]
-        combinations = [[wait, clear], [wait, wait], [clear, clear], execute[:2]]
-        combinations += [[note, action] for note in (wait, clear) for action in execute]
-        for combination in combinations:
-            for actions in (combination, list(reversed(combination))):
-                with self.subTest(actions=actions):
-                    with self.assertRaises(ValueError) as rejected:
-                        board._apply_plan(dict(active, plan=dict(summary="Conflicting work", actions=actions)))
-                    error = str(rejected.exception)
-                    self.assertIn(f"S{session['id']}: conflicting actions", error)
-                    for i, action in enumerate(actions):
-                        self.assertIn(f"actions[{i}] ({action['type']})", error)
-                    self.assertIn("Keep only one action other than rename_session per session", error)
-                    self.assertEqual(session["revision"], active["snapshot"]["sessions"][0]["revision"])
-                    self.assertIsNone(session["blocked"])
-
     def test_legacy_names_are_user_owned(self):
         board = self.board()
         session = self.new(board, "read legacy")
@@ -894,8 +671,10 @@ class SchedulerSmoke(unittest.TestCase):
         raw = "  read first\n<example>α & β</example>\n\n"
         first = self.new(board, raw)
         self.until(board, lambda: board._running(None) is not None)
+        original_events = {e["id"] for e in board._running(None)["snapshot"]["trigger_events"]}
         second = self.new(board, "read independent")
         board.request(dict(op="send", session_id=first["id"], text="read second"))
+        pending_events = {e["id"] for e in board.data["events"]} - original_events
         saved = read_state(self.root)
         self.assertEqual(len(saved["messages"]), 3)
         self.until(board, lambda: board._running(first["id"]) is not None)
@@ -919,6 +698,11 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(len(self.journal(second)["invocations"]), 1)
         scheduler = self.journal(board.data["scheduler"])
         self.assertGreaterEqual(len(scheduler["invocations"]), 3)
+        batches = [{int(node.text) for node in ET.fromstring(turn["prompt"].split("SNAPSHOT:\n", 1)[1])
+                    .findall("./trigger_events/event/id")} for turn in scheduler["invocations"]]
+        self.assertTrue(pending_events <= batches[1])
+        for event_id in original_events | pending_events:
+            self.assertEqual(sum(event_id in batch for batch in batches), 1)
         self.assertTrue(all("--automated" in t["args"] for t in scheduler["invocations"]))
         count = len(scheduler["invocations"])
         for _ in range(10):
@@ -926,7 +710,7 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(len(self.journal(board.data["scheduler"])["invocations"]), count)
 
     def test_concurrent_readers_one_writer_and_dirty_handoff(self):
-        self.config(worker_delay=0.25)
+        self.config(worker_delay=1.0)
         board = self.board()
         reader1 = self.new(board, "read one")
         reader2 = self.new(board, "read two")
@@ -942,15 +726,18 @@ class SchedulerSmoke(unittest.TestCase):
             writers = [a for a in board.active.values() if a["record"]["kind"] == "worker" and a["record"]["mode"] == "readwrite"]
             self.assertLessEqual(len(writers), 1)
             time.sleep(0.01)
-        self.assertTrue(board._workspace()["clean"])
-        self.assertIsNone(board.data["owner"])
-        for session in (writer1, writer2):
-            turns = self.journal(session)["invocations"]
-            self.assertEqual(len(turns), 2)
-            self.assertEqual(turns[0]["prompt"], "write one" if session is writer1 else "write two")
-            self.assertTrue(turns[1]["prompt"].startswith("<system-request>\n"))
-            self.assertTrue(turns[1]["prompt"].endswith("\n</system-request>"))
-            self.assertTrue(all("--no-context" not in t["args"] for t in turns))
+        self.assertFalse(board._workspace()["clean"])
+        self.assertEqual(board.data["owner"], writer2["id"])
+        source_turns = self.journal(writer1)["invocations"]
+        destination_turns = self.journal(writer2)["invocations"]
+        self.assertEqual(len(source_turns), 2)
+        self.assertEqual(len(destination_turns), 1)
+        self.assertEqual(source_turns[0]["prompt"], "write one")
+        self.assertTrue(source_turns[1]["prompt"].startswith("<system-request>\n"))
+        self.assertTrue(source_turns[1]["prompt"].endswith("\n</system-request>"))
+        self.assertEqual(destination_turns[0]["prompt"], "write two")
+        self.assertTrue(all("--no-context" not in t["args"] for t in source_turns + destination_turns))
+        self.assertIn("Handoff completed", board.data["scheduler"]["handoff_result"])
 
     def test_explicit_steer_bypasses_pending_fifo_and_preserves_owner(self):
         board = self.board()
@@ -986,7 +773,8 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(prompts, [original_text, replacement, *older_texts])
         self.assertEqual([m["id"] for m in board.data["messages"]], [])
         self.assertTrue(all(turn["args"][0] != "retry" for turn in turns))
-        self.assertIsNone(board.data["owner"])
+        self.assertEqual(board.data["owner"], session["id"])
+        self.assertFalse(board.workspace["clean"])
 
     def test_ordinary_messages_do_not_redirect_active_worker(self):
         self.config(scheduler_delay=0.05, worker_delay=0.5)
@@ -1025,26 +813,6 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertTrue(board.data["scheduler"]["error"])
         self.assertLessEqual(sum(a["record"]["kind"] == "worker" and a["record"]["mode"] == "readwrite"
                                  for a in board.active.values()), 1)
-
-    def test_steer_does_not_inherit_unrestricted_traps(self):
-        board = self.board()
-        session = self.new(board, "write hold with unrestricted policy")
-        message_id = board.data["messages"][0]["id"]
-        self.config(plan=dict(summary="Explicit unrestricted request", actions=[dict(
-            type="dispatch_message", message_id=message_id, execution_policy="unrestricted", reason="Use the requested policy")]))
-        self.until(board, lambda: self.steerable(board, session))
-        original = board._running(session["id"])["record"]
-        self.assertEqual((original["mode"], original["trap"]), ("readwrite", "off"))
-        self.config()
-        board.request(dict(op="steer", session_id=session["id"], text="read corrected request"))
-        self.until(board, lambda: board._running(session["id"]) is not None
-                   and board._running(session["id"])["record"]["action"] == "redirect")
-        redirect = board._running(session["id"])["record"]
-        self.assertEqual(redirect["mode"], "readwrite")
-        self.assertEqual(redirect["trap"], "destructive")
-        self.assertLessEqual(sum(a["record"]["kind"] == "worker" and a["record"]["mode"] == "readwrite"
-                                 for a in board.active.values()), 1)
-        self.until(board, board.idle)
 
     def test_explicit_redirect_retains_writer_admission(self):
         board = self.board()
@@ -1206,7 +974,8 @@ class SchedulerSmoke(unittest.TestCase):
         self.config(release_hold=True)
         board.request(dict(op="resume", session_id=session["id"]))
         self.until(board, board.idle)
-        self.assertTrue(board.workspace["clean"])
+        self.assertFalse(board.workspace["clean"])
+        self.assertIsNotNone(board.data["owner"])
         self.assertFalse(board.data["messages"])
         turns = self.journal(session)["invocations"]
         self.assertIn("retry", turns[1]["args"])
@@ -1232,33 +1001,6 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertNotIn("retry", args)
         self.assertEqual(args[args.index("--trap") + 1], "reversible")
 
-    def test_resume_preserves_trap_evidence_and_defers_execution(self):
-        board = self.board()
-        session = self.new(board, "trap write")
-        self.until(board, lambda: board._running(session["id"]) is not None)
-        self.config(plan=dict(summary="Inspection scope conflict", actions=[
-            dict(type="set_wait_reason", session_id=session["id"], wait_reason="Needs reconsideration")]))
-        self.until(board, board.idle)
-        self.assertEqual(session["gate"], "trapped")
-        evidence = board._scheduler_snapshot()["sessions"][0]["last_run"]["trap_evidence"]
-        for gate in ("trapped", "interrupted"):
-            session["gate"] = gate
-            result = board.request(dict(op="resume", session_id=session["id"]))
-            self.assertEqual(result, dict(eligible=True, retry=True))
-            self.assertEqual(session["gate"], "trapped")
-            self.assertTrue(session["retry_authorized"])
-            self.assertIsNone(session["blocked"])
-            self.assertIsNone(board._running(session["id"]))
-            self.assertEqual(board._scheduler_snapshot()["sessions"][0]["last_run"]["trap_evidence"], evidence)
-        self.until(board, board.idle)
-        self.assertEqual(session["blocked"], "Needs reconsideration")
-        self.assertEqual(len(self.journal(session)["invocations"]), 1)
-        self.config()
-        board.request(dict(op="resume", session_id=session["id"]))
-        self.until(board, board.idle)
-        self.assertEqual(session["last"]["exit"], "clean")
-        self.assertIn("retry", self.journal(session)["invocations"][1]["args"])
-
     def test_failures_block_dependents_without_repairs(self):
         board = self.board()
         prerequisite = self.new(board, "fail provider")
@@ -1271,7 +1013,7 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertIn("Waiting", dependent["blocked"])
         self.assertEqual(independent["last"]["exit"], "clean")
 
-    def test_failed_commit_does_not_loop(self):
+    def test_automatic_handoff_failure_does_not_loop(self):
         self.config(commit_refused=True)
         board = self.board()
         session = self.new(board, "write unfinished")
@@ -1280,6 +1022,55 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(len(self.journal(session)["invocations"]), 2)
         self.assertEqual(board.data["owner"], session["id"])
         self.assertIsNone(other["session"])
+        self.assertTrue(other["blocked"])
+        count = len(self.journal(board.data["scheduler"])["invocations"])
+        for _ in range(10):
+            board.tick()
+        self.assertEqual(len(self.journal(board.data["scheduler"])["invocations"]), count)
+
+    def test_handoff_reservation_survives_admission_and_rejects_changed_target(self):
+        board = self.board()
+        source = board.store.session(board.request(dict(op="new"))["session_id"])
+        target = self.new(board, "read reserved operation")
+        operation = board._execution_choice(target)
+        handoff = dict(source=source["id"], destination=target["id"], revision=target["revision"],
+                       operation=operation, mode="readwrite", trap="destructive", run_id="commit")
+        board.data["handoff"] = handoff
+        board.store.save()
+
+        def admit(session, choice, mode, trap):
+            self.assertEqual(read_state(self.root)["handoff"], handoff)
+            self.assertEqual((session, choice, mode, trap), (target, operation, "readwrite", "destructive"))
+
+        with patch.object(board, "_start_operation", side_effect=admit) as start:
+            board._finish_handoff(dict(id="commit"), "clean")
+            start.assert_called_once()
+        self.assertNotIn("handoff", read_state(self.root))
+        board.data["handoff"] = handoff
+        target["revision"] += 1
+        with patch.object(board, "_start_operation") as start:
+            board._finish_handoff(dict(id="commit"), "clean")
+            start.assert_not_called()
+        self.assertIsNone(target["gate"])
+        self.assertEqual(board.data["messages"][0]["state"], "pending")
+        self.assertNotIn("handoff", board.data)
+
+    def test_handoff_start_failure_gates_source_only(self):
+        board = self.board()
+        source = board.store.session(board.request(dict(op="new"))["session_id"])
+        target = self.new(board, "write destination")
+        (self.root / "owned.txt").write_text("completed source work")
+        board.data["owner"] = source["id"]
+        board._workspace()
+        active = dict(snapshot=board._scheduler_snapshot(), executed=set())
+        with patch.object(board, "_spawn", side_effect=RuntimeError("Cannot start commit")):
+            with self.assertRaisesRegex(RuntimeError, "Cannot start commit"):
+                board._scheduler_action(dict(action="run", session_id=target["id"], trap="destructive"), active)
+        self.assertEqual(source["gate"], "failed")
+        self.assertIsNone(target["gate"])
+        self.assertIsNone(target["session"])
+        self.assertNotIn("handoff", board.data)
+        self.assertTrue(source["handoff_failed"])
 
     def test_commit_and_close_preserves_mailbox_until_success(self):
         self.config(commit_refused=True)
@@ -1302,12 +1093,13 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(board.data["owner"], key)
         self.assertEqual([m["id"] for m in board.data["messages"]], [message])
         self.assertIn("remains open", session["blocked"])
-        self.assertEqual(len(self.journal(session)["invocations"]), 3)
+        self.assertEqual(len(self.journal(session)["invocations"]), 2)
         self.config()
         board.request(dict(op="commit_close", session_id=key, discard=True))
         self.until(board, lambda: session not in board.data["sessions"])
         self.assertNotIn(session, board.data["sessions"])
         self.assertTrue(board.workspace["clean"])
+        self.assertIsNone(board.data["owner"])
         self.assertEqual(board.data["messages"], [])
         self.assertTrue((self.root / ".mu/sessions" / f"{session['session']}.jsonl").exists())
 
@@ -1339,25 +1131,6 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertIn(session, board.data["sessions"])
         self.assertEqual([m["id"] for m in board.data["messages"]], [message])
         self.assertIn("New messages", session["blocked"])
-
-    def test_stale_dispatch_and_invalid_fifo(self):
-        self.config(scheduler_delay=0.3)
-        board = self.board()
-        held = self.new(board, "read held")
-        removed = self.new(board, "read removed")
-        board.request(dict(op="send", session_id=held["id"], text="read second"))
-        self.until(board, lambda: board._running(None) is not None and self.journal(board.data["scheduler"])["active"]["busy"])
-        active = board._running(None)
-        last_message = board.data["messages"][-1]
-        with self.assertRaisesRegex(ValueError, "FIFO"):
-            board._validate_plan(dict(summary="wrong", actions=[dict(type="dispatch_message", message_id=last_message["id"],
-                                                                        execution_policy="readonly", reason="Skip FIFO")]), active)
-        board.request(dict(op="interrupt", session_id=held["id"]))
-        board.request(dict(op="remove", session_id=removed["id"], discard=True))
-        self.until(board, board.idle)
-        self.assertIsNone(held["session"])
-        self.assertTrue(held["hold"])
-        self.assertEqual(len(board.data["messages"]), 2)
 
     def test_session_models(self):
         board = self.board()
@@ -1431,19 +1204,25 @@ class SchedulerSmoke(unittest.TestCase):
         self.new(board, "read also queued")
         board.tick()
         self.assertFalse(board.active)
-        # A bad JSON response triggers one corrective pass; a second bad response latches.
-        self.config(scheduler_stdout="not JSON")
-        board.request(dict(op="schedule"))
-        self.until(board, lambda: "rejected twice" in (board.data["scheduler"].get("error") or ""))
-        self.assertFalse(board.active)
-        self.assertTrue(all(m["state"] == "pending" for m in board.data["messages"]))
-        self.config(scheduler_stderr=diagnostic)
+        # A plain final response is accepted; recovery is explicit after a provider failure.
+        self.config(scheduler_stdout="Retrying the pending work.", scheduler_actions=[
+            dict(action="run", session_id=session["id"], trap="reversible")])
         board.request(dict(op="schedule"))
         self.until(board, board.idle)
         self.assertNotEqual(board.data["scheduler"]["session"], old)
         self.assertIsNone(board.data["scheduler"]["error"])
-        self.assertIn(diagnostic, board.output(None)["text"])
         self.assertEqual(session["last"]["exit"], "clean")
+
+    def test_scheduler_failure_preserves_already_started_work(self):
+        self.config(scheduler_fail_after_actions=True, worker_delay=0.3)
+        board = self.board()
+        session = self.new(board, "read admitted work")
+        self.until(board, lambda: bool(board.data["scheduler"]["error"]) and not board.active)
+        self.assertEqual(session["last"]["exit"], "clean")
+        self.assertEqual(len(self.journal(session)["invocations"]), 1)
+        self.assertFalse(board.data["messages"])
+        self.assertIn("previously accepted actions remain applied", board.data["scheduler"]["error"])
+        self.assertFalse(board.idle())
 
     def test_scheduler_error_is_not_idle_with_empty_mailbox(self):
         self.config(scheduler_fail=True)
@@ -1456,38 +1235,6 @@ class SchedulerSmoke(unittest.TestCase):
         board.request(dict(op="schedule"))
         self.until(board, board.idle)
         self.assertIsNone(board.data["scheduler"]["error"])
-
-    def test_single_correction_recovers_bad_decision(self):
-        # A first invalid decision spawns one corrective pass; if that succeeds,
-        # the board resumes normally without user intervention.
-        board = self.board()
-        self.new(board, "read work")
-        self.config(scheduler_stdout="not JSON")
-        original_spawn = board._spawn
-        corrections = []
-
-        def spawn_with_valid_correction(*args, **kwargs):
-            if kwargs.get("correction"):
-                corrections.append(kwargs["correction"])
-                self.config(scheduler_stdout=json.dumps(dict(summary="Corrected: wait", actions=[])))
-            return original_spawn(*args, **kwargs)
-
-        with patch.object(board, "_spawn", side_effect=spawn_with_valid_correction):
-            self.until(board, lambda: len(corrections) == 1 and not board.active
-                       and board.data["scheduler"].get("error") is None, seconds=10)
-        self.assertEqual(len(corrections), 1)
-        self.assertTrue(all(m["state"] == "pending" for m in board.data["messages"]))
-
-    def test_repeated_bad_decision_latches_error(self):
-        # Two consecutive bad responses latch the error and require manual /schedule.
-        board = self.board()
-        self.new(board, "read work")
-        self.config(scheduler_stdout="not JSON")
-        board.request(dict(op="schedule"))
-        self.until(board, lambda: "rejected twice" in (board.data["scheduler"].get("error") or ""), seconds=10)
-        self.assertFalse(board.active)
-        # Board has a latched error; messages remain pending (not silently dropped).
-        self.assertTrue(all(m["state"] == "pending" for m in board.data["messages"]))
 
     def test_early_exit_keeps_undelivered_input(self):
         self.config(early_fail=True)

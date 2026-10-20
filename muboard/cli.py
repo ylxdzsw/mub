@@ -2,14 +2,15 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shutil
 import signal
 import sys
 import time
 
-from .ipc import ControlServer, call
-from .output import conversation, journal_events, replay
+from .ipc import call
+from .output import conversation, journal_events
 from .state import project_root, read_state
 
 
@@ -17,85 +18,52 @@ def session_id(value):
     return int(value.removeprefix("S").removeprefix("s"))
 
 
-def text_arg(value):
-    if value is not None:
-        return value
-    if sys.stdin.isatty():
-        raise ValueError("Supply a message as an argument or on stdin")
-    return sys.stdin.read()
-
-
-def run_options(parser, suppressed=False):
-    default = argparse.SUPPRESS if suppressed else None
-    parser.add_argument("--mu", default=argparse.SUPPRESS if suppressed else "mu", help="Mu executable")
-    parser.add_argument("--scheduler-model", default=default)
-    parser.add_argument("--worker-model", default=default)
-    parser.add_argument("--model", default=default, help="Override both models for this launch")
+def run_options(parser):
+    parser.add_argument("--mu", default="mu", help="Mu executable")
+    parser.add_argument("--scheduler-model")
+    parser.add_argument("--worker-model")
+    parser.add_argument("--model", help="Override both models for this launch")
     for flag in ("headless", "until-idle"):
-        parser.add_argument("--" + flag, action="store_true", default=argparse.SUPPRESS if suppressed else False)
+        parser.add_argument("--" + flag, action="store_true")
 
 
 def parser():
-    p = argparse.ArgumentParser(prog="mub", description="Mu sessions with scheduled message delivery")
-    p.add_argument("-C", "--project", help="Project directory (default: current directory; run initializes Git if needed)")
+    p = argparse.ArgumentParser(prog="mub", description="Run mub without a subcommand to open the session TUI.",
+                                epilog="Mutation commands are for the active scheduler. User controls live in the TUI.")
+    p.add_argument("-C", "--project", help="Project directory (default: current directory; plain mub initializes Git if needed)")
     run_options(p)
     sub = p.add_subparsers(dest="command")
-    run_options(sub.add_parser("run", help="Open the session TUI (default)"), True)
-    new = sub.add_parser("new", help="Create a session, optionally queue its first message")
-    new.add_argument("text", nargs="?")
-    new.add_argument("--name")
-    new.add_argument("--model", default=argparse.SUPPRESS, help="Model for this session only")
-    model = sub.add_parser("model", help="Set one session's model for later invocations")
-    model.add_argument("session_id", type=session_id)
-    model.add_argument("reference", help="Model reference, or default to inherit worker/Mu selection")
-    rename = sub.add_parser("rename", help="Name a session or return it to automatic naming")
+    run = sub.add_parser("run", help="Run the selected session's next eligible operation")
+    run.add_argument("session_id", type=session_id)
+    run.add_argument("--trap", choices=("reversible", "destructive", "off"), required=True)
+    rename = sub.add_parser("rename", help="Rename an automatically named session")
     rename.add_argument("session_id", type=session_id)
-    rename.add_argument("name", nargs="?")
-    rename.add_argument("--auto", action="store_true")
-    send = sub.add_parser("send", help="Queue a message for a session")
-    send.add_argument("session_id", type=session_id)
-    send.add_argument("text", nargs="?")
-    steer = sub.add_parser("steer", help="Supersede a session's unfinished turn with a new prompt")
-    steer.add_argument("session_id", type=session_id)
-    steer.add_argument("text", nargs="?")
-    for name, help_text in (("interrupt", "Stop a session and hold all automatic work"),
-                            ("resume", "Release a hold; explicitly authorize continuation of the old turn"),
-                            ("remove", "Detach an idle session; never delete its Mu journal"),
-                            ("logs", "Read Mu history and current live output")):
-        command = sub.add_parser(name, help=help_text)
-        command.add_argument("session_id", type=session_id)
-        if name == "remove":
-            command.add_argument("--discard", action="store_true", help="Discard queued/interrupted messages")
-    sub.add_parser("status", help="Read board state, including when the owner is closed")
+    rename.add_argument("name")
+    failed = sub.add_parser("mark-failed", help="Require user intervention for a session")
+    failed.add_argument("session_id", type=session_id)
+    failed.add_argument("reason")
+    note = sub.add_parser("note", help="Set or clear a session's scheduler note")
+    note.add_argument("session_id", type=session_id)
+    note.add_argument("text", nargs="?")
+    note.add_argument("--clear", action="store_true")
     context = sub.add_parser("context", help="Read exact user turns and final responses from a worker journal")
     context.add_argument("session_id", type=session_id)
     context.add_argument("--before", type=int, help="Read only this byte prefix of the journal")
     context.add_argument("--turn", help="Read one Mu turn ID instead of the full conversation")
     context.add_argument("--requests", action="store_true", help="Omit responses when inspecting user scope and restrictions")
-    sub.add_parser("schedule", help="Recheck scheduling; replace a failed scheduler session, never retry it")
-    models = sub.add_parser("models", help="List models or save scheduler/worker choices")
-    models.add_argument("--scheduler")
-    models.add_argument("--worker")
-    quit_parser = sub.add_parser("quit", help="Stop all agents and close mub")
-    quit_parser.add_argument("--yes", action="store_true", help="Confirm stopping running agents")
     return p
 
 
 def main():
     args = parser().parse_args()
     try:
-        command = args.command or "run"
         directory = Path(args.project or Path.cwd()).resolve()
-        if command == "run":
+        if args.command is None:
             run(directory, args)
             return
+        command = args.command
         root = project_root(directory)
-        if command == "status":
-            try:
-                result = call(root, dict(op="status"))
-            except RuntimeError:
-                result = dict(read_state(root), root=str(root), owner_running=False)
-        elif command == "context":
+        if command == "context":
             session = next((s for s in read_state(root)["sessions"] if s["id"] == args.session_id), None)
             if not session:
                 raise ValueError("Unknown session")
@@ -107,58 +75,22 @@ def main():
             if args.requests:
                 for turn in result["turns"]:
                     del turn["response"]
-        elif command == "logs":
-            try:
-                result = call(root, dict(op="output", session_id=args.session_id))
-            except RuntimeError:
-                session = next((s for s in read_state(root)["sessions"] if s["id"] == args.session_id), None)
-                if not session:
-                    raise ValueError("Unknown session")
-                result = dict(text=replay(root, session["session"], args.mu) if session["session"] else "",
-                              source="Mu session journal")
-            print(f"[{result['source']}]", file=sys.stderr)
-            print(result["text"], end="")
+            print(json.dumps(result, ensure_ascii=False, indent=2))
             return
+        if command == "note" and args.clear == (args.text is not None):
+            raise ValueError("Supply note text or --clear, not both")
+        request = dict(op="scheduler_action", action=command, session_id=args.session_id,
+                       pass_id=os.environ.get("MUB_PASS_ID"))
+        if command == "run":
+            request["trap"] = args.trap
+        elif command == "rename":
+            request["name"] = args.name
+        elif command == "mark-failed":
+            request["reason"] = args.reason
         else:
-            request = dict(op=command)
-            if hasattr(args, "session_id"):
-                request["session_id"] = args.session_id
-            if command == "new":
-                request["name"] = args.name
-                request["model"] = None if args.model == "default" else args.model
-                if args.text is not None or not sys.stdin.isatty():
-                    text = text_arg(args.text)
-                    if text.strip():
-                        request["text"] = text
-            elif command == "model":
-                request.update(op="set_session_model", model=None if args.reference == "default" else args.reference)
-            elif command in ("send", "steer"):
-                text = text_arg(args.text)
-                if command == "steer" and not text.strip():
-                    raise ValueError("Steering text cannot be empty")
-                request["text"] = text
-            elif command == "rename":
-                if args.auto == (args.name is not None):
-                    raise ValueError("Supply a name or --auto, not both")
-                request["name"] = args.name
-            elif command == "remove":
-                request["discard"] = args.discard
-            elif command == "models":
-                choices = {role: None if value == "default" else value
-                           for role in ("scheduler", "worker") if (value := getattr(args, role)) is not None}
-                if choices:
-                    request.update(op="set_models", models=choices)
-            elif command == "quit":
-                state = call(root, dict(op="status"))
-                busy = state["scheduler"]["active"] or any(s["active"] for s in state["sessions"])
-                confirmed = args.yes
-                if busy and not args.yes:
-                    if not sys.stdin.isatty() or input("Stop running agents and quit? [y/N] ").lower() != "y":
-                        raise ValueError("Quit cancelled; use --yes to confirm stopping running agents")
-                    confirmed = True
-                request.update(op="shutdown", confirmed=confirmed)
-            result = call(root, request)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+            request["note"] = None if args.clear else args.text
+        result = call(root, request)
+        print(result["text"])
     except (ValueError, RuntimeError, OSError) as error:
         print(f"mub: {error}", file=sys.stderr)
         raise SystemExit(1) from None
@@ -178,8 +110,6 @@ def run(root, args):
                     worker_model=args.worker_model or args.model)
     previous = {}
     try:
-        engine.server = ControlServer(root)
-
         def shutdown(signum, frame):
             engine.request(dict(op="shutdown", confirmed=True))
 
