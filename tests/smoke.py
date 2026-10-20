@@ -472,7 +472,7 @@ class SchedulerSmoke(unittest.TestCase):
         self.until(reopened, reopened.idle)
         self.assertNotEqual(reopened.data["scheduler"]["session"], old)
         prompt = self.journal(reopened.data["scheduler"])["invocations"][0]["prompt"]
-        self.assertIn("You schedule", prompt)
+        self.assertTrue(prompt.startswith(reopened._scheduler_policy()))
         self.assertNotIn("JSON decision", prompt)
         self.assertNotIn("read design", prompt)
 
@@ -518,7 +518,10 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual({int(node.findtext("id")) for node in session_nodes}, {first["id"], second["id"]})
         for node in session_nodes:
             self.assertIsNotNone(node.find("execution"))
+            self.assertEqual(node.findtext("execution/reader"), "available")
+            self.assertEqual(node.findtext("execution/writer"), "available")
             self.assertIsNotNone(node.find("messages"))
+            self.assertIsNone(node.find("messages/message/session_id"))
         self.assertIsNotNone(scheduler)
         self.until(board, board.idle)
         self.assertIsNone(board.data["scheduler"]["error"])
@@ -541,7 +544,7 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertIn(f"S{first['id']} received a new message.", wakeup)
         self.assertIn("The user requested a scheduling pass.", wakeup)
         self.assertNotIn("1. RUNTIME", wakeup)
-        self.assertEqual(ET.fromstring(document).tag, "snapshot")
+        self.assertEqual(len(ET.fromstring(document).findall("./trigger_events/event")), 4)
 
     def test_scheduler_commands_apply_immediately_and_require_pass_auth(self):
         self.config(scheduler_delay=0.25, after_action_delay=0.1,
@@ -995,6 +998,8 @@ class SchedulerSmoke(unittest.TestCase):
         snapshots = [json.loads(p.read_text()) for p in (self.root / ".mu/fake").glob("snapshot-*")]
         trapped = next(s for snap in snapshots for s in snap["sessions"] if s["continuation_state"] == "trapped")
         self.assertIn("complete stdin", trapped["last_run"]["trap_evidence"])
+        self.assertIn("diagnostic", trapped["last_run"])
+        self.assertNotIn("journal_offset", trapped["execution"]["operation"])
         board.request(dict(op="send", session_id=session["id"], text="read next"))
         self.until(board, board.idle)
         args = self.journal(session)["invocations"][-1]["args"]
@@ -1037,6 +1042,17 @@ class SchedulerSmoke(unittest.TestCase):
                        operation=operation, mode="readwrite", trap="destructive", run_id="commit")
         board.data["handoff"] = handoff
         board.store.save()
+        facts = board._execution_facts(target)
+        self.assertEqual(facts["operation"], operation)
+        self.assertEqual(facts["reader"], "scheduled after handoff")
+        self.assertIn("Reserved for handoff", facts["writer"])
+        snapshot = board._scheduler_snapshot()
+        before = json.dumps(snapshot)
+        document = board._scheduler_prompt(snapshot).split("SNAPSHOT:\n", 1)[1]
+        rendered_handoff = ET.fromstring(document).find("handoff")
+        self.assertIsNone(rendered_handoff.find("revision"))
+        self.assertEqual(rendered_handoff.findtext("run_id"), "commit")
+        self.assertEqual(json.dumps(snapshot), before)
 
         def admit(session, choice, mode, trap):
             self.assertEqual(read_state(self.root)["handoff"], handoff)
@@ -1062,6 +1078,8 @@ class SchedulerSmoke(unittest.TestCase):
         (self.root / "owned.txt").write_text("completed source work")
         board.data["owner"] = source["id"]
         board._workspace()
+        facts = board._execution_facts(target)
+        self.assertEqual(facts["writer"], f"available after automatic handoff from S{source['id']}")
         active = dict(snapshot=board._scheduler_snapshot(), executed=set())
         with patch.object(board, "_spawn", side_effect=RuntimeError("Cannot start commit")):
             with self.assertRaisesRegex(RuntimeError, "Cannot start commit"):

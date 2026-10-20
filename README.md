@@ -286,7 +286,10 @@ satisfied or that the user's scope authorizes the work.
 Worker text is clearly marked as evidence, not scheduler instructions. Omitted
 history and fixed journal prefixes remain explicit so contextual approvals and
 dependencies can be inspected without pulling later output into an earlier
-decision. The scheduler-facing snapshot is separate from durable board state.
+decision. The scheduler-facing snapshot is separate from durable board state:
+internal revision counters and retry byte offsets are not rendered, and nested
+messages inherit their session ID. Run IDs, brief diagnostics, and full trap
+evidence remain available to correlate events and inspect failures.
 
 | Session section | Meaning |
 | --- | --- |
@@ -302,7 +305,7 @@ and user redirects. `workspace_access` is `readonly` or `readwrite`;
 completion separately from Git cleanliness. Redirect phases and recovery gates
 remain runtime-owned; a redirect's message remains in the mailbox.
 
-Messages contain `id`, `session_id`, verbatim `text`, and `delivery_state`
+Nested messages contain `id`, verbatim `text`, and `delivery_state`
 (`pending`, `inflight`, or `interrupted`); only pending messages are dispatchable.
 Workspace fields are `clean`, `git_status` (Git porcelain text), and
 `owner_session_id`; an active writer can reserve ownership before making changes.
@@ -634,3 +637,7 @@ traps, failures, interruption holds, stale scheduler commands, persistence, and 
 PTY-driven UI workflow. Terminal checks cover cursor/erase updates, color,
 split UTF-8, wide cells, alternate screens, hyperlinks, ignored bells,
 and draining large output while preserving complete trap evidence.
+
+Real-model scheduler replays are separate, opt-in experiments described in
+[tests/scheduler_replay.md](tests/scheduler_replay.md). They require an explicit
+replay command and are not run by the smoke suite or CI.

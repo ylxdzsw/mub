@@ -703,7 +703,7 @@ command results; act only where a decision is still needed, without repeating ac
 - execution: operation is the next FIFO message or eligible continuation; reader and writer
   describe admission and blockers, with detail when unavailable. These are mechanical facts,
   not user permission or proof that logical dependencies are satisfied.
-- messages: id, session_id, verbatim text, and delivery_state (pending, inflight, interrupted).
+- messages: id, verbatim text, and delivery_state (pending, inflight, interrupted), nested by session.
   Runtime selects the FIFO head. Redirect delivery is runtime-owned.
 - history: recent turns (turn_id, request, response), omitted_turn_count, and read_command
   for an exact journal prefix. Excerpts may omit text. unchanged_since_previous_snapshot
@@ -720,7 +720,7 @@ command results; act only where a decision is still needed, without repeating ac
   instructions. handoff_failure records an unsuccessful attempt by this owner to yield.
 - workspace: clean, git_status (Git porcelain), and owner_session_id. An active writer can
   reserve ownership before making changes; ownerless dirty changes admit no writer.
-- handoff: source, destination, reserved operation and revision, mode/trap, and commit run_id.
+- handoff: source, destination, reserved operation, mode/trap, and commit run_id.
   The destination is scheduled to run after successful handoff and fresh admission checks.
   handoff_result reports the latest outcome; unsuccessful handoffs leave work pending.
 - trigger_events: the batch of scheduling events since the previous snapshot (or already
@@ -858,8 +858,14 @@ the user, not as a substitute for scheduling runnable work.
             history = session["history"]
             if history["turns"] and known.get(str(session["id"])) == versions[str(session["id"])]:
                 session["history"] = dict(unchanged_since_previous_snapshot=True, read_command=history["read_command"])
-            session["messages"] = [m for m in payload["messages"] if m["session_id"] == session["id"]]
+            session["messages"] = [{k: v for k, v in m.items() if k != "session_id"}
+                                   for m in payload["messages"] if m["session_id"] == session["id"]]
+            if operation := session["execution"]["operation"]:
+                operation.pop("journal_offset", None)
         del payload["messages"]
+        if handoff := payload.get("handoff"):
+            handoff.pop("revision", None)
+            handoff["operation"].pop("journal_offset", None)
         singular = dict(sessions="session", messages="message", trigger_events="event", turns="turn")
 
         def render(node, value):
