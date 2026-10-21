@@ -291,6 +291,11 @@ internal revision counters and retry byte offsets are not rendered, and nested
 messages inherit their session ID. Run IDs, brief diagnostics, and full trap
 evidence remain available to correlate events and inspect failures.
 
+Empty optional fields and collections are omitted. Each snapshot fully replaces
+earlier state: absence means no value or an empty collection, not unchanged.
+Only the explicit history-unchanged marker permits reuse of earlier history.
+Boolean false and numeric zero remain explicit.
+
 | Session section | Meaning |
 | --- | --- |
 | identity | Board session ID, display title, and automatic/user naming ownership. |
@@ -317,7 +322,11 @@ screen redraws. Snapshots include each session's recent materialized requests an
 final responses before any active invocation. Requests and responses are
 excerpted with explicit omission markers and a count of older turns, while
 pending/inflight messages and trap evidence remain complete. Failure
-diagnostics are kept separately from assistant responses. The scheduler view
+diagnostics are kept separately from assistant responses. Unsuccessful runs include
+a bounded `terminal_tail` exported from the terminal emulator after PTY capture
+finishes, rather than raw redraw sequences. It may include wrapped text or earlier
+turns and is not a complete transcript; runtime errors and full trapped-command
+evidence remain separate. The scheduler view
 shows the XML snapshot, command feedback, and any stall advisory; blocked
 sessions, holds, and failures still surface reasons requiring attention.
 

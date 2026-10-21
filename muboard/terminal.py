@@ -63,6 +63,12 @@ class Screen:
         with self.lock:
             return list(dict.fromkeys(link[0] for link in self.core.get_all_hyperlinks()))
 
+    def tail(self, lines=40, chars=2000):
+        """Bounded rendered context, not a complete invocation transcript."""
+        with self.lock:
+            text = self.core.export_text().rstrip()
+        return "\n".join(text.splitlines()[-lines:])[-chars:]
+
     def frame(self, start, count, *, follow=False):
         with self.lock:
             core = self.core

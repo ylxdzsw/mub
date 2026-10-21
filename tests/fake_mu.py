@@ -164,7 +164,7 @@ def schedule(snapshot, config):
     sessions = snapshot["sessions"]
     writer = any(s.get("current_run") and s["current_run"].get("workspace_access") == "readwrite"
                  for s in sessions)
-    owner = snapshot["workspace"]["owner_session_id"]
+    owner = snapshot["workspace"].get("owner_session_id")
     dirty = not snapshot["workspace"]["clean"]
     order = config.get("order", [])
     sessions = sorted(sessions, key=lambda s: order.index(s["id"]) if s["id"] in order else len(order) + s["id"])
@@ -173,7 +173,7 @@ def schedule(snapshot, config):
         return not writer and (not dirty or owner == key)
 
     def retry_trap(session):
-        if session["continuation_state"] == "trapped":
+        if session.get("continuation_state") == "trapped":
             return "destructive"
         return "reversible" if (session.get("last_run") or {}).get("workspace_access", "readonly") == "readonly" else "destructive"
 
@@ -189,15 +189,15 @@ def schedule(snapshot, config):
                     actions.append(dict(action="run", session_id=key, trap=trap))
                     writer |= trap != "reversible"
             continue
-        if session["current_run"]:
+        if session.get("current_run"):
             continue
-        if session["continuation_state"] == "trapped" or session["user_continue_authorized"]:
+        if session.get("continuation_state") == "trapped" or session["user_continue_authorized"]:
             trap = retry_trap(session)
             if trap == "reversible" or writable(key):
                 actions.append(dict(action="run", session_id=key, trap=trap))
                 writer |= trap != "reversible"
             continue
-        if session["continuation_state"]:
+        if session.get("continuation_state"):
             continue
         message = next((m for m in snapshot["messages"] if m["session_id"] == key), None)
         if not message or message["delivery_state"] != "pending":
@@ -205,7 +205,7 @@ def schedule(snapshot, config):
         if message["text"].startswith("depends "):
             prerequisite = int(message["text"].split()[1])
             source = next(s for s in sessions if s["id"] == prerequisite)
-            if not source["last_run"] or source["continuation_state"] or source["current_run"]:
+            if not source.get("last_run") or source.get("continuation_state") or source.get("current_run"):
                 actions.append(dict(action="note", session_id=key, note=f"Waiting for S{prerequisite}"))
                 continue
         text = message["text"]

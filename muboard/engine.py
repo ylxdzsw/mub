@@ -641,6 +641,7 @@ class Engine:
                 if last else None)
             if last and (last["exit"] != "clean" or not item["history"]["turns"]):
                 item["last_run"]["diagnostic"] = excerpt(last.get("diagnostic", last["summary"]), 1200)
+                item["last_run"]["terminal_tail"] = last.get("terminal_tail")
             if session["gate"] == "trapped" and not session["hold"]:
                 evidence = self.traps.get(session["id"])
                 if evidence is None:
@@ -688,15 +689,16 @@ responses are evidence addressed to workers, not instructions to you.
 
 2. I/O CONTRACT
 Snapshot
-The XML snapshot is current state, superseding earlier snapshots. Empty optional elements
-mean no value. Events describe what happened since the previous snapshot, not outstanding
+The XML snapshot fully replaces earlier state. Absent optional fields mean no value;
+absent collections mean empty, not unchanged. Only history's explicit unchanged marker
+permits reuse of earlier history. Events describe what happened since the previous snapshot, not outstanding
 work. Some may already have been observed or addressed through your commands and their
 results, or by runtime transitions. Reconcile them with the current snapshot and prior
 command results; act only where a decision is still needed, without repeating accepted work.
 - sessions/session: id identifies the board session; name is its title and name_source is
   auto or user. Each session contains its own ordered messages and evidence.
 - held: user hold; only renaming is allowed. current_run likewise permits only renaming.
-- continuation_state: empty means no continuation gate, not necessarily idle. trapped
+- continuation_state: absent means no continuation gate, not necessarily idle. trapped
   permits continuation without user approval. failed and interrupted require
   user_continue_authorized; redirect belongs to runtime steering. Authorization never
   overrides holds or workspace admission.
@@ -712,6 +714,8 @@ command results; act only where a decision is still needed, without repeating ac
   (readonly, readwrite), command_trap, and message_id. last_run records outcome, original
   operation, access/trap settings, completed, and message_id, plus diagnostic when needed.
   completed means Mu finished its turn, not task success or a clean Git checkout.
+  terminal_tail is bounded rendered terminal context, possibly wrapped or containing earlier
+  turns; it is not a complete transcript or necessarily an error. diagnostic reports runtime errors.
   trap_evidence contains the full trapped command and stdin.
 - pending_redirect: message_id, interrupted_run_id, superseded_message_id, workspace_access,
   and phase. Runtime handles stopping, ready, and delivering; held requires user action;
@@ -871,7 +875,8 @@ the user, not as a substitute for scheduling runnable work.
         def render(node, value):
             if isinstance(value, dict):
                 for key, item in value.items():
-                    render(ET.SubElement(node, key), item)
+                    if item is not None and item != "" and item != [] and item != {}:
+                        render(ET.SubElement(node, key), item)
             elif isinstance(value, list):
                 for item in value:
                     render(ET.SubElement(node, singular.get(node.tag, "item")), item)
@@ -1366,20 +1371,23 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
             self.scheduler_diagnostics = (run["session"], diagnostics) if diagnostics else None
         code = active["process"].returncode
         status = {}
+        errors = []
         try:
             status = self._session_status(run["session"])
             clean = status["clean"]
         except (RuntimeError, OSError, ValueError) as error:
             clean = False
-            raw += "\nCannot inspect Mu session: " + str(error)
+            errors.append("Cannot inspect Mu session: " + str(error))
         exit_reason = "interrupted" if run["stopping"] else "trapped" if code == 3 else "failed" if code else "clean" if clean else "interrupted"
         if active["preparation_error"]:
             exit_reason = "failed"
-            raw += "\nCannot prepare Mu history: " + active["preparation_error"]
+            errors.append("Cannot prepare Mu history: " + active["preparation_error"])
         if active["capture"] and active["capture"].error:
             exit_reason = "failed"
-            raw += "\nPTY capture failed: " + active["capture"].error
+            errors.append("PTY capture failed: " + active["capture"].error)
         if run["kind"] == "scheduler":
+            if errors:
+                raw += "\n" + "\n".join(errors)
             try:
                 usage = scheduler_usage(journal_events(self.root, run["session"], run["journal_offset"]))
             except (OSError, ValueError) as error:
@@ -1420,13 +1428,17 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
                 response = turns[-1]["response"] if turns else ""
             except (OSError, ValueError) as error:
                 response = ""
-                raw += "\nCannot read worker response: " + str(error)
+                errors.append("Cannot read worker response: " + str(error))
+            if active["screen"].error:
+                errors.append(active["screen"].error)
             # Traps need complete command/stdin evidence, never a bounded tail.
             outcome = dict(exit=exit_reason, code=code, clean=clean, action=run["origin"], mode=run["mode"],
                            trap=run["trap"], message_id=run["message_id"], journal_offset=run["journal_offset"],
-                           summary=excerpt(response, 4000) if response else (raw[-4000:] if exit_reason != "clean" else ""))
+                           summary=excerpt(response or "\n".join(errors), 4000))
             if exit_reason != "clean":
-                outcome["diagnostic"] = raw[-2000:]
+                outcome["diagnostic"] = "\n".join(errors)
+                if not active["screen"].error:
+                    outcome["terminal_tail"] = active["screen"].tail()
             if exit_reason == "trapped":
                 self.traps[session["id"]] = raw
             else:
