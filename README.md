@@ -296,6 +296,22 @@ earlier state: absence means no value or an empty collection, not unchanged.
 Only the explicit history-unchanged marker permits reuse of earlier history.
 Boolean false and numeric zero remain explicit.
 
+Compact metadata—IDs, flags, counts, and fixed state labels—is rendered as XML
+attributes. Free-form text (including names, commands, diagnostics, and admission
+explanations) and nested structures remain child elements. For example:
+
+```xml
+<session id="12" name_source="user" held="false" user_continue_authorized="false">
+  <name>Fix scheduler wakeups</name>
+  <messages>
+    <message id="42" delivery_state="pending">
+      <text>Check why eligible work is not starting.</text>
+    </message>
+  </messages>
+  <history omitted_turn_count="0" />
+</session>
+```
+
 | Session section | Meaning |
 | --- | --- |
 | identity | Board session ID, display title, and automatic/user naming ownership. |

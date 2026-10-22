@@ -502,7 +502,8 @@ class SchedulerSmoke(unittest.TestCase):
     def test_scheduler_uses_xml_snapshot_and_accepts_plain_final(self):
         self.config(scheduler_actions=[], scheduler_stdout="Nothing eligible in this pass.")
         board = self.board()
-        first = self.new(board, "read XML evidence")
+        text = 'read XML evidence: <tag key="value"> & text\nsecond line'
+        first = self.new(board, text)
         second = self.new(board, "read another request")
         self.until(board, lambda: board._running(None) is not None
                    and self.journal(board.data["scheduler"])["invocations"])
@@ -515,18 +516,24 @@ class SchedulerSmoke(unittest.TestCase):
         document = invocation["prompt"].split("SNAPSHOT:\n", 1)[1].strip()
         root = ET.fromstring(document)
         self.assertEqual(root.tag, "snapshot")
-        self.assertFalse(any(not len(node) and node.text is None for node in root.iter()))
+        self.assertFalse(any(not len(node) and not node.attrib and node.text is None for node in root.iter()))
         self.assertIsNone(root.find("./messages"))
         session_nodes = root.findall("./sessions/session")
-        self.assertEqual({int(node.findtext("id")) for node in session_nodes}, {first["id"], second["id"]})
+        self.assertEqual({int(node.get("id")) for node in session_nodes}, {first["id"], second["id"]})
+        self.assertEqual(root.findtext(f"./sessions/session[@id='{first['id']}']/messages/message/text"), text)
+        self.assertEqual(root.find("workspace").get("clean"), "true")
         for node in session_nodes:
-            self.assertEqual(node.findtext("held"), "false")
-            self.assertEqual(node.findtext("history/omitted_turn_count"), "0")
+            self.assertEqual(node.get("held"), "false")
+            self.assertEqual(node.find("history").get("omitted_turn_count"), "0")
+            self.assertIsNone(node.find("id"))
+            self.assertNotIn("continuation_state", node.attrib)
             self.assertIsNone(node.find("current_run"))
             self.assertIsNotNone(node.find("execution"))
             self.assertEqual(node.findtext("execution/reader"), "available")
             self.assertEqual(node.findtext("execution/writer"), "available")
             self.assertIsNotNone(node.find("messages"))
+            self.assertEqual(node.find("messages/message").get("delivery_state"), "pending")
+            self.assertNotIn("session_id", node.find("messages/message").attrib)
             self.assertIsNone(node.find("messages/message/session_id"))
         self.assertIsNotNone(scheduler)
         self.until(board, board.idle)
@@ -707,8 +714,8 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(len(self.journal(second)["invocations"]), 1)
         scheduler = self.journal(board.data["scheduler"])
         self.assertGreaterEqual(len(scheduler["invocations"]), 3)
-        batches = [{int(node.text) for node in ET.fromstring(turn["prompt"].split("SNAPSHOT:\n", 1)[1])
-                    .findall("./trigger_events/event/id")} for turn in scheduler["invocations"]]
+        batches = [{int(node.get("id")) for node in ET.fromstring(turn["prompt"].split("SNAPSHOT:\n", 1)[1])
+                    .findall("./trigger_events/event")} for turn in scheduler["invocations"]]
         self.assertTrue(pending_events <= batches[1])
         for event_id in original_events | pending_events:
             self.assertEqual(sum(event_id in batch for batch in batches), 1)
@@ -1060,7 +1067,9 @@ class SchedulerSmoke(unittest.TestCase):
         document = board._scheduler_prompt(snapshot).split("SNAPSHOT:\n", 1)[1]
         rendered_handoff = ET.fromstring(document).find("handoff")
         self.assertIsNone(rendered_handoff.find("revision"))
-        self.assertEqual(rendered_handoff.findtext("run_id"), "commit")
+        self.assertNotIn("revision", rendered_handoff.attrib)
+        self.assertEqual(rendered_handoff.get("run_id"), "commit")
+        self.assertEqual(rendered_handoff.find("operation").get("action"), "message")
         self.assertEqual(json.dumps(snapshot), before)
 
         def admit(session, choice, mode, trap):

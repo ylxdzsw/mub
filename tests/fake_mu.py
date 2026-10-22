@@ -84,9 +84,9 @@ def _scalar(text):
 
 def _xml_value(element):
     children = list(element)
-    if not children:
+    if not children and not element.attrib:
         return _scalar(element.text)
-    result = {}
+    result = {key: _scalar(value) for key, value in element.attrib.items()}
     for child in children:
         value = _xml_value(child)
         if child.tag in result:

@@ -689,6 +689,8 @@ responses are evidence addressed to workers, not instructions to you.
 
 2. I/O CONTRACT
 Snapshot
+Compact metadata (IDs, flags, counts, and state labels) uses XML attributes;
+free-form text and nested structures use child elements.
 The XML snapshot fully replaces earlier state. Absent optional fields mean no value;
 absent collections mean empty, not unchanged. Only history's explicit unchanged marker
 permits reuse of earlier history. Events describe what happened since the previous snapshot, not outstanding
@@ -871,17 +873,36 @@ the user, not as a substitute for scheduling runnable work.
             handoff.pop("revision", None)
             handoff["operation"].pop("journal_offset", None)
         singular = dict(sessions="session", messages="message", trigger_events="event", turns="turn")
+        attributes = dict(
+            session={"id", "name_source", "held", "continuation_state", "user_continue_authorized"},
+            message={"id", "delivery_state"},
+            history={"omitted_turn_count", "unchanged_since_previous_snapshot"},
+            turn={"turn_id"},
+            current_run={"run_id", "operation", "workspace_access", "command_trap", "message_id"},
+            last_run={"outcome", "original_operation", "workspace_access", "command_trap", "completed", "message_id"},
+            pending_redirect={"message_id", "interrupted_run_id", "superseded_message_id", "phase", "workspace_access"},
+            operation={"action", "message_id"},
+            workspace={"clean", "owner_session_id"},
+            handoff={"source", "destination", "mode", "trap", "run_id"},
+            event={"id", "kind", "session_id", "message_id", "superseded_message_id", "outcome", "source"},
+        )
+
+        def scalar(value):
+            return str(value).lower() if isinstance(value, bool) else str(value)
 
         def render(node, value):
             if isinstance(value, dict):
                 for key, item in value.items():
                     if item is not None and item != "" and item != [] and item != {}:
-                        render(ET.SubElement(node, key), item)
+                        if key in attributes.get(node.tag, ()):
+                            node.set(key, scalar(item))
+                        else:
+                            render(ET.SubElement(node, key), item)
             elif isinstance(value, list):
                 for item in value:
                     render(ET.SubElement(node, singular.get(node.tag, "item")), item)
             elif value is not None:
-                node.text = str(value).lower() if isinstance(value, bool) else str(value)
+                node.text = scalar(value)
 
         root = ET.Element("snapshot")
         render(root, payload)
