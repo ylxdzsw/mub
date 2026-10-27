@@ -131,7 +131,7 @@ def scheduler_command(action, snapshot):
     kind = _action_kind(action)
     session_id = action.get("session_id")
     if kind == "run":
-        return ["run", "--trap", action["trap"], f"S{session_id}"]
+        return ["run", "--trap", action["trap"], *(["--approve"] if action.get("approve") else []), f"S{session_id}"]
     if kind == "rename":
         return ["rename", f"S{session_id}", action["name"]]
     if kind == "mark-failed":
@@ -323,7 +323,12 @@ def main():
             subprocess.run(["git", "add", str(own_file)], check=True)
             subprocess.run(["git", "-c", "user.name=Fake", "-c", "user.email=fake@example.com", "commit", "-qm", "Fake handoff"], check=True)
         return finish(0, "Committed task-owned work" if not config.get("commit_refused") else "Cannot safely commit incomplete work", True)
-    if task.startswith("trap") and not retry:
+    if task == "trap twice":
+        approved = data.get("approved_commands", 0) + int(retry and "--approve" in args)
+        data["approved_commands"] = approved
+        if args[args.index("--trap") + 1] == "reversible" and approved < 2:
+            return finish(3, f"# Command {approved + 1}\n$ [reversible] touch setup-{approved + 1}\n⊘ trapped before execution", False)
+    elif task.startswith("trap") and not retry:
         return finish(3, "# Write fixture\n$ [reversible] cat > work.txt\n< complete stdin\n⊘ trapped before execution", False)
     if task.startswith("fail"):
         return finish(1, "fake provider failure", False)

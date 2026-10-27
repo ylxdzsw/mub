@@ -147,6 +147,7 @@ class Engine:
                 session.update(hold=True, gate="interrupted", reason="Previous owner stopped; inspect the session before continuing.",
                                retry_authorized=False, revision=session["revision"] + 1,
                                last=dict(exit="interrupted", action=run["origin"], mode=run["mode"],
+                                         trap=run["trap"], approve=run.get("approve", False),
                                          message_id=run.get("message_id"), journal_offset=run["journal_offset"],
                                          clean=False, summary="Owner stopped during invocation."))
                 for message in self.data["messages"]:
@@ -631,13 +632,13 @@ class Engine:
             active = self._running(session["id"])
             run = active["record"] if active else None
             item["current_run"] = (dict(run_id=run["id"], operation=run["action"],
-                workspace_access=run["mode"], command_trap=run["trap"], message_id=run["message_id"])
+                workspace_access=run["mode"], command_trap=run["trap"], approve=run.get("approve", False), message_id=run["message_id"])
                 if run else None)
             item["history"] = self._worker_context(session)
             last = session["last"]
             item["last_run"] = ({new: last[old] for old, new in (
                 ("exit", "outcome"), ("action", "original_operation"), ("mode", "workspace_access"),
-                ("trap", "command_trap"), ("clean", "completed"), ("message_id", "message_id")) if old in last}
+                ("trap", "command_trap"), ("approve", "approve"), ("clean", "completed"), ("message_id", "message_id")) if old in last}
                 if last else None)
             if last and (last["exit"] != "clean" or not item["history"]["turns"]):
                 item["last_run"]["diagnostic"] = excerpt(last.get("diagnostic", last["summary"]), 1200)
@@ -713,8 +714,10 @@ command results; act only where a decision is still needed, without repeating ac
   for an exact journal prefix. Excerpts may omit text. unchanged_since_previous_snapshot
   means reuse previously supplied history, not previous execution state.
 - current_run: run_id, operation (message, retry, commit, redirect), workspace_access
-  (readonly, readwrite), command_trap, and message_id. last_run records outcome, original
-  operation, access/trap settings, completed, and message_id, plus diagnostic when needed.
+  (readonly, readwrite), command_trap, approve, and message_id. approve means one pending
+  Bash command was authorized for this invocation, not a lasting permission. last_run records
+  outcome, original operation, access/trap/approval settings, completed, and message_id,
+  plus diagnostic when needed. Past approval must never be assumed to cover a new command.
   completed means Mu finished its turn, not task success or a clean Git checkout.
   terminal_tail is bounded rendered terminal context, possibly wrapped or containing earlier
   turns; it is not a complete transcript or necessarily an error. diagnostic reports runtime errors.
@@ -726,7 +729,7 @@ command results; act only where a decision is still needed, without repeating ac
   instructions. handoff_failure records an unsuccessful attempt by this owner to yield.
 - workspace: clean, git_status (Git porcelain), and owner_session_id. An active writer can
   reserve ownership before making changes; ownerless dirty changes admit no writer.
-- handoff: source, destination, reserved operation, mode/trap, and commit run_id.
+- handoff: source, destination, reserved operation, mode/trap/approve, and commit run_id.
   The destination is scheduled to run after successful handoff and fresh admission checks.
   handoff_result reports the latest outcome; unsuccessful handoffs leave work pending.
 - trigger_events: the batch of scheduling events since the previous snapshot (or already
@@ -735,8 +738,12 @@ command results; act only where a decision is still needed, without repeating ac
 
 Commands
 Use this exact mub command prefix: {self.client}
-- run --trap reversible|destructive|off S12: start the observed next operation. Runtime
+- run --trap reversible|destructive|off [--approve] S12: start the observed next operation. Runtime
   selects FIFO dispatch or eligible continuation; this never grants recovery authorization.
+  --approve is only for an eligible trapped retry with full command evidence. It approves
+  only the first pending Bash command; later commands obey --trap. Approval always requires
+  writer admission for the whole invocation, even with --trap reversible. It expires with
+  that invocation and is never automatically renewed after interruption or failure.
   If another idle eligible session owns dirty work, runtime requests a commit there and
   reserves this operation to run after handoff. No further run command is needed for it.
 - rename S12 "Topic": change an automatic title, never a user-owned title.
@@ -776,20 +783,29 @@ Scope and traps. Read user requests before authorizing writes or relaxing traps 
 already inspected in this scheduler session. Retrieve missing decision-critical history;
 omitted context never erases restrictions or grants permission. Conversational change
 requests can authorize ordinary implementation without a second approval.
-- reversible: reader admission; traps reversible and destructive Bash calls.
+- reversible: reader admission unless --approve; traps reversible and destructive Bash calls.
 - destructive: writer admission; traps destructive Bash calls.
 - off: writer admission with traps disabled; use only when the user's scope justifies it.
 A continuation's trap setting applies to the rest of the turn, not only the trapped command.
+Use --approve for an isolated, authorized exception while retaining the appropriate trap
+for subsequent commands. For example, --trap destructive --approve allows one authorized
+destructive command without disabling traps for later destructive commands.
 Traps are not a sandbox, and changing them never expands the user's scope.
 
 Resolve ordinary task-scoped traps yourself through scheduling. Initial readonly admission
 is provisional, not a prohibition on harmless reversible inspection setup. Inspect full trap
 evidence and actual effects: browser setup for testing or review may need writer admission
-without authorizing implementation. If within scope, continue with run --trap destructive
-when admitted. If writer access, a handoff, or a prerequisite is unavailable, keep the turn
+without authorizing implementation. Choose intelligently between a one-shot exception and
+lifting the trap for the remaining turn. If the worker is doing or is likely to repeat
+legitimate reversible work, such as starting and operating browser tests for a readonly
+review, use run --trap destructive rather than approving each command separately. Do not
+wait for repeated traps to establish an obvious workflow. For a genuinely isolated setup
+step, run --trap reversible --approve keeps later writes trapped. Repeated authorized
+destructive work may justify --trap off, but repetition alone never establishes permission.
+If writer access, a handoff, or a prerequisite is unavailable, keep the turn
 trapped and pending, set a user-visible waiting note, and end this pass. Reconsider it on a
 later wakeup; do not mark it failed or require user intervention merely for this trap.
-Do not rerun at the same threshold that blocked the command.
+Do not rerun at the same threshold that blocked the command without --approve.
 
 Failure and recovery. Use mark-failed only when concrete evidence establishes a fatal task
 problem or an operation that cannot proceed within user authorization and needs intervention.
@@ -797,6 +813,10 @@ Explain the evidence, such as an explicit restriction violated by the trapped co
 unauthorized destructive action. A trap, ordinary tool error, or failing test alone is not
 failure. Runtime already gates startup failures, crashes, and interrupted work; retain those
 gates until explicit user continuation. Holds always require user action.
+After /resume, reassess the command, user authorization, and expected remaining workflow;
+choose one-shot approval or a suitable turn-wide trap yourself. /resume authorizes recovery,
+not arbitrary out-of-scope effects. After a crash or interruption, retry without --approve
+to obtain fresh trap evidence before approving any pending command.
 
 Naming and notes. Rename unnamed automatic sessions as soon as their topic is clear, even
 when work is blocked. Prefer topic titles within 40 characters, not statuses; change an
@@ -808,9 +828,13 @@ the user, not as a substitute for scheduling runnable work.
 - S12 needs an endpoint being implemented in S10: note S12 "Waiting for S10 to finish the
   endpoint". After S10 stops, inspect its result before deciding that S12 can proceed.
 - S12 traps on harmless reversible browser setup for its requested review: inspect the
-  command and user scope, then run --trap destructive S12 if writer admission is available.
+  command and user scope. If browser testing will need repeated reversible commands, use
+  run --trap destructive S12; for one isolated setup command use
+  run --trap reversible --approve S12. Both require writer admission.
   If S10 is still writing, note S12 "Waiting for writer access for browser testing" and
   finish. Do not mark S12 failed, ask for /resume, or execute browser commands yourself.
+- S12 traps on one explicitly authorized destructive cleanup during implementation:
+  run --trap destructive --approve S12, retaining traps for later destructive commands.
 - Idle S10 owns dirty work and has a related queued follow-up: prefer running that follow-up
   if priorities and dependencies allow. If instead S12 should write next, run --trap
   destructive S12; runtime handles the commit and scheduled launch. Finish without waiting.
@@ -878,12 +902,12 @@ the user, not as a substitute for scheduling runnable work.
             message={"id", "delivery_state"},
             history={"omitted_turn_count", "unchanged_since_previous_snapshot"},
             turn={"turn_id"},
-            current_run={"run_id", "operation", "workspace_access", "command_trap", "message_id"},
-            last_run={"outcome", "original_operation", "workspace_access", "command_trap", "completed", "message_id"},
+            current_run={"run_id", "operation", "workspace_access", "command_trap", "approve", "message_id"},
+            last_run={"outcome", "original_operation", "workspace_access", "command_trap", "approve", "completed", "message_id"},
             pending_redirect={"message_id", "interrupted_run_id", "superseded_message_id", "phase", "workspace_access"},
             operation={"action", "message_id"},
             workspace={"clean", "owner_session_id"},
-            handoff={"source", "destination", "mode", "trap", "run_id"},
+            handoff={"source", "destination", "mode", "trap", "approve", "run_id"},
             event={"id", "kind", "session_id", "message_id", "superseded_message_id", "outcome", "source"},
         )
 
@@ -910,7 +934,7 @@ the user, not as a substitute for scheduling runnable work.
         return f"{policy}\n\nSNAPSHOT:\n{ET.tostring(root, encoding='unicode')}"
 
     def _spawn(self, *, session=None, message=None, action="schedule", mode="readonly", trap=None, snapshot=None,
-               close_messages=None):
+               close_messages=None, approve=False):
         started_at = time.monotonic()
         kind = "worker" if session else "scheduler"
         target = session if session else self.data["scheduler"]
@@ -990,7 +1014,7 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
         screen.finished = False
         self.screens[key] = screen
         record = dict(id=uuid.uuid4().hex[:12], kind=kind, session_id=session["id"] if session else None,
-                      session=mu_session, action=action, mode=mode,
+                      session=mu_session, action=action, mode=mode, approve=approve,
                       trap=trap or ("destructive" if kind == "scheduler" or mode == "readwrite" else "reversible"),
                       origin=session["last"]["action"] if action == "retry" and session["last"] else action,
                       journal_offset=session["last"]["journal_offset"] if action == "retry" and session["last"] else journal_path(self.root, mu_session).stat().st_size,
@@ -1041,6 +1065,8 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
             env["MUB_SOCKET"] = str(self.server.path)
         args = [self.mu, *(["retry"] if action == "retry" else []), "--automated", "-s", mu_session,
                 "-o", "final" if kind == "scheduler" else "concise", "--trap", record["trap"]]
+        if approve:
+            args += ["--approve"]
         if kind == "scheduler":
             args += ["--no-context"]
         if model:
@@ -1192,7 +1218,7 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
 
     def _scheduler_action(self, req, active):
         kind, key = req.get("action"), req.get("session_id")
-        action = {k: v for k, v in req.items() if k in ("trap", "name", "reason", "note")}
+        action = {k: v for k, v in req.items() if k in ("trap", "approve", "name", "reason", "note")}
         action["type"] = kind
         try:
             if self.data["scheduler"]["error"]:
@@ -1239,7 +1265,14 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
                 operation = self._execution_choice(session)
                 if not operation or operation != observed["execution"]["operation"]:
                     raise ValueError("Observed work is no longer eligible; no execution started")
-                mode = TRAP_MODES[trap]
+                approve = req.get("approve", False)
+                if type(approve) is not bool:
+                    raise ValueError("Approval must be a boolean")
+                if approve and (operation["action"] != "retry" or session["gate"] != "trapped"
+                        or (session["last"] or {}).get("exit") != "trapped"
+                        or not (observed["last_run"] or {}).get("trap_evidence")):
+                    raise ValueError("Approval requires an eligible trapped retry with command evidence")
+                mode = "readwrite" if approve else TRAP_MODES[trap]
                 if mode == "readwrite":
                     if self.data.get("handoff"):
                         raise ValueError("The next writer is already reserved by a handoff")
@@ -1254,7 +1287,7 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
                         if source in active["executed"]:
                             raise ValueError("Dirty owner already executed in this pass; reconsider handoff on the next wakeup")
                         self.data["handoff"] = dict(source=source, destination=key, revision=session["revision"],
-                                                    operation=operation, mode=mode, trap=trap, run_id=None)
+                                                    operation=operation, mode=mode, trap=trap, approve=approve, run_id=None)
                         self.store.save()
                         try:
                             commit = self._start_operation(owner, dict(action="commit"), "readwrite", "destructive")
@@ -1264,15 +1297,15 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
                             raise
                         active["executed"].update((source, key))
                         text = (f"Handoff initiated: S{source} → S{key}. Commit started in S{source}. "
-                                f"S{key} has not started; it is scheduled to run automatically after a successful "
+                                f"S{key} has not started (trap={trap}, approve={approve}); it is scheduled to run automatically after a successful "
                                 "handoff and a fresh admission check. Do not wait or poll; the runtime will wake you when needed.")
                         session["blocked"] = f"Scheduled to run after handoff from S{source}."
                         return self._record_action(action, key, True, text)
                 if blocker := self._execution_blocker(session, mode):
                     raise ValueError(blocker)
                 active["executed"].add(key)
-                self._start_operation(session, operation, mode, trap)
-                text = f"Started S{key}: {operation['action']}, {mode} access, trap={trap}. Do not wait or poll."
+                self._start_operation(session, operation, mode, trap, approve=approve)
+                text = f"Started S{key}: {operation['action']}, {mode} access, trap={trap}, approve={approve}. Do not wait or poll."
                 return self._record_action(action, key, True, text)
             session["revision"] += 1
             observed["revision"] = session["revision"]
@@ -1281,10 +1314,10 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
             self._record_action(action, key, False, str(error))
             raise
 
-    def _start_operation(self, session, operation, mode, trap):
+    def _start_operation(self, session, operation, mode, trap, *, approve=False):
         message = next((m for m in self.data["messages"] if m["id"] == operation["message_id"]), None) if operation["action"] == "message" else None
         try:
-            return self._spawn(session=session, message=message, action=operation["action"], mode=mode, trap=trap)
+            return self._spawn(session=session, message=message, action=operation["action"], mode=mode, trap=trap, approve=approve)
         except (OSError, RuntimeError, ValueError) as error:
             session.update(gate="failed", reason=str(error), retry_authorized=False, revision=session["revision"] + 1)
             if session.get("steering"):
@@ -1330,7 +1363,8 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
             self._cancel_handoff(blocker)
             return
         try:
-            self._start_operation(target, handoff["operation"], handoff["mode"], handoff["trap"])
+            self._start_operation(target, handoff["operation"], handoff["mode"], handoff["trap"],
+                                  approve=handoff.get("approve", False))
         except (OSError, RuntimeError, ValueError) as error:
             self._cancel_handoff(f"Source committed, but S{target['id']} could not start: {error}")
         else:
@@ -1454,7 +1488,7 @@ Commit only this session's completed, task-owned changes {purpose}. Do not blind
                 errors.append(active["screen"].error)
             # Traps need complete command/stdin evidence, never a bounded tail.
             outcome = dict(exit=exit_reason, code=code, clean=clean, action=run["origin"], mode=run["mode"],
-                           trap=run["trap"], message_id=run["message_id"], journal_offset=run["journal_offset"],
+                           trap=run["trap"], approve=run.get("approve", False), message_id=run["message_id"], journal_offset=run["journal_offset"],
                            summary=excerpt(response or "\n".join(errors), 4000))
             if exit_reason != "clean":
                 outcome["diagnostic"] = "\n".join(errors)

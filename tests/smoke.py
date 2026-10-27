@@ -1034,6 +1034,79 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertIn("Waiting", dependent["blocked"])
         self.assertEqual(independent["last"]["exit"], "clean")
 
+    def test_one_shot_approval_admission_handoff_and_expiry(self):
+        self.config(scheduler_actions=[])
+        board = self.board()
+        session = self.new(board, "trap twice")
+        request = dict(action="run", session_id=session["id"], trap="reversible", approve=True)
+
+        def schedule(req):
+            return board._scheduler_action(req, dict(snapshot=board._scheduler_snapshot(), executed=set()))
+
+        with self.assertRaisesRegex(ValueError, "eligible trapped retry"):
+            schedule(request)
+        schedule(dict(request, approve=False))
+        self.until(board, board.idle)
+        self.assertEqual(session["gate"], "trapped")
+        for gate in ("failed", "interrupted"):
+            with patch.dict(session, gate=gate, retry_authorized=True):
+                with self.assertRaisesRegex(ValueError, "eligible trapped retry"):
+                    schedule(request)
+        with patch.dict(session, hold=True):
+            with self.assertRaisesRegex(ValueError, "held"):
+                schedule(request)
+        snapshot = board._scheduler_snapshot()
+        snapshot["sessions"][0]["last_run"].pop("trap_evidence")
+        with self.assertRaisesRegex(ValueError, "command evidence"):
+            board._scheduler_action(request, dict(snapshot=snapshot, executed=set()))
+
+        source = self.new(board, "write before approval")
+        schedule(dict(action="run", session_id=source["id"], trap="destructive"))
+        with self.assertRaisesRegex(ValueError, "active writer"):
+            schedule(request)
+        self.until(board, board.idle)
+        self.assertFalse(board.workspace["clean"])
+        self.assertEqual(board.data["owner"], source["id"])
+
+        # Exercise CLI/IPC forwarding and the reserved handoff, not just _spawn.
+        self.config(scheduler_actions_once=[request])
+        board.request(dict(op="schedule"))
+        self.until(board, board.idle)
+        self.assertNotIn("handoff", board.data)
+        self.assertIn("Handoff completed", board.data["scheduler"]["handoff_result"])
+        self.assertEqual(session["gate"], "trapped")
+        self.assertEqual(session["last"]["mode"], "readwrite")
+        self.assertEqual(session["last"]["trap"], "reversible")
+        self.assertTrue(session["last"]["approve"])
+        turns = self.journal(session)["invocations"]
+        self.assertEqual(len(turns), 2)
+        self.assertIn("retry", turns[-1]["args"])
+        self.assertIn("--approve", turns[-1]["args"])
+        self.assertNotIn("--approve", self.journal(source)["invocations"][-1]["args"])
+        snapshot = board._scheduler_snapshot()
+        last = snapshot["sessions"][0]["last_run"]
+        self.assertTrue(last["approve"])
+        self.assertIn("Command 2", last["trap_evidence"])
+
+        # A later invocation does not inherit approval, even on the same turn.
+        schedule(dict(request, approve=False))
+        self.until(board, board.idle)
+        self.assertEqual(session["gate"], "trapped")
+        self.assertFalse(session["last"]["approve"])
+        self.assertNotIn("--approve", self.journal(session)["invocations"][-1]["args"])
+        # /resume leaves the choice to the scheduler; ongoing setup can lift the trap.
+        board.request(dict(op="resume", session_id=session["id"]))
+        schedule(dict(request, trap="destructive", approve=False))
+        self.until(board, board.idle)
+        self.assertEqual(session["last"]["exit"], "clean")
+        board.request(dict(op="send", session_id=session["id"], text="read next"))
+        schedule(dict(request, approve=False))
+        self.until(board, board.idle)
+        args = self.journal(session)["invocations"][-1]["args"]
+        self.assertNotIn("retry", args)
+        self.assertNotIn("--approve", args)
+        self.assertEqual(args[args.index("--trap") + 1], "reversible")
+
     def test_automatic_handoff_failure_does_not_loop(self):
         self.config(commit_refused=True)
         board = self.board()
@@ -1072,7 +1145,7 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertEqual(rendered_handoff.find("operation").get("action"), "message")
         self.assertEqual(json.dumps(snapshot), before)
 
-        def admit(session, choice, mode, trap):
+        def admit(session, choice, mode, trap, *, approve=False):
             self.assertEqual(read_state(self.root)["handoff"], handoff)
             self.assertEqual((session, choice, mode, trap), (target, operation, "readwrite", "destructive"))
 

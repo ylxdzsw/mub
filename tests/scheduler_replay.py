@@ -216,15 +216,17 @@ class ReplayEngine(Engine):
         self.active[record["id"]] = active
         return active
 
-    def _start_operation(self, session, operation, mode, trap):
-        self.launches.append(dict(session_id=session["id"], operation=operation, mode=mode, trap=trap))
+    def _start_operation(self, session, operation, mode, trap, *, approve=False):
+        self.launches.append(dict(session_id=session["id"], operation=operation, mode=mode, trap=trap, approve=approve))
         session.update(revision=session["revision"] + 1, retry_authorized=False, blocked=None)
         if mode == "readwrite":
             self.data["owner"] = session["id"]
         for message in self.data["messages"]:
             if message["id"] == operation.get("message_id"):
                 message["state"] = "inflight"
-        return self._virtual_run(session, operation["action"], mode, trap, operation.get("message_id"))
+        active = self._virtual_run(session, operation["action"], mode, trap, operation.get("message_id"))
+        active["record"]["approve"] = approve
+        return active
 
     def request(self, req):
         if req.get("op") == "shutdown":

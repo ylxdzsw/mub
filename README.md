@@ -15,7 +15,7 @@ tasks with a completion lifecycle.
 ## Run
 
 Requires Linux with pidfds, Python 3.12+, Git, and configured `mu` on PATH
-supporting `--automated` and `--no-context`. The scheduler uses ordinary Mu
+supporting `--automated`, `--no-context`, and `mu retry --approve`. The scheduler uses ordinary Mu
 tool calls and `mub` commands rather than a structured final decision.
 Installation includes the embedded Rust terminal engine
 `par-term-emu-core-rust` (and its Pillow dependency); no shell, GUI toolkit,
@@ -238,6 +238,10 @@ admission:
 | `destructive` | Writer; destructive commands are trapped |
 | `off` | Writer; traps are disabled |
 
+`run --approve` approves one pending Bash command on a trapped retry, keeping
+the selected trap for later commands. It always requires writer admission for
+the whole invocation, including with `--trap reversible`.
+
 The runtime still enforces FIFO, one invocation per session, holds, recovery
 authorization, stale-pass protection, and fresh writer admission. `run` never
 grants user recovery permission. `rename` changes only an automatic session
@@ -317,12 +321,13 @@ explanations) and nested structures remain child elements. For example:
 | identity | Board session ID, display title, and automatic/user naming ownership. |
 | state and gates | Holds, continuation state, recovery authorization, and runtime detail; a null continuation gate does not imply idle. |
 | eligibility | Next pending or continuation operation, access/trap choices, writer ownership, and blockers computed from a fresh runtime view. |
-| current/last run | Active or previous operation, access, trap, completion, diagnostics, and complete trap evidence. |
+| current/last run | Active or previous operation, access, trap, one-shot approval, completion, diagnostics, and complete trap evidence. |
 | history | Recent requests and final responses, with omitted-count and fixed-prefix read commands when a journal exists. |
 
 Run operations include new messages, recovery, worker-mediated handoff commits,
 and user redirects. `workspace_access` is `readonly` or `readwrite`;
-`command_trap` is `reversible`, `destructive`, or `off`. Completion reports Mu
+`command_trap` is `reversible`, `destructive`, or `off`. `approve` records a
+single-command exception for that invocation, not a reusable permission. Completion reports Mu
 completion separately from Git cleanliness. Redirect phases and recovery gates
 remain runtime-owned; a redirect's message remains in the mailbox.
 
@@ -483,8 +488,28 @@ explicit continuation permission.
 Normal dispatch and retry policies pair readonly access with `--trap reversible`,
 readwrite access with `--trap destructive`, or readwrite access with traps off
 only when unrestricted permission is justified. Trap policy applies to the
-**rest of that turn**, not one command. A subsequent normal turn gets a fresh
-access/trap policy. Single-command approval is not implemented.
+**rest of that turn**. A subsequent normal turn gets a fresh access/trap policy.
+
+For an isolated authorized exception, the scheduler can use
+`mub run S12 --trap reversible --approve` (one reversible setup command) or
+`mub run S12 --trap destructive --approve` (one authorized destructive command).
+Mu approves only the first pending Bash command; later commands still obey the
+selected trap. Approval does not bypass command validation or repeat started
+higher-risk commands. mub requires an eligible trapped retry with full command
+evidence and reserves writer access for the entire invocation, even with
+`--trap reversible`. Approval survives a successful reserved handoff, but expires
+with its invocation and is never automatically renewed after failure or interruption.
+Recovery must obtain fresh trap evidence before another one-shot approval.
+
+The scheduler chooses between one-shot approval and lifting the trap based on
+the expected workflow. Repeated legitimate reversible operations, such as browser
+testing for a nominally readonly review, should normally use `--trap destructive`
+rather than approve every command. It need not wait for repeated traps when the
+workflow is already clear. Repeated destructive work justifies `--trap off` only
+when the user's scope supports it; repetition itself grants no permission.
+After `/resume`, the scheduler makes this choice using the command evidence and
+user authorization. `/resume` permits recovery, not unrelated or out-of-scope work;
+there is no separate TUI approval command.
 
 Before a dirty handoff, when there is no explicit steering request, the scheduler
 prefers the owner's oldest ordinary FIFO message when it directly continues the
@@ -582,6 +607,8 @@ The scheduler has four immediate CLI actions and no JSON decision protocol:
 mub run S12 --trap reversible
 mub run S12 --trap destructive
 mub run S12 --trap off
+mub run S12 --trap reversible --approve
+mub run S12 --trap destructive --approve
 mub rename S11 "API pagination"
 mub mark-failed S10 "Cannot proceed within the user's authorization"
 mub note S13 "Waiting for S10 to implement the endpoint"
@@ -590,6 +617,8 @@ mub note S13 --clear
 
 `run` requires one of the three trap settings. The runtime chooses dispatch or
 continuation and returns immediately after admission or handoff initiation.
+Optional `--approve` is only accepted for a trapped retry with command evidence;
+it grants a single-command exception, not recovery authorization or lasting approval.
 `rename`, `mark-failed`, and `note` likewise return a plain-text result. The
 scheduler pass identifier is carried in `MUB_PASS_ID` when the scheduler uses
 these commands; the owner validates it along with the caller.

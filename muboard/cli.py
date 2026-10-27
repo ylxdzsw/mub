@@ -36,6 +36,7 @@ def parser():
     run = sub.add_parser("run", help="Run the selected session's next eligible operation")
     run.add_argument("session_id", type=session_id)
     run.add_argument("--trap", choices=("reversible", "destructive", "off"), required=True)
+    run.add_argument("--approve", action="store_true", help="Approve one trapped Bash command; requires writer admission")
     rename = sub.add_parser("rename", help="Rename an automatically named session")
     rename.add_argument("session_id", type=session_id)
     rename.add_argument("name")
@@ -83,6 +84,7 @@ def main():
                        pass_id=os.environ.get("MUB_PASS_ID"))
         if command == "run":
             request["trap"] = args.trap
+            request["approve"] = args.approve
         elif command == "rename":
             request["name"] = args.name
         elif command == "mark-failed":
