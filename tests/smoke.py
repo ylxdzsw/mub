@@ -33,6 +33,22 @@ from muboard.ui import _UI
 
 
 class InputSmoke(unittest.TestCase):
+    def test_discard_command_requires_selected_session(self):
+        ui = _UI.__new__(_UI)
+        ui.selected, ui.ui_error = 1, ""
+        ui._set_draft = MagicMock()
+        ui._request = MagicMock()
+        ui._command("/discard")
+        ui._request.assert_called_once_with(dict(op="discard", session_id=1))
+        ui._request.reset_mock()
+        ui._command("/discard all")
+        ui._request.assert_not_called()
+        self.assertEqual(ui.ui_error, "Usage: /discard")
+        ui.selected = None
+        ui._command("/discard")
+        ui._request.assert_not_called()
+        self.assertIn("Select a session", ui.ui_error)
+
     def test_steer_command_retains_draft_until_confirmed_and_accepted(self):
         ui = _UI.__new__(_UI)
         session = dict(id=1, gate="interrupted", active=None)
@@ -1180,6 +1196,40 @@ class SchedulerSmoke(unittest.TestCase):
         self.assertIsNone(target["session"])
         self.assertNotIn("handoff", board.data)
         self.assertTrue(source["handoff_failed"])
+
+    def test_discard_preserves_dirty_workspace_and_unfinished_work(self):
+        board = self.board()
+        session = self.new(board, "write unfinished")
+        self.until(board, board.idle)
+        key = session["id"]
+        board.data["scheduler"]["error"] = "Paused for explicit discard"
+        other = self.new(board, "read other session")
+        messages = [board.store.submit(key, text) for text in
+                    ("running", "interrupted", "redirect", "queued first", "queued second")]
+        messages[0]["state"] = "inflight"
+        messages[1]["state"] = "interrupted"
+        session.update(hold=True, gate="interrupted", steering=dict(message_id=messages[2]["id"], phase="held"))
+        before = dict(session)
+        files = {p: p.read_bytes() for p in self.root.iterdir() if p.is_file()}
+        journals = {p: p.read_bytes() for p in (self.root / ".mu/sessions").glob("*.jsonl")}
+        self.assertFalse(board.workspace["clean"])
+        self.assertEqual(board.data["owner"], key)
+        with patch.object(board, "_agent_peer", return_value=True):
+            with self.assertRaisesRegex(ValueError, "requires the user"):
+                board.request(dict(op="discard", session_id=key))
+        self.assertEqual(board.request(dict(op="discard", session_id=key)), dict(discarded=2))
+        self.assertEqual(session, dict(before, revision=before["revision"] + 1))
+        self.assertEqual(board.data["owner"], key)
+        self.assertEqual({p: p.read_bytes() for p in files}, files)
+        self.assertEqual({p: p.read_bytes() for p in journals}, journals)
+        self.assertEqual([m for m in board.data["messages"] if m["session_id"] == key], messages[:3])
+        self.assertEqual([m["text"] for m in board.data["messages"] if m["session_id"] == other["id"]],
+                         ["read other session"])
+        self.assertEqual(read_state(self.root)["messages"], board.data["messages"])
+        self.assertEqual(board.data["events"][-1]["kind"], "discarded")
+        revision, events = session["revision"], len(board.data["events"])
+        self.assertEqual(board.request(dict(op="discard", session_id=key)), dict(discarded=0))
+        self.assertEqual((session["revision"], len(board.data["events"])), (revision, events))
 
     def test_commit_and_close_preserves_mailbox_until_success(self):
         self.config(commit_refused=True)

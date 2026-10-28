@@ -55,6 +55,7 @@ class _UI:
         "/new [name]": "Create and select a session",
         "/rename <name>|--auto": "Name the selected session, or let its name evolve automatically",
         "/close": "Close the selected session",
+        "/discard": "Discard the selected session's queued messages, keeping unfinished work",
         "/model [session|scheduler|worker|both]": "Show models, or choose a model, thinking effort, and fast mode",
         "/interrupt": "Interrupt and hold the selected session",
         "/resume [selected]": "Authorize continuation and ask the scheduler to reconsider",
@@ -785,6 +786,11 @@ class _UI:
                            "name": None if argument == "--auto" else argument})
         elif command == "/close":
             self._close()
+        elif command == "/discard":
+            if self.selected is None:
+                self.ui_error = "Select a session to discard queued messages."
+                return
+            self._request({"op": "discard", "session_id": self.selected})
         elif command == "/model":
             if argument:
                 self._models(argument)

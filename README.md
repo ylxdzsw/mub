@@ -145,6 +145,11 @@ Local commands:
 - `/new [name]`: create and select a session.
 - `/rename <name>`: name the selected session and protect its name from automatic changes.
 - `/rename --auto`: let the scheduler name and rename the selected session again.
+- `/discard`: discard all ordinary pending messages for the selected session,
+  without closing it or changing workspace files or ownership. Works even while
+  the session is active, held, or owns uncommitted changes. In-flight and
+  interrupted messages, pending steering redirects, and Mu history are preserved;
+  this does not interrupt or resume an unfinished turn.
 - `/close`: detach an idle session; confirm discarding any queued messages.
   If it owns a dirty workspace, show a warning first. Repeat `/close` or `Ctrl-D`
   while that warning is displayed to ask the session to commit its completed,

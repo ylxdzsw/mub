@@ -387,6 +387,17 @@ class Engine:
         elif op == "send":
             message = self.store.submit(int(req["session_id"]), req["text"])
             result = dict(message_id=message["id"])
+        elif op == "discard":
+            session = self.store.session(int(req["session_id"]))
+            steering_id = session.get("steering", {}).get("message_id")
+            discarded = {m["id"] for m in self.data["messages"]
+                         if m["session_id"] == session["id"] and m["state"] == "pending"
+                         and m["id"] != steering_id}
+            if discarded:
+                self.data["messages"] = [m for m in self.data["messages"] if m["id"] not in discarded]
+                session["revision"] += 1
+                self.store.event("discarded", session["id"], message_ids=sorted(discarded))
+            result = dict(discarded=len(discarded))
         elif op == "steer":
             session = self.store.session(int(req["session_id"]))
             if session.get("steering"):
@@ -849,6 +860,7 @@ the user, not as a substitute for scheduling runnable work.
     @staticmethod
     def _scheduler_wakeup(snapshot):
         descriptions = dict(submitted="received a new message", held="was held by the user",
+                            discarded="had queued messages discarded by the user",
                             resumed="received a user continuation request", removed="was removed",
                             steering="received user steering", redirected="accepted user steering",
                             failed="encountered an execution error", interrupted="needs interruption recovery",
